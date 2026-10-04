@@ -1,0 +1,6 @@
+{
+  "name": "PlayUp Reseller & PlayUp Mobile",
+  "description": "Plateforme professionnelle de distribution et d'API de services gaming, avec application mobile dédiée aux joueurs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

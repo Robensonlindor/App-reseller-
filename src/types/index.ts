@@ -10,6 +10,7 @@ export type ConnectionDiagnosticCode =
   | 'INVALID_API_KEY'
   | 'INVALID_URL'
   | 'AUTH_ERROR'
+  | 'API_UNAVAILABLE'
   | 'NETWORK_ERROR'
   | 'UNEXPECTED_RESPONSE';
 
@@ -22,6 +23,7 @@ export interface ConnectionTestResult {
     | 'API Key invalide'
     | 'URL incorrecte'
     | 'Erreur d\'authentification'
+    | 'API indisponible'
     | 'Erreur réseau'
     | 'Réponse inattendue du fournisseur';
   httpStatus?: number;
@@ -31,6 +33,7 @@ export interface ConnectionTestResult {
   timestamp: string;
   authHeadersUsed?: Record<string, string>;
   gamesCountDetected?: number;
+  productsCountDetected?: number;
   responseSnippet?: string;
 }
 
@@ -51,8 +54,8 @@ export interface ProviderCustomParam {
 
 export interface Provider {
   id: string;
-  slug: string; // e.g., 'goxtop'
-  adapterType: 'goxtop' | 'generic_rest';
+  slug: string; // e.g., 'goxtop' | 'rechargegames'
+  adapterType: 'goxtop' | 'rechargegames' | 'generic_rest';
   name: string;
   apiUrl: string; // API Base URL e.g. https://goxtop.com
   environment: ProviderEnvironment;
@@ -253,14 +256,17 @@ export interface Game {
 export interface ServicePackage {
   id: string;
   serviceId: string;
-  externalProductId?: string; // GoXtop Product ID
-  externalGameId?: string;    // GoXtop Game code
+  externalProductId?: string; // GoXtop Product ID or RechargeGames product_key
+  productKey?: string;        // RechargeGames exact product_key
+  region?: string;            // Region/Country (e.g. 'Brazil', 'USA', 'Global')
+  providerSlug?: string;      // 'rechargegames' | 'goxtop'
+  externalGameId?: string;    // Game code
   name: string;
   amount: number;
   unit: string;
-  publicPrice: number;    // PlayUp Selling Price (= GoXtop cost + PlayUp margin)
+  publicPrice: number;    // PlayUp Selling Price (= Supplier cost + PlayUp margin)
   resellerPrice: number;  // PlayUp Reseller Price
-  supplierCost: number;   // GoXtop Cost (Never modified in GoXtop)
+  supplierCost: number;   // Provider Cost (Never modified in Provider)
   margin: number;         // PlayUp Margin (publicPrice - supplierCost)
   currency: string;       // USD
   isActive: boolean;      // Availability
@@ -499,4 +505,168 @@ export interface PaymentTransaction {
   createdAt: string;
   updatedAt: string;
 }
+
+// ============================================================================
+// RECHARGEGAMES OFFICIAL INTEGRATION DATA STRUCTURES
+// ============================================================================
+
+export type RechargeGamesMode = 'TEST' | 'PRODUCTION';
+export type RechargeGamesOrderStatus = 'pending' | 'delivered' | 'failed' | 'refunded';
+
+/**
+ * Table: products (RechargeGames synchronized catalog)
+ */
+export interface RechargeGamesProduct {
+  id: string;
+  provider: 'rechargegames';
+  product_key: string;        // Exact product_key provided by RechargeGames
+  game: string;               // e.g. 'Free Fire', 'PUBG Mobile', 'Mobile Legends', 'Call of Duty: Mobile', 'Roblox'
+  game_slug?: string;         // e.g. 'free-fire', 'pubg-mobile'
+  region: string;             // e.g. 'Brazil', 'USA', 'Global', 'Europe', 'LATAM'
+  name: string;               // Product display name
+  topup_value: string;        // e.g. '100 Diamonds', '60 UC'
+  amount?: number;            // Numeric value e.g. 100
+  unit?: string;              // e.g. 'Diamonds', 'UC', 'CP', 'Robux'
+  provider_price: number;     // Supplier cost from RechargeGames
+  currency: string;           // e.g. 'USD'
+  playup_price: number;       // Final customer price computed server-side with PlayUp margin
+  margin_percent: number;     // Applied margin %
+  profit_estimate: number;    // playup_price - provider_price
+  active: boolean;            // Availability from RechargeGames
+  requires_player_id?: boolean;
+  last_synced_at: string;     // ISO timestamp
+  raw_metadata?: Record<string, any>;
+}
+
+/**
+ * Table: orders (RechargeGames orders with buyer_ref and status lifecycle)
+ */
+export interface RechargeGamesOrderRecord {
+  id: string;                 // PlayUp Order ID e.g. 'PU-10235'
+  user_id: string;            // User ID
+  provider: 'rechargegames';
+  provider_order_id: string;  // RechargeGames Order ID (used in GET /v1/orders/{order_id})
+  buyer_ref: string;          // Unique idempotency key e.g. 'PLAYUP-20261005-000001'
+  product_key: string;        // Exact RechargeGames product_key
+  product_name: string;       // Display name of the product
+  game: string;               // Game name
+  region: string;             // Product region ('Brazil', 'USA', 'Global', etc.)
+  player_id: string;          // Player ID
+  player_name?: string;       // Verified or provided player name
+  server_id?: string;         // Optional zone/server ID
+  provider_price: number;     // Supplier cost
+  customer_price: number;     // Final PlayUp price charged to customer
+  profit: number;             // customer_price - provider_price
+  currency: string;           // 'USD'
+  status: RechargeGamesOrderStatus; // 'pending' | 'delivered' | 'failed' | 'refunded'
+  test_mode: boolean;         // true if created in TEST mode
+  payment_method?: string;
+  payment_reference?: string;
+  created_at: string;
+  updated_at: string;
+  delivered_at?: string;
+  refunded_at?: string;
+  refund_reason?: string;
+  refund_transaction_id?: string;
+  failure_reason?: string;
+  poll_attempts?: number;
+  last_polled_at?: string;
+}
+
+/**
+ * Table: webhook_events (RechargeGames webhook deduplication & audit log)
+ */
+export interface RechargeGamesWebhookEvent {
+  event_id: string;           // Unique webhook-id or event_id
+  event_type: string;         // 'webhook.test' | 'order.delivered' | 'order.refunded' | 'order.failed'
+  provider: 'rechargegames';
+  order_id?: string;          // RechargeGames order_id or PlayUp order id
+  provider_order_id?: string; // RechargeGames order_id
+  playup_order_id?: string;   // PlayUp order ID (PU-...)
+  buyer_ref?: string;         // buyer_ref if included
+  received_at: string;
+  processed_at?: string;
+  processing_status:
+    | 'processed'
+    | 'rejected_signature'
+    | 'duplicate_ignored'
+    | 'order_not_found'
+    | 'invalid_payload'
+    | 'error';
+  signature_valid: boolean;
+  webhook_timestamp?: string;
+  signature_header?: string;
+  signature_masked?: string;
+  computed_hmac_preview?: string;
+  payload_preview?: string;
+  error_message?: string;
+  processing_steps?: string[];
+  firestore_doc_path?: string;
+  firestore_idempotency_status?: 'stored' | 'duplicate_blocked' | 'skipped_unverified';
+  firestore_synced_at?: string;
+}
+
+/**
+ * Firestore /webhook_events/{eventId} immutable idempotency document
+ */
+export interface FirestoreWebhookIdempotencyRecord {
+  eventId: string;
+  provider: 'rechargegames';
+  eventType: 'webhook.test' | 'order.delivered' | 'order.refunded' | 'order.failed';
+  providerOrderId?: string;
+  playupOrderId?: string;
+  buyerRef?: string;
+  status: 'processed';
+  signatureHash: string;
+  processedAt: string;
+  firestoreDocPath: string;
+}
+
+/**
+ * PlayUp Server-Side Margin Configuration for RechargeGames
+ */
+export interface RechargeGamesMarginConfig {
+  globalMarginPercent: number;            // Default e.g. 20 (%)
+  gameMargins: Record<string, number>;    // e.g. { 'Free Fire': 20, 'PUBG Mobile': 18 }
+  regionMargins: Record<string, number>;  // e.g. { 'Brazil': 15, 'USA': 20, 'Global': 20 }
+  productMargins: Record<string, number>; // e.g. { 'ff_br_100': 25 } (margin % per product_key)
+  updatedAt: string;
+}
+
+export interface RechargeGamesSyncStats {
+  lastSyncedAt: string | null;
+  totalProducts: number;
+  activeProducts: number;
+  unavailableProducts: number;
+  regionsAvailable: string[];
+  gamesAvailable: string[];
+  syncErrors: string[];
+  autoSyncEnabled: boolean;
+  autoSyncIntervalMinutes: number;
+}
+
+export interface RechargeGamesConfigState {
+  mode: RechargeGamesMode;                // 'TEST' | 'PRODUCTION'
+  baseUrl: string;                        // RECHARGEGAMES_BASE_URL
+  hasApiKey: boolean;
+  apiKeyMasked: string;
+  hasWebhookSecret: boolean;
+  webhookSecretMasked: string;
+  webhookEndpoint: string;                // '/api/webhooks/rechargegames'
+  connectionStatus: 'connected' | 'error' | 'untested';
+  lastConnectionLabel: string;
+  lastConnectionTestedAt?: string;
+  syncStats: RechargeGamesSyncStats;
+  margins: RechargeGamesMarginConfig;
+}
+
+export interface RechargeGamesTestStepResult {
+  testNumber: number;
+  name: string;
+  passed: boolean;
+  durationMs: number;
+  details: string;
+  evidence?: Record<string, any>;
+}
+
 

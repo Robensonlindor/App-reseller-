@@ -575,13 +575,15 @@ export class GoXtopProvider extends BaseProvider {
           ? `https://goxtop.com${rawImage}`
           : (rawImage || '/src/assets/images/game_cover_freefire_1790988876938.jpg');
 
+        const candidateId = 'game_' + gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '_');
         const existing = games.find(
           g =>
+            g.id === candidateId ||
             g.externalGameId?.toLowerCase() === gameCode.toLowerCase() ||
             g.slug.toLowerCase() === gameCode.toLowerCase() ||
             (gameCode === 'freefire_global' && g.id === 'game_ff') ||
-            (gameCode === 'mlbb_special' && g.id === 'game_mlbb') ||
-            (gameCode === 'codm_sgmy' && g.id === 'game_codm')
+            ((gameCode === 'mlbb_special' || gameCode === 'mlbb') && g.id === 'game_mlbb') ||
+            ((gameCode === 'codm_sgmy' || gameCode === 'codm') && g.id === 'game_codm')
         );
 
         if (existing) {

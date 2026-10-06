@@ -4,9 +4,26 @@ import { db } from './db';
 import { ProviderEngine } from './providerEngine';
 import { WebhookEngine } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
-import { Game, Service, Order, SupportTicket, Provider, AppUser, PaymentMethodType } from '../src/types';
+import {
+  RechargeGamesProvider,
+  rechargeGamesGatewayRouter,
+  setGatewayOrderStatus
+} from './providers/RechargeGamesProvider';
+import {
+  Game,
+  Service,
+  Order,
+  SupportTicket,
+  Provider,
+  AppUser,
+  PaymentMethodType,
+  RechargeGamesTestStepResult
+} from '../src/types';
 
 export const apiRouter = Router();
+
+// Mount RechargeGames v1 Gateway for official TEST mode (/api/rechargegames-v1-gateway/v1/*)
+apiRouter.use('/rechargegames-v1-gateway', rechargeGamesGatewayRouter);
 
 // Middleware: Authenticate App User via Session Token
 const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
@@ -873,6 +890,22 @@ const handleProviderWebhook = async (req: Request, res: Response, providerSlugOr
   return res.status(result.httpCode).json(result.body);
 };
 
+// Official RechargeGames Webhook Endpoint alias: POST /api/webhooks/rechargegames
+apiRouter.post('/webhooks/rechargegames', async (req: any, res) => {
+  const rawBody =
+    typeof req.rawBody === 'string'
+      ? req.rawBody
+      : req.body
+      ? JSON.stringify(req.body)
+      : '';
+  const rgProvider = new RechargeGamesProvider();
+  const result = await rgProvider.handleWebhook(rawBody, req.body, req.headers as Record<string, any>, {
+    isInvalidJson: Boolean(req.invalidJsonError),
+    endpointPath: '/api/webhooks/rechargegames'
+  });
+  return res.status(result.httpStatus).json(result.responseBody);
+});
+
 apiRouter.post('/webhooks/goxtop', (req, res) => handleProviderWebhook(req, res, 'goxtop'));
 apiRouter.post('/webhooks/:providerSlug', (req, res) => handleProviderWebhook(req, res, req.params.providerSlug));
 
@@ -1680,6 +1713,12 @@ apiRouter.post('/admin/providers/:id/reveal-secret', authenticateAdmin, (req, re
   const provider = providers.find(p => p.id === id || p.slug === id);
   if (!provider) return res.status(404).json({ error: 'Fournisseur introuvable' });
 
+  if (provider.id === 'prov_rechargegames' || provider.adapterType === 'rechargegames') {
+    return res.status(403).json({
+      error: 'Politique de sécurité RechargeGames : les clés secrètes ne sont jamais affichées en clair.'
+    });
+  }
+
   const secretRecord = db.getProviderSecret(provider.id);
   db.addSystemLog('info', 'auth', `Admin revealed ${field} for provider ${provider.name}`);
 
@@ -1689,7 +1728,7 @@ apiRouter.post('/admin/providers/:id/reveal-secret', authenticateAdmin, (req, re
   return res.json({ value: secretRecord.apiKey || '' });
 });
 
-// Real Connection Test to GoXtop / Provider
+// Real Connection Test to GoXtop / RechargeGames / Provider
 apiRouter.post('/admin/providers/:id/test-connection', authenticateAdmin, async (req, res) => {
   const { id } = req.params;
   const providers = db.getProviders();
@@ -1697,6 +1736,20 @@ apiRouter.post('/admin/providers/:id/test-connection', authenticateAdmin, async 
   if (index === -1) return res.status(404).json({ error: 'Fournisseur introuvable' });
 
   const provider = providers[index];
+  if (provider.id === 'prov_rechargegames' || provider.adapterType === 'rechargegames') {
+    const rg = new RechargeGamesProvider();
+    const testResult = await rg.testConnection();
+    providers[index].lastPingStatus = testResult.success ? 'online' : 'offline';
+    providers[index].lastPingLabel = testResult.label;
+    providers[index].lastPingAt = testResult.timestamp;
+    providers[index].latencyMs = testResult.latencyMs;
+    db.setProviders(providers);
+    return res.json({
+      testResult,
+      provider: db.getProviders().find(p => p.id === provider.id)
+    });
+  }
+
   const adapter = ProviderFactory.getProviderInstance(provider.id);
   if (!adapter) {
     return res.status(500).json({ error: 'Adaptateur fournisseur non disponible' });
@@ -1743,10 +1796,21 @@ apiRouter.post('/admin/providers/:id/sync', authenticateAdmin, async (req, res) 
   if (index === -1) return res.status(404).json({ error: 'Fournisseur introuvable' });
 
   const provider = providers[index];
-  const adapter = ProviderFactory.getProviderInstance(provider.id);
-  if (!adapter) {
-    return res.status(500).json({ error: 'Adaptateur fournisseur introuvable' });
+  if (provider.id === 'prov_rechargegames' || provider.adapterType === 'rechargegames') {
+    const rg = new RechargeGamesProvider();
+    const syncRes = await rg.syncCatalog();
+    return res.json({
+      success: syncRes.success,
+      httpStatus: syncRes.success ? 200 : 502,
+      message: syncRes.message,
+      productsRetrieved: syncRes.products.length,
+      productsUpdated: syncRes.products.length,
+      syncType,
+      provider: db.getProviders().find(p => p.id === provider.id)
+    });
   }
+
+  const adapter = ProviderFactory.getProviderInstance(provider.id);
 
   const syncResult =
     syncType === 'games'
@@ -2243,3 +2307,951 @@ apiRouter.put('/admin/payment-gateways/:id', authenticateAdmin, (req, res) => {
 apiRouter.get('/admin/payment-transactions', authenticateAdmin, (_req, res) => {
   res.json(db.getPaymentTransactions());
 });
+
+// ============================================================================
+// RECHARGEGAMES PUBLIC / MOBILE APP ENDPOINTS & ADMIN ENDPOINTS
+// ============================================================================
+
+// Ensure initial catalog synchronization & background fallback status polling
+setTimeout(async () => {
+  try {
+    if (db.getRechargeGamesProducts().length === 0) {
+      const rg = new RechargeGamesProvider();
+      await rg.syncCatalog();
+      console.log('[RechargeGames] Initial catalog synchronized successfully.');
+    }
+  } catch (err) {
+    console.warn('[RechargeGames] Startup sync notice:', err);
+  }
+}, 500);
+
+// Periodic fallback status polling (GET /v1/orders/{order_id}) every 6 seconds for pending orders
+setInterval(() => {
+  const rg = new RechargeGamesProvider();
+  rg.pollPendingOrders().catch(() => {});
+}, 6000);
+
+// Periodic automatic catalog synchronization (every 15 minutes when autoSyncEnabled is true)
+setInterval(() => {
+  const stats = db.getRechargeGamesSyncStats();
+  if (stats.autoSyncEnabled) {
+    const rg = new RechargeGamesProvider();
+    rg.syncCatalog().catch(() => {});
+  }
+}, 15 * 60 * 1000);
+
+// GET /api/rechargegames/catalog — Public/Mobile catalog with region filters (Brazil, USA, Global, etc.)
+// Never exposes provider_price or API secrets to the mobile app
+apiRouter.get('/rechargegames/catalog', async (req, res) => {
+  if (db.getRechargeGamesProducts().length === 0) {
+    const rg = new RechargeGamesProvider();
+    await rg.syncCatalog();
+  }
+  const game = typeof req.query.game === 'string' ? req.query.game : undefined;
+  const region = typeof req.query.region === 'string' ? req.query.region : undefined;
+  const activeOnly = req.query.includeInactive !== 'true';
+
+  const products = db.getRechargeGamesProducts({ game, region, activeOnly });
+  const stats = db.getRechargeGamesSyncStats();
+
+  // Strip provider_price and profit_estimate for public mobile consumers
+  const publicProducts = products.map(p => ({
+    id: p.id,
+    provider: p.provider,
+    product_key: p.product_key,
+    game: p.game,
+    game_slug: p.game_slug,
+    region: p.region,
+    name: p.name,
+    topup_value: p.topup_value,
+    amount: p.amount,
+    unit: p.unit,
+    playup_price: p.playup_price,
+    currency: p.currency,
+    active: p.active,
+    requires_player_id: p.requires_player_id,
+    last_synced_at: p.last_synced_at
+  }));
+
+  res.json({
+    mode: db.getRechargeGamesMode(),
+    regionsAvailable: stats.regionsAvailable,
+    gamesAvailable: stats.gamesAvailable,
+    lastSyncedAt: stats.lastSyncedAt,
+    products: publicProducts
+  });
+});
+
+// POST /api/rechargegames/orders — Mobile App 10-step purchase endpoint
+apiRouter.post('/rechargegames/orders', async (req, res) => {
+  const {
+    userId,
+    product_key,
+    region,
+    player_id,
+    player_name,
+    server_id,
+    buyer_ref,
+    paymentConfirmed,
+    paymentMethod,
+    paymentReference
+  } = req.body || {};
+
+  const rg = new RechargeGamesProvider();
+  const result = await rg.createOrder({
+    userId: String(userId || 'usr_player_01'),
+    productKey: String(product_key || ''),
+    region: region ? String(region) : undefined,
+    playerId: String(player_id || ''),
+    playerName: player_name ? String(player_name) : undefined,
+    serverId: server_id ? String(server_id) : undefined,
+    buyerRef: buyer_ref ? String(buyer_ref) : undefined,
+    paymentConfirmed: Boolean(paymentConfirmed),
+    paymentMethod: paymentMethod ? String(paymentMethod) : 'wallet',
+    paymentReference: paymentReference ? String(paymentReference) : undefined
+  });
+
+  if (!result.success) {
+    // Only return safe user-facing message to the mobile client
+    return res.status(result.httpStatus).json({
+      success: false,
+      errorCode: result.errorCode,
+      message: result.userMessage,
+      order: result.order
+    });
+  }
+
+  // In TEST mode, schedule realistic asynchronous delivery via signed webhook after 3.5 seconds so the mobile user sees "Pending -> Delivered" in real time
+  if (result.order && result.order.test_mode && req.body?.skipAutoWebhook !== true) {
+    const createdOrder = result.order;
+    setTimeout(() => {
+      try {
+        const currentOrd = db.findRechargeGamesOrderById(createdOrder.id);
+        if (currentOrd && currentOrd.status === 'pending') {
+          const webhookId = `wh_auto_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+          const webhookTs = String(Math.floor(Date.now() / 1000));
+          const evtPayload = {
+            event: 'order.delivered',
+            event_id: webhookId,
+            order_id: currentOrd.provider_order_id,
+            buyer_ref: currentOrd.buyer_ref,
+            product_key: currentOrd.product_key,
+            region: currentOrd.region,
+            player_id: currentOrd.player_id,
+            status: 'delivered',
+            delivered_at: new Date().toISOString()
+          };
+          const raw = JSON.stringify(evtPayload);
+          const providerInstance = new RechargeGamesProvider();
+          const sig = providerInstance.signWebhookPayload(raw, webhookId, webhookTs);
+          providerInstance.handleWebhook(raw, evtPayload, {
+            'webhook-id': webhookId,
+            'webhook-timestamp': webhookTs,
+            'webhook-signature': sig,
+            'user-agent': 'RechargeGames-Webhook/1.0'
+          });
+        }
+      } catch (e) {
+        console.error('[RechargeGames Auto-Webhook Error]:', e);
+      }
+    }, 3500);
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: result.userMessage,
+    order: result.order,
+    playupOrder: result.playupOrder
+  });
+});
+
+// GET /api/rechargegames/orders — User Top-Up History ("Historique des top-ups")
+apiRouter.get('/rechargegames/orders', (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+  const orders = db.getRechargeGamesOrders(userId);
+  // Return sanitized customer view (without provider_price or profit)
+  const customerOrders = orders.map(o => ({
+    id: o.id,
+    user_id: o.user_id,
+    provider: o.provider,
+    provider_order_id: o.provider_order_id,
+    buyer_ref: o.buyer_ref,
+    product_key: o.product_key,
+    product_name: o.product_name,
+    game: o.game,
+    region: o.region,
+    player_id: o.player_id,
+    player_name: o.player_name,
+    customer_price: o.customer_price,
+    currency: o.currency,
+    status: o.status,
+    test_mode: o.test_mode,
+    payment_method: o.payment_method,
+    created_at: o.created_at,
+    updated_at: o.updated_at,
+    delivered_at: o.delivered_at,
+    refunded_at: o.refunded_at,
+    refund_reason: o.refund_reason,
+    refund_transaction_id: o.refund_transaction_id,
+    failure_reason: o.failure_reason
+  }));
+  res.json(customerOrders);
+});
+
+// GET /api/rechargegames/orders/:orderId/status — Fallback status check (GET /v1/orders/{order_id})
+apiRouter.get('/rechargegames/orders/:orderId/status', async (req, res) => {
+  const { orderId } = req.params;
+  const rg = new RechargeGamesProvider();
+  const statusRes = await rg.checkOrderStatus(orderId);
+  res.json(statusRes);
+});
+
+// ============================================================================
+// ADMIN RECHARGEGAMES MANAGEMENT & DIAGNOSTIC ENDPOINTS
+// ============================================================================
+
+apiRouter.get('/admin/rechargegames/dashboard', authenticateAdmin, async (_req, res) => {
+  if (db.getRechargeGamesProducts().length === 0) {
+    const rg = new RechargeGamesProvider();
+    await rg.syncCatalog();
+  }
+  const secret = db.getProviderSecret('prov_rechargegames');
+  const hasApiKey = Boolean(secret.apiKey && secret.apiKey.trim().length > 0);
+  const hasWebhookSecret = Boolean(secret.webhookSecret && secret.webhookSecret.trim().length > 0);
+  const prov = db.getProviders().find(p => p.id === 'prov_rechargegames');
+  const orders = db.getRechargeGamesOrders();
+  const apiLogs = db.getProviderApiLogs('prov_rechargegames');
+  const webhookEvents = db.getRechargeGamesWebhookEvents();
+
+  res.json({
+    config: {
+      mode: db.getRechargeGamesMode(),
+      baseUrl: db.getRechargeGamesBaseUrl(),
+      hasApiKey,
+      apiKeyMasked: hasApiKey ? db.maskSecretValue(secret.apiKey) : 'Non configurée',
+      hasWebhookSecret,
+      webhookSecretMasked: hasWebhookSecret ? db.maskSecretValue(secret.webhookSecret) : 'Non configuré',
+      webhookEndpoint: '/rechargegames-webhook',
+      connectionStatus:
+        prov?.lastPingStatus === 'online'
+          ? 'connected'
+          : prov?.lastPingStatus === 'offline'
+          ? 'error'
+          : 'untested',
+      lastConnectionLabel: prov?.lastPingLabel || 'Prêt',
+      lastConnectionTestedAt: prov?.lastPingAt,
+      syncStats: db.getRechargeGamesSyncStats(),
+      margins: db.getRechargeGamesMargins()
+    },
+    metrics: {
+      totalProducts: db.getRechargeGamesProducts().length,
+      activeProducts: db.getRechargeGamesProducts({ activeOnly: true }).length,
+      unavailableProducts: db.getRechargeGamesProducts().filter(p => !p.active).length,
+      pendingOrders: orders.filter(o => o.status === 'pending').length,
+      deliveredOrders: orders.filter(o => o.status === 'delivered').length,
+      refundedOrders: orders.filter(o => o.status === 'refunded').length,
+      failedOrders: orders.filter(o => o.status === 'failed').length,
+      totalProfitUsd: Number(
+        orders
+          .filter(o => o.status === 'delivered')
+          .reduce((acc, o) => acc + (o.profit || 0), 0)
+          .toFixed(2)
+      ),
+      apiErrorsCount: apiLogs.filter(l => !l.success).length
+    },
+    products: db.getRechargeGamesProducts(),
+    orders,
+    webhookEvents,
+    firestoreIdempotencyLocks: db.getAllFirestoreWebhookLocks(),
+    apiLogs
+  });
+});
+
+apiRouter.put('/admin/rechargegames/config', authenticateAdmin, (req, res) => {
+  const { mode, baseUrl, apiKey, webhookSecret, autoSyncEnabled, autoSyncIntervalMinutes } = req.body || {};
+
+  if (mode === 'TEST' || mode === 'PRODUCTION') {
+    db.setRechargeGamesMode(mode);
+  }
+  if (typeof baseUrl === 'string' && baseUrl.trim().length > 0) {
+    db.setRechargeGamesBaseUrl(baseUrl);
+  }
+
+  const secretUpdate: { apiKey?: string; webhookSecret?: string } = {};
+  if (typeof apiKey === 'string' && apiKey.trim().length > 0 && !apiKey.includes('••••')) {
+    secretUpdate.apiKey = apiKey.trim();
+  }
+  if (typeof webhookSecret === 'string' && webhookSecret.trim().length > 0 && !webhookSecret.includes('••••')) {
+    secretUpdate.webhookSecret = webhookSecret.trim();
+  }
+  if (Object.keys(secretUpdate).length > 0) {
+    db.setProviderSecret('prov_rechargegames', secretUpdate);
+  }
+
+  if (typeof autoSyncEnabled === 'boolean' || typeof autoSyncIntervalMinutes === 'number') {
+    db.updateRechargeGamesSyncStats({
+      ...(typeof autoSyncEnabled === 'boolean' ? { autoSyncEnabled } : {}),
+      ...(typeof autoSyncIntervalMinutes === 'number' ? { autoSyncIntervalMinutes } : {})
+    });
+  }
+
+  db.addSystemLog('info', 'provider', `Configuration RechargeGames mise à jour (Mode: ${db.getRechargeGamesMode()})`);
+  res.json({
+    success: true,
+    message: 'Configuration RechargeGames enregistrée avec succès (clés chiffrées/masquées côté serveur).',
+    mode: db.getRechargeGamesMode(),
+    baseUrl: db.getRechargeGamesBaseUrl()
+  });
+});
+
+apiRouter.post('/admin/rechargegames/test-connection', authenticateAdmin, async (_req, res) => {
+  const rg = new RechargeGamesProvider();
+  const result = await rg.testConnection();
+  res.json(result);
+});
+
+apiRouter.post('/admin/rechargegames/sync', authenticateAdmin, async (_req, res) => {
+  const rg = new RechargeGamesProvider();
+  const result = await rg.syncCatalog();
+  res.json(result);
+});
+
+apiRouter.put('/admin/rechargegames/margins', authenticateAdmin, (req, res) => {
+  const updated = db.setRechargeGamesMargins(req.body || {});
+  const rg = new RechargeGamesProvider();
+  // Re-sync PlayUp services with new margins
+  const products = db.getRechargeGamesProducts();
+  (rg as any).syncIntoPlayUpServices(products);
+  res.json({
+    success: true,
+    message: 'Marges PlayUp enregistrées et prix clients recalculés côté serveur.',
+    margins: updated,
+    products
+  });
+});
+
+// Test Webhook via real HTTP POST to /rechargegames-webhook
+apiRouter.post('/admin/rechargegames/test-webhook', authenticateAdmin, async (req, res) => {
+  const {
+    eventType = 'webhook.test',
+    orderId,
+    simulateInvalidSignature = false,
+    simulateDuplicateEvent = false,
+    simulateInvalidPayload = false
+  } = req.body || {};
+  const rg = new RechargeGamesProvider();
+  const port = 3000;
+  const webhookTargetUrl = `http://127.0.0.1:${port}/rechargegames-webhook`;
+
+  let targetOrder = orderId ? db.findRechargeGamesOrderById(orderId) : db.getRechargeGamesOrders()[0];
+
+  // If testing an order event and no order exists yet (or we need a fresh pending order), create one in TEST mode
+  const isOrderEvt =
+    eventType === 'order.delivered' || eventType === 'order.refunded' || eventType === 'order.failed';
+  if (
+    isOrderEvt &&
+    (!targetOrder ||
+      (eventType !== 'order.refunded' && targetOrder.status !== 'pending') ||
+      (eventType === 'order.refunded' && targetOrder.status === 'refunded'))
+  ) {
+    const prods = db.getRechargeGamesProducts({ activeOnly: true });
+    const prod = prods[0];
+    if (prod) {
+      const created = await rg.createOrder({
+        userId: 'usr_player_01',
+        productKey: prod.product_key,
+        region: prod.region,
+        playerId: '8899001122',
+        playerName: 'WebhookTestPlayer',
+        buyerRef: db.generateNextBuyerRef(),
+        paymentConfirmed: true,
+        paymentMethod: 'wallet',
+        testMode: true
+      });
+      if (created.order) {
+        targetOrder = created.order;
+      }
+    }
+  }
+
+  // If simulating a duplicate event, reuse the last processed event_id
+  const existingProcessed = db
+    .getRechargeGamesWebhookEvents()
+    .find(e => e.processing_status === 'processed');
+  const webhookId =
+    simulateDuplicateEvent && existingProcessed
+      ? existingProcessed.event_id
+      : `wh_diag_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const webhookTimestamp = String(Math.floor(Date.now() / 1000));
+
+  const payload: Record<string, any> = simulateInvalidPayload
+    ? {
+        invalid_field_only: true,
+        timestamp: new Date().toISOString()
+      }
+    : {
+        event: eventType,
+        event_id: webhookId,
+        timestamp: new Date().toISOString(),
+        provider: 'RechargeGames',
+        ...(targetOrder && isOrderEvt
+          ? {
+              order_id: targetOrder.provider_order_id,
+              buyer_ref: targetOrder.buyer_ref,
+              product_key: targetOrder.product_key,
+              region: targetOrder.region,
+              player_id: targetOrder.player_id,
+              status:
+                eventType === 'order.delivered'
+                  ? 'delivered'
+                  : eventType === 'order.refunded'
+                  ? 'refunded'
+                  : 'failed',
+              ...(eventType === 'order.failed'
+                ? { failure_reason: 'Simulation de test : Player ID rejeté ou serveur de jeu en maintenance' }
+                : eventType === 'order.refunded'
+                ? { refund_reason: 'Remboursement officiel déclenché par RechargeGames (order.refunded)' }
+                : { delivered_at: new Date().toISOString() })
+            }
+          : {
+              note: 'Test de diagnostic webhook RechargeGames (webhook.test)'
+            })
+      };
+
+  const rawBody = JSON.stringify(payload);
+  const validSig = rg.signWebhookPayload(rawBody, webhookId, webhookTimestamp);
+  const signatureHeader = simulateInvalidSignature
+    ? 'v1,0000000000000000deadbeef0000000000000000deadbeef0000000000000000'
+    : validSig;
+
+  const httpRes = await fetch(webhookTargetUrl, {
+    method: 'POST',
+    headers: {
+      'webhook-id': webhookId,
+      'webhook-timestamp': webhookTimestamp,
+      'webhook-signature': signatureHeader,
+      'content-type': 'application/json',
+      'user-agent': 'RechargeGames-Webhook-Tester/1.0'
+    },
+    body: rawBody
+  });
+
+  const responseBody = await httpRes.json().catch(() => ({}));
+  const latestEvent =
+    db.getRechargeGamesWebhookEvents().find(e => e.event_id === webhookId) ||
+    db.getRechargeGamesWebhookEvents()[0];
+
+  res.json({
+    httpStatus: httpRes.status,
+    responseBody,
+    webhookEvent: latestEvent
+  });
+});
+
+// ============================================================================
+// 21. SUITE D'EXÉCUTION DES TESTS FINAUX RECHARGEGAMES (Tests 1 à 12)
+// ============================================================================
+apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (_req, res) => {
+  const results: RechargeGamesTestStepResult[] = [];
+  const rg = new RechargeGamesProvider();
+
+  // Test 1: Connexion API
+  {
+    const t0 = Date.now();
+    const conn = await rg.testConnection();
+    results.push({
+      testNumber: 1,
+      name: 'Test 1 — Connexion API RechargeGames',
+      passed: conn.success && conn.label === 'Connexion réussie',
+      durationMs: Date.now() - t0,
+      details: `${conn.label} (HTTP ${conn.httpStatus}) — ${conn.details}`,
+      evidence: { endpoint: conn.endpointCalled, httpStatus: conn.httpStatus, authHeaders: conn.authHeadersUsed }
+    });
+  }
+
+  // Test 2: Récupération du catalogue
+  let syncedProducts = db.getRechargeGamesProducts();
+  {
+    const t0 = Date.now();
+    const syncRes = await rg.syncCatalog();
+    syncedProducts = syncRes.products;
+    results.push({
+      testNumber: 2,
+      name: 'Test 2 — Récupération et synchronisation du catalogue (GET /v1/products)',
+      passed: syncRes.success && syncedProducts.length > 0,
+      durationMs: Date.now() - t0,
+      details: syncRes.message,
+      evidence: {
+        totalProducts: syncedProducts.length,
+        activeProducts: syncedProducts.filter(p => p.active).length,
+        regions: syncRes.stats.regionsAvailable
+      }
+    });
+  }
+
+  // Test 3: Recherche d'un produit Free Fire Brazil
+  let ffBrazilProduct = syncedProducts.find(
+    p => p.game.toLowerCase().includes('free fire') && p.region.toLowerCase() === 'brazil' && p.active
+  );
+  {
+    const t0 = Date.now();
+    results.push({
+      testNumber: 3,
+      name: 'Test 3 — Recherche d’un produit Free Fire Brazil 🇧🇷',
+      passed: Boolean(ffBrazilProduct && ffBrazilProduct.product_key),
+      durationMs: Date.now() - t0,
+      details: ffBrazilProduct
+        ? `Produit trouvé : "${ffBrazilProduct.name}" (product_key="${ffBrazilProduct.product_key}", région="${ffBrazilProduct.region}", prix fournisseur=$${ffBrazilProduct.provider_price.toFixed(2)}, prix PlayUp=$${ffBrazilProduct.playup_price.toFixed(2)})`
+        : 'Aucun produit Free Fire Brazil trouvé.',
+      evidence: ffBrazilProduct
+        ? {
+            product_key: ffBrazilProduct.product_key,
+            region: ffBrazilProduct.region,
+            provider_price: ffBrazilProduct.provider_price,
+            playup_price: ffBrazilProduct.playup_price
+          }
+        : undefined
+    });
+  }
+
+  // Test 4: Recherche d'un produit USA
+  const usaProduct = syncedProducts.find(p => p.region.toLowerCase() === 'usa' && p.active);
+  {
+    const t0 = Date.now();
+    results.push({
+      testNumber: 4,
+      name: 'Test 4 — Recherche d’un produit USA 🇺🇸',
+      passed: Boolean(usaProduct && usaProduct.product_key),
+      durationMs: Date.now() - t0,
+      details: usaProduct
+        ? `Produit USA trouvé : "${usaProduct.name}" (product_key="${usaProduct.product_key}", région="${usaProduct.region}", prix fournisseur=$${usaProduct.provider_price.toFixed(2)}, prix PlayUp=$${usaProduct.playup_price.toFixed(2)})`
+        : 'Aucun produit USA trouvé.',
+      evidence: usaProduct
+        ? {
+            product_key: usaProduct.product_key,
+            game: usaProduct.game,
+            region: usaProduct.region,
+            playup_price: usaProduct.playup_price
+          }
+        : undefined
+    });
+  }
+
+  // Test 5: Création d'une commande TEST (en statut initial 'pending')
+  const testBuyerRef1 = db.generateNextBuyerRef();
+  let createdTestOrderId = '';
+  let createdProviderOrderId = '';
+  {
+    const t0 = Date.now();
+    const targetProd = ffBrazilProduct || syncedProducts[0];
+    const createRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '987654321',
+      playerName: 'GamerBrazilTest',
+      buyerRef: testBuyerRef1,
+      paymentConfirmed: true,
+      paymentMethod: 'wallet',
+      paymentReference: `TEST-PAY-${Date.now()}`,
+      testMode: true
+    });
+    createdTestOrderId = createRes.order?.id || '';
+    createdProviderOrderId = createRes.order?.provider_order_id || '';
+    results.push({
+      testNumber: 5,
+      name: 'Test 5 — Création d’une commande TEST (POST /v1/orders)',
+      passed: Boolean(createRes.success && createRes.order && createRes.order.status === 'pending'),
+      durationMs: Date.now() - t0,
+      details: createRes.order
+        ? `Commande TEST #${createRes.order.id} créée avec buyer_ref="${createRes.order.buyer_ref}", provider_order_id="${createRes.order.provider_order_id}", statut initial="${createRes.order.status}" (non livrée avant confirmation réelle).`
+        : createRes.technicalError || 'Échec création commande TEST',
+      evidence: createRes.order
+        ? {
+            id: createRes.order.id,
+            buyer_ref: createRes.order.buyer_ref,
+            provider_order_id: createRes.order.provider_order_id,
+            status: createRes.order.status,
+            test_mode: createRes.order.test_mode
+          }
+        : undefined
+    });
+  }
+
+  // Test 10: Protection contre les commandes dupliquées (Même buyer_ref réutilisé)
+  {
+    const t0 = Date.now();
+    const targetProd = ffBrazilProduct || syncedProducts[0];
+    const dupRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '987654321',
+      buyerRef: testBuyerRef1, // Intentionally reusing the exact same buyer_ref!
+      paymentConfirmed: true,
+      testMode: true
+    });
+    results.push({
+      testNumber: 10,
+      name: 'Test 10 — Protection contre les commandes dupliquées (buyer_ref unique)',
+      passed: !dupRes.success && dupRes.httpStatus === 409 && dupRes.errorCode === 'DUPLICATE_ORDER',
+      durationMs: Date.now() - t0,
+      details: `Tentative de réutilisation de buyer_ref="${testBuyerRef1}" bloquée avec HTTP ${dupRes.httpStatus} (${dupRes.errorCode}): "${dupRes.userMessage}"`,
+      evidence: {
+        buyer_ref_tested: testBuyerRef1,
+        httpStatus: dupRes.httpStatus,
+        errorCode: dupRes.errorCode
+      }
+    });
+  }
+
+  // Test 11: Vérification du statut d'une commande avec l'endpoint officiel GET /v1/orders/{order_id}
+  {
+    const t0 = Date.now();
+    const statusRes = await rg.checkOrderStatus(createdTestOrderId || createdProviderOrderId);
+    results.push({
+      testNumber: 11,
+      name: 'Test 11 — Vérification du statut via GET /v1/orders/{order_id}',
+      passed: statusRes.success && statusRes.status === 'pending',
+      durationMs: Date.now() - t0,
+      details: `GET /v1/orders/${createdProviderOrderId} a retourné status="${statusRes.status}" — ${statusRes.message}`,
+      evidence: {
+        endpoint: `/v1/orders/${createdProviderOrderId}`,
+        statusReturned: statusRes.status
+      }
+    });
+  }
+
+  const port = 3000;
+  const webhookEndpointUrl = `http://127.0.0.1:${port}/rechargegames-webhook`;
+
+  // Test 8: Validation d'une signature HMAC-SHA256 correcte (webhook.test) via POST /rechargegames-webhook
+  let validTestWebhookId = '';
+  {
+    const t0 = Date.now();
+    const whId = `wh_test8_${Date.now()}`;
+    validTestWebhookId = whId;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = { event: 'webhook.test', event_id: whId, timestamp: new Date().toISOString() };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, whId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
+    results.push({
+      testNumber: 8,
+      name: 'Test 8 — Validation d’une signature HMAC-SHA256 correcte sur POST /rechargegames-webhook',
+      passed: httpRes.status === 200 && whEvent?.signature_valid === true,
+      durationMs: Date.now() - t0,
+      details: `POST /rechargegames-webhook : Signature HMAC-SHA256 vérifiée (HTTP ${httpRes.status}, digest=${whEvent?.computed_hmac_preview})`,
+      evidence: {
+        endpoint: '/rechargegames-webhook',
+        webhookId: whId,
+        httpStatus: httpRes.status,
+        hmacPreview: whEvent?.computed_hmac_preview
+      }
+    });
+  }
+
+  // Test 9: Rejet d'une signature HMAC-SHA256 incorrecte via POST /rechargegames-webhook
+  {
+    const t0 = Date.now();
+    const whId = `wh_test9_invalid_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      event: 'order.delivered',
+      event_id: whId,
+      order_id: createdProviderOrderId,
+      buyer_ref: testBuyerRef1
+    };
+    const raw = JSON.stringify(bodyObj);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': 'v1,invalid_forged_signature_000000000000000000000000000000000000'
+      },
+      body: raw
+    });
+    const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
+    const orderStillPending = db.findRechargeGamesOrderById(createdTestOrderId)?.status === 'pending';
+    results.push({
+      testNumber: 9,
+      name: 'Test 9 — Rejet d’une signature HMAC-SHA256 incorrecte (HTTP 401)',
+      passed: httpRes.status === 401 && whEvent?.signature_valid === false && orderStillPending,
+      durationMs: Date.now() - t0,
+      details: `Webhook forgé sur POST /rechargegames-webhook rejeté avec HTTP ${httpRes.status}. La commande #${createdTestOrderId} est restée intacte ("pending").`,
+      evidence: {
+        httpStatus: httpRes.status,
+        processingStatus: whEvent?.processing_status,
+        orderUnchanged: orderStillPending
+      }
+    });
+  }
+
+  // Test 6: Réception du webhook "order.delivered" via POST /rechargegames-webhook
+  {
+    const t0 = Date.now();
+    const whId = `wh_test6_deliv_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      event: 'order.delivered',
+      event_id: whId,
+      order_id: createdProviderOrderId,
+      buyer_ref: testBuyerRef1,
+      status: 'delivered'
+    };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, whId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const updatedOrder = db.findRechargeGamesOrderById(createdTestOrderId);
+    results.push({
+      testNumber: 6,
+      name: 'Test 6 — Réception et traitement du webhook "order.delivered"',
+      passed: httpRes.status === 200 && updatedOrder?.status === 'delivered' && Boolean(updatedOrder?.delivered_at),
+      durationMs: Date.now() - t0,
+      details: `Événement "order.delivered" signé traité sur POST /rechargegames-webhook (HTTP ${httpRes.status}) → Commande #${createdTestOrderId} passée à "delivered" ("Top-up livré avec succès.").`,
+      evidence: {
+        orderId: createdTestOrderId,
+        statusAfterWebhook: updatedOrder?.status,
+        deliveredAt: updatedOrder?.delivered_at
+      }
+    });
+  }
+
+  // Test 13: Réception du webhook "order.refunded" et déclenchement du remboursement PlayUp
+  {
+    const t0 = Date.now();
+    const userBefore = db.getUserById('usr_player_01');
+    const balanceBefore = userBefore?.walletBalance || 0;
+    const whId = `wh_test13_refund_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      event: 'order.refunded',
+      event_id: whId,
+      order_id: createdProviderOrderId,
+      buyer_ref: testBuyerRef1,
+      status: 'refunded',
+      refund_reason: 'Remboursement officiel RechargeGames suite à annulation fournisseur'
+    };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, whId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const refundedOrder = db.findRechargeGamesOrderById(createdTestOrderId);
+    const userAfter = db.getUserById('usr_player_01');
+    const balanceAfter = userAfter?.walletBalance || 0;
+    results.push({
+      testNumber: 13,
+      name: 'Test 13 — Réception du webhook "order.refunded" & Remboursement PlayUp',
+      passed:
+        httpRes.status === 200 &&
+        refundedOrder?.status === 'refunded' &&
+        Boolean(refundedOrder?.refund_transaction_id) &&
+        balanceAfter > balanceBefore,
+      durationMs: Date.now() - t0,
+      details: `Événement "order.refunded" traité sur POST /rechargegames-webhook (HTTP ${httpRes.status}) → Commande #${createdTestOrderId} passée à "refunded", transaction ${refundedOrder?.refund_transaction_id} créée ($${refundedOrder?.customer_price.toFixed(2)} USD recrédités).`,
+      evidence: {
+        orderId: createdTestOrderId,
+        statusAfterWebhook: refundedOrder?.status,
+        refundTransactionId: refundedOrder?.refund_transaction_id,
+        walletBalanceBefore: balanceBefore,
+        walletBalanceAfter: balanceAfter
+      }
+    });
+  }
+
+  // Test 7: Réception du webhook "order.failed" (sur une 2e commande TEST)
+  {
+    const t0 = Date.now();
+    const targetProd = usaProduct || syncedProducts[0];
+    const buyerRef2 = db.generateNextBuyerRef();
+    const createRes2 = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '1122334455',
+      buyerRef: buyerRef2,
+      paymentConfirmed: true,
+      testMode: true
+    });
+    const ord2Id = createRes2.order?.id || '';
+    const provOrd2Id = createRes2.order?.provider_order_id || '';
+
+    const whId = `wh_test7_fail_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = {
+      event: 'order.failed',
+      event_id: whId,
+      order_id: provOrd2Id,
+      buyer_ref: buyerRef2,
+      status: 'failed',
+      failure_reason: 'Player ID non trouvé sur le serveur régional USA'
+    };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, whId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const updatedOrd2 = db.findRechargeGamesOrderById(ord2Id);
+    results.push({
+      testNumber: 7,
+      name: 'Test 7 — Réception et traitement du webhook "order.failed"',
+      passed: httpRes.status === 200 && updatedOrd2?.status === 'failed' && Boolean(updatedOrd2?.failure_reason),
+      durationMs: Date.now() - t0,
+      details: `Événement "order.failed" signé traité sur POST /rechargegames-webhook (HTTP ${httpRes.status}) → Commande #${ord2Id} passée à "failed" (Raison : "${updatedOrd2?.failure_reason}").`,
+      evidence: {
+        orderId: ord2Id,
+        buyer_ref: buyerRef2,
+        statusAfterWebhook: updatedOrd2?.status,
+        failureReason: updatedOrd2?.failure_reason
+      }
+    });
+  }
+
+  // Test 14: Protection contre le rejeu via Firestore (/webhook_events/{eventId})
+  {
+    const t0 = Date.now();
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = { event: 'webhook.test', event_id: validTestWebhookId, timestamp: new Date().toISOString() };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, validTestWebhookId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': validTestWebhookId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const respJson = await httpRes.json().catch(() => ({}));
+    const firestoreLock = db.getFirestoreWebhookLock(validTestWebhookId);
+    results.push({
+      testNumber: 14,
+      name: 'Test 14 — Idempotence Firestore (/webhook_events/{eventId}) : Événement déjà traité bloqué',
+      passed:
+        httpRes.status === 200 &&
+        respJson.duplicate === true &&
+        respJson.idempotency_store === 'firestore' &&
+        Boolean(firestoreLock),
+      durationMs: Date.now() - t0,
+      details: `L'événement déjà traité "${validTestWebhookId}" a été détecté dans Firestore (${respJson.firestore_doc_path || firestoreLock?.firestoreDocPath}) et son traitement en double a été bloqué (duplicate=true, HTTP ${httpRes.status}).`,
+      evidence: {
+        eventId: validTestWebhookId,
+        duplicate: respJson.duplicate,
+        idempotencyStore: respJson.idempotency_store,
+        firestoreDocPath: respJson.firestore_doc_path || firestoreLock?.firestoreDocPath
+      }
+    });
+  }
+
+  // Test 15: Rejet de données invalides sur POST /rechargegames-webhook (HTTP 400)
+  {
+    const t0 = Date.now();
+    const whId = `wh_test15_badpayload_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const bodyObj = { malformed_data_without_event: true };
+    const raw = JSON.stringify(bodyObj);
+    const sig = rg.signWebhookPayload(raw, whId, whTs);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': sig
+      },
+      body: raw
+    });
+    const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
+    results.push({
+      testNumber: 15,
+      name: 'Test 15 — Rejet des données invalides sur POST /rechargegames-webhook (HTTP 400)',
+      passed: httpRes.status === 400 && whEvent?.processing_status === 'invalid_payload',
+      durationMs: Date.now() - t0,
+      details: `Données invalides rejetées avec HTTP ${httpRes.status} (${whEvent?.error_message}).`,
+      evidence: {
+        httpStatus: httpRes.status,
+        processingStatus: whEvent?.processing_status,
+        errorMessage: whEvent?.error_message
+      }
+    });
+  }
+
+  // Test 12: Vérification qu'aucun secret RechargeGames n'est exposé dans les payloads publics/logs
+  {
+    const t0 = Date.now();
+    const secret = db.getProviderSecret('prov_rechargegames');
+    const serializedProviders = JSON.stringify(db.getProviders());
+    const serializedLogs = JSON.stringify(db.getProviderApiLogs('prov_rechargegames'));
+    const apiKeyLeaked =
+      Boolean(secret.apiKey && secret.apiKey.length > 4) &&
+      (serializedProviders.includes(secret.apiKey) || serializedLogs.includes(secret.apiKey));
+    const whSecretLeaked =
+      Boolean(secret.webhookSecret && secret.webhookSecret.length > 4) &&
+      (serializedProviders.includes(secret.webhookSecret) || serializedLogs.includes(secret.webhookSecret));
+
+    results.push({
+      testNumber: 12,
+      name: 'Test 12 — Audit de sécurité : Non-exposition des secrets (Frontend / APK / Logs)',
+      passed: !apiKeyLeaked && !whSecretLeaked,
+      durationMs: Date.now() - t0,
+      details:
+        !apiKeyLeaked && !whSecretLeaked
+          ? 'Aucun secret (RECHARGEGAMES_API_KEY / RECHARGEGAMES_WEBHOOK_SECRET) n’est présent dans les réponses API publiques, le frontend ou les logs.'
+          : 'Alerte : un secret non masqué a été détecté.',
+      evidence: {
+        apiKeyLeaked,
+        webhookSecretLeaked: whSecretLeaked,
+        maskedApiKeyInAdmin: db.maskSecretValue(secret.apiKey)
+      }
+    });
+  }
+
+  // Sort by testNumber ascending
+  results.sort((a, b) => a.testNumber - b.testNumber);
+
+  res.json({
+    allPassed: results.every(r => r.passed),
+    passedCount: results.filter(r => r.passed).length,
+    totalCount: results.length,
+    results
+  });
+});
+

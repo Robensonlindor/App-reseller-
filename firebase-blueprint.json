@@ -152,6 +152,76 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "WebhookIdempotencyRecord": {
+      "title": "WebhookIdempotencyRecord",
+      "description": "Immutable idempotency lock record for RechargeGames webhook events stored in Firestore to prevent duplicate processing.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique RechargeGames webhook event ID."
+        },
+        "provider": {
+          "type": "string",
+          "enum": ["rechargegames"],
+          "maxLength": 32,
+          "description": "Webhook provider identifier."
+        },
+        "eventType": {
+          "type": "string",
+          "enum": ["webhook.test", "order.delivered", "order.refunded", "order.failed"],
+          "maxLength": 64,
+          "description": "Documented RechargeGames webhook event type."
+        },
+        "providerOrderId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Optional RechargeGames order_id."
+        },
+        "playupOrderId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Optional PlayUp order ID."
+        },
+        "buyerRef": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Optional PlayUp unique buyer_ref."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["processed"],
+          "maxLength": 24,
+          "description": "Terminal idempotency lock state."
+        },
+        "signatureHash": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Non-sensitive SHA-256 fingerprint of the verified HMAC signature."
+        },
+        "processedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the event was processed and locked."
+        }
+      },
+      "required": [
+        "eventId",
+        "provider",
+        "eventType",
+        "status",
+        "signatureHash",
+        "processedAt"
+      ]
     }
   },
   "firestore": {
@@ -166,6 +236,10 @@
     "/users/{userId}/orders/{orderId}": {
       "schema": { "$ref": "#/entities/UserOrderRecord" },
       "description": "Subcollection of orders belonging to a specific user."
+    },
+    "/webhook_events/{eventId}": {
+      "schema": { "$ref": "#/entities/WebhookIdempotencyRecord" },
+      "description": "Immutable Firestore idempotency registry for RechargeGames webhook events (/rechargegames-webhook)."
     }
   }
 }

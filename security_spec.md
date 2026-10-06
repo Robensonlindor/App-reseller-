@@ -7,6 +7,7 @@
 4. **Master Gate Relational Sync**: Subcollection documents under `/users/{userId}/orders/{orderId}` require the parent `/users/{userId}` document to exist (`exists(/databases/$(database)/documents/users/$(userId))`) and `ownerId == userId`.
 5. **Terminal State Locking**: Once an order reaches a terminal state (`completed`, `failed`, `cancelled`, `refunded`), non-admin users cannot mutate it.
 6. **Temporal & Identity Immutability**: `createdAt`, `uid`, `ownerId`, `orderNumber`, and `partnerOrderId` are immutable on update, and timestamps must equal `request.time`.
+7. **Immutable Webhook Idempotency Lock (`/webhook_events/{eventId}`)**: Webhook idempotency records in `/webhook_events/{eventId}` require `eventId` to match the document ID (`isValidId(eventId)`), `provider == 'rechargegames'`, `status == 'processed'`, and `processedAt == request.time`. Once created, documents in `/webhook_events/{eventId}` are strictly immutable (`allow update, delete: if false;`) to guarantee that a processed `event_id` can never be replayed or tampered with.
 
 ## 2. The "Dirty Dozen" Payloads
 1. **Unauthenticated Write**: `auth = null`, creating `/users/user_1` -> `PERMISSION_DENIED`.

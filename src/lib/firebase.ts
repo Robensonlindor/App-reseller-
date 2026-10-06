@@ -223,3 +223,69 @@ export async function signOutFirebase() {
     await signOut(currentAuth);
   }
 }
+
+export async function syncWebhookEventIdempotencyToFirestore(record: {
+  eventId: string;
+  eventType: 'webhook.test' | 'order.delivered' | 'order.refunded' | 'order.failed';
+  providerOrderId?: string;
+  playupOrderId?: string;
+  buyerRef?: string;
+  signatureHash: string;
+}) {
+  const { db: currentDb, auth: currentAuth } = ensureFirebaseInitialized();
+  if (!currentDb || !currentAuth?.currentUser || !currentAuth.currentUser.emailVerified) {
+    return;
+  }
+
+  const sanitizedEventId = String(record.eventId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_\-]/g, '_')
+    .slice(0, 128);
+  if (!sanitizedEventId) return;
+
+  const docPath = `webhook_events/${sanitizedEventId}`;
+
+  let existsAlready = false;
+  try {
+    const snap = await getDoc(doc(currentDb, 'webhook_events', sanitizedEventId));
+    existsAlready = snap.exists();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, docPath);
+  }
+
+  if (existsAlready) return;
+
+  const payload: Record<string, any> = {
+    eventId: sanitizedEventId,
+    provider: 'rechargegames',
+    eventType: record.eventType,
+    status: 'processed',
+    signatureHash: String(record.signatureHash || 'verified_hmac_sha256')
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .slice(0, 128),
+    processedAt: serverTimestamp()
+  };
+
+  if (record.providerOrderId) {
+    payload.providerOrderId = String(record.providerOrderId)
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .slice(0, 64);
+  }
+  if (record.playupOrderId) {
+    payload.playupOrderId = String(record.playupOrderId)
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .slice(0, 64);
+  }
+  if (record.buyerRef) {
+    payload.buyerRef = String(record.buyerRef)
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .slice(0, 64);
+  }
+
+  try {
+    await setDoc(doc(currentDb, 'webhook_events', sanitizedEventId), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, docPath);
+  }
+}
+

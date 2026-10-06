@@ -8,7 +8,8 @@ import {
 } from 'lucide-react';
 import {
   Game, Service, ServicePackage, Order, PlayerCheckResult, UserNotification,
-  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType
+  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType,
+  RechargeGamesProduct, RechargeGamesOrderRecord
 } from '../../types';
 import { apiClient } from '../../services/apiClient';
 import { signInWithGooglePopup, signOutFirebase } from '../../lib/firebase';
@@ -38,6 +39,10 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
   // Purchase Flow State
   const [selectedGame, setSelectedGame] = useState<Game | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<string>('Brazil');
+  const [rgCatalog, setRgCatalog] = useState<RechargeGamesProduct[]>([]);
+  const [rgOrders, setRgOrders] = useState<RechargeGamesOrderRecord[]>([]);
+  const [revealedPlayerIds, setRevealedPlayerIds] = useState<Record<string, boolean>>({});
   const [selectedService, setSelectedService] = useState<Service | null>(null);
   const [selectedPackage, setSelectedPackage] = useState<ServicePackage | null>(null);
   const [gameProfileInputs, setGameProfileInputs] = useState<Record<string, string>>({});
@@ -140,7 +145,17 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     loadUserOrders();
     loadNotifications();
     loadPaymentGateways();
+    loadRechargeGamesCatalog();
   }, [authUser?.id]);
+
+  const loadRechargeGamesCatalog = async () => {
+    try {
+      const cat = await apiClient.getRechargeGamesCatalog();
+      setRgCatalog(cat.products || []);
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const loadPaymentGateways = async () => {
     try {
@@ -327,8 +342,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   const loadUserOrders = async () => {
     setOrdersLoading(true);
     try {
-      const orders = await apiClient.getRecentOrders(authUser?.id);
+      const [orders, rgList] = await Promise.all([
+        apiClient.getRecentOrders(authUser?.id),
+        apiClient.getRechargeGamesOrders(authUser?.id).catch(() => [])
+      ]);
       setUserOrders(orders);
+      setRgOrders(rgList);
       if (userToken) {
         const prof = await apiClient.getUserProfile(userToken).catch(() => null);
         if (prof) {
@@ -348,10 +367,24 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setSelectedGame(game);
     const gameServices = services.filter(s => s.gameId === game.id && s.isActive);
     setSelectedService(gameServices[0] || null);
+    // Determine default region for this game from RechargeGames catalog
+    const gameRgProducts = rgCatalog.filter(
+      p => p.game.toLowerCase() === game.name.toLowerCase() || p.game_slug === game.slug
+    );
+    const availableRegs = Array.from(new Set(gameRgProducts.map(p => p.region)));
+    if (availableRegs.includes('Brazil')) {
+      setSelectedRegion('Brazil');
+    } else if (availableRegs.includes('USA')) {
+      setSelectedRegion('USA');
+    } else if (availableRegs.length > 0) {
+      setSelectedRegion(availableRegs[0]);
+    } else {
+      setSelectedRegion('Global');
+    }
     setSelectedPackage(null);
     setPlayerCheckResult(null);
     setShowPaymentStep(false);
-    setPendingPartnerOrderId(`PTNR-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`);
+    setPendingPartnerOrderId('');
 
     // Check if user has saved profile for this game to auto-fill
     const existing = savedProfiles.find(p => p.gameId === game.id);
@@ -452,20 +485,85 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
         setAuthUser(paymentRes.user);
       }
 
-      // 2. Create PlayUp Order & Dispatch to GoXtop with verified payment reference
-      const order = await apiClient.createMobileOrder({
-        gameId: selectedGame.id,
-        serviceId: selectedService.id,
-        packageId: selectedPackage.id,
-        gameProfileData: gameProfileInputs,
-        verifiedPlayerName: playerCheckResult?.verified ? playerCheckResult.playerName : undefined,
-        paymentConfirmed: true,
-        paymentMethod: selectedPaymentMethod,
-        paymentTransactionId: paymentRes.transaction.id,
-        paymentReference: paymentRes.transaction.transactionReference,
-        userId: authUser?.id,
-        partnerOrderId: pendingPartnerOrderId || undefined
-      });
+      // 2. Create PlayUp Order & Dispatch to RechargeGames (or GoXtop fallback) with verified payment reference
+      const productKeyToUse = selectedPackage.productKey || selectedPackage.externalProductId || '';
+      const isRechargeGamesProduct =
+        selectedPackage.providerSlug === 'rechargegames' ||
+        rgCatalog.some(p => p.product_key === productKeyToUse);
+
+      let order: Order;
+      if (isRechargeGamesProduct && productKeyToUse) {
+        const rgRes = await apiClient.createRechargeGamesOrder({
+          userId: authUser?.id || 'usr_player_01',
+          product_key: productKeyToUse,
+          region: selectedPackage.region || selectedRegion,
+          player_id:
+            gameProfileInputs.playerId ||
+            gameProfileInputs.characterId ||
+            Object.values(gameProfileInputs)[0] ||
+            'VOUCHER_PIN',
+          player_name: playerCheckResult?.verified ? playerCheckResult.playerName : gameProfileInputs.playerName,
+          server_id: gameProfileInputs.serverId || gameProfileInputs.zoneId,
+          paymentConfirmed: true,
+          paymentMethod: selectedPaymentMethod,
+          paymentReference: paymentRes.transaction.transactionReference
+        });
+        order = rgRes.playupOrder || {
+          id: rgRes.order.id,
+          orderNumber: rgRes.order.id,
+          partnerOrderId: rgRes.order.buyer_ref,
+          externalOrderId: rgRes.order.provider_order_id,
+          source: 'mobile_app',
+          userId: rgRes.order.user_id,
+          gameId: selectedGame.id,
+          gameName: rgRes.order.game,
+          serviceId: selectedService.id,
+          serviceName: `${rgRes.order.game} (${rgRes.order.region})`,
+          packageId: selectedPackage.id,
+          externalProductId: rgRes.order.product_key,
+          packageName: `${rgRes.order.product_name} [${rgRes.order.region}]`,
+          playerId: rgRes.order.player_id,
+          gameProfileData: {
+            playerId: rgRes.order.player_id,
+            region: rgRes.order.region,
+            product_key: rgRes.order.product_key
+          },
+          publicPrice: rgRes.order.customer_price,
+          chargedAmount: rgRes.order.customer_price,
+          supplierCost: rgRes.order.provider_price,
+          margin: rgRes.order.profit,
+          currency: rgRes.order.currency,
+          status: 'pending',
+          paymentMethod: selectedPaymentMethod,
+          paymentReference: paymentRes.transaction.transactionReference,
+          providerId: 'prov_rechargegames',
+          providerName: 'RechargeGames',
+          providerReference: rgRes.order.provider_order_id,
+          createdAt: rgRes.order.created_at,
+          updatedAt: rgRes.order.updated_at,
+          statusHistory: [
+            {
+              status: 'pending',
+              timestamp: rgRes.order.created_at,
+              note: `En traitement... (${rgRes.order.buyer_ref})`
+            }
+          ]
+        };
+      } else {
+        order = await apiClient.createMobileOrder({
+          gameId: selectedGame.id,
+          serviceId: selectedService.id,
+          packageId: selectedPackage.id,
+          gameProfileData: gameProfileInputs,
+          verifiedPlayerName: playerCheckResult?.verified ? playerCheckResult.playerName : undefined,
+          paymentConfirmed: true,
+          paymentMethod: selectedPaymentMethod,
+          paymentTransactionId: paymentRes.transaction.id,
+          paymentReference: paymentRes.transaction.transactionReference,
+          userId: authUser?.id,
+          partnerOrderId: pendingPartnerOrderId || undefined
+        });
+      }
 
       setCurrentOrder(order);
       setShowPaymentStep(false);
@@ -852,17 +950,24 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     </div>
 
                     <h3 className="font-display text-xl font-bold text-slate-900">
-                      {currentOrder.status === 'completed' ? 'Recharge Livrée avec Succès !' :
-                       currentOrder.status === 'failed' ? 'Échec de Livraison' :
-                       'Commande en cours de traitement...'}
+                      {currentOrder.status === 'completed' ? 'Top-up livré avec succès.' :
+                       currentOrder.status === 'refunded' ? 'Commande remboursée' :
+                       currentOrder.status === 'failed' ? 'Top-up échoué' :
+                       'En traitement...'}
                     </h3>
+
+                    <div className="text-xs font-mono font-bold text-orange-600">
+                      Commande #{currentOrder.orderNumber}
+                    </div>
 
                     <p className="text-xs text-slate-500 max-w-xs mx-auto">
                       {currentOrder.status === 'completed'
-                        ? 'Les diamants ont été crédités directement sur le compte joueur.'
+                        ? 'Top-up livré avec succès sur votre compte joueur.'
+                        : currentOrder.status === 'refunded'
+                        ? currentOrder.errorMessage || 'Votre commande a été remboursée suite à la confirmation RechargeGames.'
                         : currentOrder.status === 'failed'
-                        ? currentOrder.errorMessage || 'Impossible de livrer sur cet identifiant'
-                        : 'La passerelle contacte actuellement le serveur de jeu...'}
+                        ? currentOrder.errorMessage || 'Recharge échouée. Veuillez vérifier vos informations.'
+                        : 'Commande en traitement auprès de RechargeGames...'}
                     </p>
                   </div>
 
@@ -1038,45 +1143,154 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 </div>
               </div>
 
-              {/* Step 2: Choose Package */}
-              <div className="space-y-2.5">
-                <label className="text-xs font-bold text-slate-800 uppercase tracking-tight block">
-                  Étape 1 : Choisir le package
-                </label>
-                {selectedService && (
-                  <div className="grid grid-cols-2 gap-2.5">
-                    {selectedService.packages.map(pkg => {
-                      const isSelected = selectedPackage?.id === pkg.id;
-                      return (
-                        <div
-                          key={pkg.id}
-                          onClick={() => setSelectedPackage(pkg)}
-                          className={`cursor-pointer rounded-2xl p-3 border transition-all flex flex-col justify-between ${
-                            isSelected
-                              ? 'border-orange-600 bg-orange-50/60 shadow-xs ring-1 ring-orange-500'
-                              : 'border-slate-200 bg-white hover:border-slate-300'
-                          }`}
-                        >
-                          <div>
-                            <span className="text-[10px] font-semibold text-slate-400 block uppercase">
-                              {pkg.unit}
-                            </span>
-                            <div className="font-bold text-slate-900 text-sm mt-0.5">
-                              {pkg.name}
+              {/* Step 1: Pays / Région (Brazil 🇧🇷, USA 🇺🇸, Global 🌐) */}
+              {(() => {
+                const gameRgProducts = rgCatalog.filter(
+                  p =>
+                    p.game.toLowerCase() === selectedGame.name.toLowerCase() ||
+                    p.game_slug === selectedGame.slug ||
+                    (selectedGame.slug === 'roblox' && p.game.toLowerCase().includes('roblox'))
+                );
+                const regionsForGame = Array.from(
+                  new Set(gameRgProducts.map(p => p.region).filter(Boolean))
+                );
+                const regionList = regionsForGame.length > 0 ? regionsForGame : ['Brazil', 'USA', 'Global'];
+
+                const formatRegionChip = (reg: string) => {
+                  const r = reg.toLowerCase();
+                  if (r === 'brazil') return 'Brazil 🇧🇷';
+                  if (r === 'usa') return 'USA 🇺🇸';
+                  if (r === 'global') return 'Global 🌐';
+                  return `🌍 ${reg}`;
+                };
+
+                const regionalPackages: ServicePackage[] =
+                  gameRgProducts.length > 0
+                    ? gameRgProducts
+                        .filter(p => p.region.toLowerCase() === selectedRegion.toLowerCase())
+                        .map((p, idx) => ({
+                          id: `pkg_rg_${p.product_key}`,
+                          serviceId: selectedService?.id || `srv_${selectedGame.slug}`,
+                          externalProductId: p.product_key,
+                          productKey: p.product_key,
+                          region: p.region,
+                          providerSlug: 'rechargegames',
+                          externalGameId: p.game_slug || selectedGame.slug,
+                          name: p.name,
+                          amount: p.amount || 1,
+                          unit: p.unit || 'Diamonds',
+                          supplierCost: p.provider_price || 0,
+                          margin: 0,
+                          publicPrice: p.playup_price,
+                          resellerPrice: p.playup_price,
+                          currency: p.currency,
+                          isActive: p.active,
+                          requiresPlayerId: p.requires_player_id !== false,
+                          requiredFields: selectedGame.fields.map(f => f.name),
+                          displayOrder: idx + 1
+                        }))
+                    : selectedService?.packages || [];
+
+                return (
+                  <>
+                    {/* Step 1: Pays / Région */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-slate-800 uppercase tracking-tight">
+                          Étape 1 : Pays / Région du compte
+                        </label>
+                        <span className="text-[10px] font-semibold text-orange-600">
+                           Catalogue Régional Officiel
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {regionList.map(reg => {
+                          const isRegActive = selectedRegion.toLowerCase() === reg.toLowerCase();
+                          return (
+                            <button
+                              key={reg}
+                              type="button"
+                              onClick={() => {
+                                setSelectedRegion(reg);
+                                setSelectedPackage(null);
+                                setOrderError(null);
+                              }}
+                              className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                                isRegActive
+                                  ? 'bg-orange-600 text-white border-orange-600 shadow-2xs'
+                                  : 'bg-white text-slate-700 border-slate-200 hover:border-orange-400'
+                              }`}
+                            >
+                              {formatRegionChip(reg)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[10px] text-slate-500">
+                        Les produits de la région <strong>{formatRegionChip(selectedRegion)}</strong> sont strictement réservés aux comptes de cette région.
+                      </p>
+                    </div>
+
+                    {/* Step 2: Choose Package */}
+                    <div className="space-y-2.5">
+                      <label className="text-xs font-bold text-slate-800 uppercase tracking-tight block">
+                        Étape 2 : Choisir le produit ({formatRegionChip(selectedRegion)})
+                      </label>
+                      <div className="grid grid-cols-2 gap-2.5">
+                        {regionalPackages.map(pkg => {
+                          const isSelected = selectedPackage?.id === pkg.id;
+                          return (
+                            <div
+                              key={pkg.id}
+                              onClick={() => {
+                                if (!pkg.isActive) {
+                                  setOrderError('Ce produit est temporairement indisponible.');
+                                  return;
+                                }
+                                setOrderError(null);
+                                setSelectedPackage(pkg);
+                              }}
+                              className={`rounded-2xl p-3 border transition-all flex flex-col justify-between ${
+                                !pkg.isActive
+                                  ? 'opacity-50 cursor-not-allowed border-slate-200 bg-slate-100'
+                                  : isSelected
+                                  ? 'cursor-pointer border-orange-600 bg-orange-50/60 shadow-xs ring-1 ring-orange-500'
+                                  : 'cursor-pointer border-slate-200 bg-white hover:border-slate-300'
+                              }`}
+                            >
+                              <div>
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-[10px] font-semibold text-slate-400 uppercase">
+                                    {pkg.region ? formatRegionChip(pkg.region) : pkg.unit}
+                                  </span>
+                                  {pkg.productKey && (
+                                    <span className="text-[9px] font-mono text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">
+                                      {pkg.productKey}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="font-bold text-slate-900 text-xs mt-1 leading-snug">
+                                  {pkg.name}
+                                </div>
+                              </div>
+                              <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
+                                <span className="font-mono font-bold text-orange-600 text-xs">
+                                  ${pkg.publicPrice.toFixed(2)} {pkg.currency}
+                                </span>
+                                {!pkg.isActive ? (
+                                  <span className="text-[9px] font-bold text-rose-600">Indisponible</span>
+                                ) : (
+                                  isSelected && <Check className="w-3.5 h-3.5 text-orange-600" />
+                                )}
+                              </div>
                             </div>
-                          </div>
-                          <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
-                            <span className="font-mono font-bold text-orange-600 text-xs">
-                              ${pkg.publicPrice.toFixed(2)}
-                            </span>
-                            {isSelected && <Check className="w-3.5 h-3.5 text-orange-600" />}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
 
               {/* Step 3: Dynamic Game Profile Fields & GoXtop Name Checker */}
               {(selectedPackage?.requiresPlayerId !== false && selectedGame.requiresPlayerId !== false) ? (
@@ -1708,6 +1922,124 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                         Aucune commande effectuée pour le moment.
                       </div>
                     )}
+                  </div>
+
+                  {/* SECTION 17: HISTORIQUE DES TOP-UPS RECHARGEGAMES */}
+                  <div className="pt-4 border-t border-slate-200 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-xs font-bold text-slate-900 uppercase tracking-tight">
+                          Historique des top-ups ({rgOrders.length})
+                        </h3>
+                        <p className="text-[10px] text-slate-500">
+                          Détail complet par région, produit et Player ID sécurisé
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2.5">
+                      {rgOrders.map(rgOrd => {
+                        const isPlayerIdRevealed = Boolean(revealedPlayerIds[rgOrd.id]);
+                        const rawPid = rgOrd.player_id || '';
+                        const maskedPid =
+                          rawPid.length > 5
+                            ? `${rawPid.slice(0, 2)}••••${rawPid.slice(-2)}`
+                            : rawPid;
+
+                        const statusBadge =
+                          rgOrd.status === 'delivered' ? (
+                            <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-bold">
+                              Delivered • Top-up livré avec succès.
+                            </span>
+                          ) : rgOrd.status === 'refunded' ? (
+                            <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800 text-[10px] font-bold">
+                              Refunded • Commande remboursée
+                            </span>
+                          ) : rgOrd.status === 'failed' ? (
+                            <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 text-[10px] font-bold">
+                              Failed • Top-up échoué
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold">
+                              Pending • En traitement...
+                            </span>
+                          );
+
+                        return (
+                          <div
+                            key={rgOrd.id}
+                            className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-2 text-xs shadow-2xs"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-bold text-slate-900">
+                                Commande #{rgOrd.id}
+                              </span>
+                              {statusBadge}
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-1.5 text-[11px] pt-1">
+                              <div>
+                                <span className="text-slate-400">Jeu : </span>
+                                <span className="font-semibold text-slate-800">{rgOrd.game}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400">Région : </span>
+                                <span className="font-bold text-slate-800">
+                                  {rgOrd.region === 'Brazil'
+                                    ? 'Brazil 🇧🇷'
+                                    : rgOrd.region === 'USA'
+                                    ? 'USA 🇺🇸'
+                                    : rgOrd.region}
+                                </span>
+                              </div>
+                              <div className="col-span-2">
+                                <span className="text-slate-400">Produit : </span>
+                                <span className="font-semibold text-slate-800">
+                                  {rgOrd.product_name}
+                                </span>{' '}
+                                <span className="font-mono text-[10px] text-orange-600">
+                                  ({rgOrd.product_key})
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-slate-400">Player ID : </span>
+                                <span className="font-mono font-bold text-slate-800">
+                                  {isPlayerIdRevealed ? rawPid : maskedPid}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setRevealedPlayerIds(prev => ({
+                                      ...prev,
+                                      [rgOrd.id]: !prev[rgOrd.id]
+                                    }))
+                                  }
+                                  className="text-[10px] text-orange-600 underline font-semibold"
+                                >
+                                  {isPlayerIdRevealed ? 'Masquer' : 'Afficher'}
+                                </button>
+                              </div>
+                              <div className="text-right">
+                                <span className="text-slate-400">Montant : </span>
+                                <span className="font-mono font-bold text-orange-600">
+                                  ${rgOrd.customer_price.toFixed(2)} {rgOrd.currency}
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                              <span>Réf: {rgOrd.buyer_ref}</span>
+                              <span>{new Date(rgOrd.created_at).toLocaleString()}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {rgOrders.length === 0 && (
+                        <div className="text-center py-6 text-slate-400 text-xs bg-white border border-slate-200 rounded-2xl">
+                          Aucun top-up RechargeGames enregistré.
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}

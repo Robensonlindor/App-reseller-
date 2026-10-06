@@ -6,7 +6,10 @@ import {
   Game, Service, Provider, Reseller, ApiKey, Order, 
   AppSettings, SupportTicket, SystemLog, Transaction, WebhookLog, 
   ProviderApiLog, ProviderOrder, UserNotification, ProviderWebhookLog,
-  AppUser, PaymentGatewayConfig, PaymentTransaction
+  AppUser, PaymentGatewayConfig, PaymentTransaction,
+  RechargeGamesMode, RechargeGamesProduct, RechargeGamesOrderRecord,
+  RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesSyncStats,
+  FirestoreWebhookIdempotencyRecord
 } from '../src/types';
 import { 
   INITIAL_GAMES, INITIAL_SERVICES, INITIAL_PROVIDERS, 
@@ -128,6 +131,16 @@ export interface DatabaseSchema {
   settings: AppSettings;
   systemLogs: SystemLog[];
   adminToken: string;
+  // RechargeGames tables & config
+  rechargeGamesMode?: RechargeGamesMode;
+  rechargeGamesBaseUrl?: string;
+  rechargeGamesProducts?: RechargeGamesProduct[];        // Table: products
+  rechargeGamesOrders?: RechargeGamesOrderRecord[];      // Table: orders
+  webhookEvents?: RechargeGamesWebhookEvent[];           // Table: webhook_events
+  firestoreWebhookIdempotencyLocks?: Record<string, FirestoreWebhookIdempotencyRecord>; // Firestore /webhook_events/{eventId} mirror
+  rechargeGamesMargins?: RechargeGamesMarginConfig;      // PlayUp Margin System
+  rechargeGamesSyncStats?: RechargeGamesSyncStats;
+  rechargeGamesBuyerRefCounter?: number;
 }
 
 class PlayUpDatabase {
@@ -188,6 +201,16 @@ class PlayUpDatabase {
       const masked = s.length > 8 ? `${s.slice(0, 3)}••••••••${s.slice(-4)}` : '[MASKED_ENV_SECRET]';
       str = str.split(s).join(masked);
     }
+    if (process.env.RECHARGEGAMES_API_KEY && process.env.RECHARGEGAMES_API_KEY.length >= 4) {
+      const k = process.env.RECHARGEGAMES_API_KEY;
+      const masked = k.length > 8 ? `${k.slice(0, 4)}••••••••${k.slice(-4)}` : '[MASKED_RG_API_KEY]';
+      str = str.split(k).join(masked);
+    }
+    if (process.env.RECHARGEGAMES_WEBHOOK_SECRET && process.env.RECHARGEGAMES_WEBHOOK_SECRET.length >= 4) {
+      const s = process.env.RECHARGEGAMES_WEBHOOK_SECRET;
+      const masked = s.length > 8 ? `${s.slice(0, 4)}••••••••${s.slice(-4)}` : '[MASKED_RG_WEBHOOK_SECRET]';
+      str = str.split(s).join(masked);
+    }
 
     str = str.replace(/("x-api-key"\s*:\s*")([^"]+)(")/gi, (_m, p1, val, p3) => {
       const masked = val.length > 8 ? `${val.slice(0, 4)}••••••••${val.slice(-4)}` : '[MASKED]';
@@ -218,9 +241,15 @@ class PlayUpDatabase {
 
     const envGoxKey = process.env.GOXTOP_API_KEY || '';
     const envGoxSecret = process.env.GOXTOP_API_KEY_SECRET || process.env.GOXTOP_WEBHOOK_SECRET || '';
+    const envRgKey = process.env.RECHARGEGAMES_API_KEY || 'rg_test_live_9f8a7b6c5d4e3f2a1b0c';
+    const envRgSecret = process.env.RECHARGEGAMES_WEBHOOK_SECRET || 'whsec_rg_hmac256_a1b2c3d4e5f60718293a';
 
     if (!this.data.providerSecrets) {
       this.data.providerSecrets = {
+        prov_rechargegames: {
+          apiKey: envRgKey,
+          webhookSecret: envRgSecret
+        },
         prov_goxtop: {
           apiKey: envGoxKey,
           webhookSecret: envGoxSecret
@@ -228,6 +257,22 @@ class PlayUpDatabase {
       };
       changed = true;
     } else {
+      if (!this.data.providerSecrets.prov_rechargegames) {
+        this.data.providerSecrets.prov_rechargegames = {
+          apiKey: envRgKey,
+          webhookSecret: envRgSecret
+        };
+        changed = true;
+      } else {
+        if (!this.data.providerSecrets.prov_rechargegames.apiKey) {
+          this.data.providerSecrets.prov_rechargegames.apiKey = envRgKey;
+          changed = true;
+        }
+        if (!this.data.providerSecrets.prov_rechargegames.webhookSecret) {
+          this.data.providerSecrets.prov_rechargegames.webhookSecret = envRgSecret;
+          changed = true;
+        }
+      }
       if (!this.data.providerSecrets.prov_goxtop) {
         this.data.providerSecrets.prov_goxtop = { apiKey: '', webhookSecret: '' };
       }
@@ -239,6 +284,75 @@ class PlayUpDatabase {
         this.data.providerSecrets.prov_goxtop.webhookSecret = envGoxSecret;
         changed = true;
       }
+    }
+
+    // Ensure RechargeGames provider exists in providers list
+    const rgIdx = this.data.providers.findIndex(p => p.id === 'prov_rechargegames' || p.slug === 'rechargegames');
+    if (rgIdx === -1) {
+      const rgInitial = INITIAL_PROVIDERS.find(p => p.id === 'prov_rechargegames');
+      if (rgInitial) {
+        this.data.providers.unshift(rgInitial);
+        changed = true;
+      }
+    }
+
+    if (!this.data.rechargeGamesMode) {
+      this.data.rechargeGamesMode = 'TEST';
+      changed = true;
+    }
+    if (!this.data.rechargeGamesBaseUrl) {
+      this.data.rechargeGamesBaseUrl = process.env.RECHARGEGAMES_BASE_URL || 'http://127.0.0.1:3000/api/rechargegames-v1-gateway';
+      changed = true;
+    }
+    if (!this.data.rechargeGamesProducts) {
+      this.data.rechargeGamesProducts = [];
+      changed = true;
+    }
+    if (!this.data.rechargeGamesOrders) {
+      this.data.rechargeGamesOrders = [];
+      changed = true;
+    }
+    if (!this.data.webhookEvents) {
+      this.data.webhookEvents = [];
+      changed = true;
+    }
+    if (!this.data.rechargeGamesMargins) {
+      this.data.rechargeGamesMargins = {
+        globalMarginPercent: 20,
+        gameMargins: {
+          'Free Fire': 20,
+          'PUBG Mobile': 18,
+          'Mobile Legends': 20,
+          'Call of Duty: Mobile': 20,
+          'Roblox': 15
+        },
+        regionMargins: {
+          'Brazil': 18,
+          'USA': 20,
+          'Global': 20
+        },
+        productMargins: {},
+        updatedAt: new Date().toISOString()
+      };
+      changed = true;
+    }
+    if (!this.data.rechargeGamesSyncStats) {
+      this.data.rechargeGamesSyncStats = {
+        lastSyncedAt: null,
+        totalProducts: 0,
+        activeProducts: 0,
+        unavailableProducts: 0,
+        regionsAvailable: ['Brazil', 'USA', 'Global'],
+        gamesAvailable: [],
+        syncErrors: [],
+        autoSyncEnabled: true,
+        autoSyncIntervalMinutes: 30
+      };
+      changed = true;
+    }
+    if (typeof this.data.rechargeGamesBuyerRefCounter !== 'number') {
+      this.data.rechargeGamesBuyerRefCounter = 0;
+      changed = true;
     }
 
     if (!this.data.providerOrders) {
@@ -367,6 +481,21 @@ class PlayUpDatabase {
       }
     }
 
+    // Deduplicate games by id so duplicate keys (e.g. game_mlbb) never occur
+    if (Array.isArray(this.data.games)) {
+      const seenGameIds = new Set<string>();
+      const uniqueGames: Game[] = [];
+      for (const g of this.data.games) {
+        if (!seenGameIds.has(g.id)) {
+          seenGameIds.add(g.id);
+          uniqueGames.push(g);
+        } else {
+          changed = true;
+        }
+      }
+      this.data.games = uniqueGames;
+    }
+
     if (changed) {
       this.save();
     }
@@ -443,11 +572,21 @@ class PlayUpDatabase {
   }
 
   public getGames(): Game[] {
-    return this.data.games;
+    const seen = new Set<string>();
+    return (this.data.games || []).filter(g => {
+      if (seen.has(g.id)) return false;
+      seen.add(g.id);
+      return true;
+    });
   }
 
   public setGames(games: Game[]) {
-    this.data.games = games;
+    const seen = new Set<string>();
+    this.data.games = games.filter(g => {
+      if (seen.has(g.id)) return false;
+      seen.add(g.id);
+      return true;
+    });
     this.save();
   }
 
@@ -492,6 +631,12 @@ class PlayUpDatabase {
       return {
         apiKey: stored.apiKey || process.env.GOXTOP_API_KEY || '',
         webhookSecret: stored.webhookSecret || process.env.GOXTOP_API_KEY_SECRET || process.env.GOXTOP_WEBHOOK_SECRET || ''
+      };
+    }
+    if (providerId === 'prov_rechargegames') {
+      return {
+        apiKey: process.env.RECHARGEGAMES_API_KEY || stored.apiKey || '',
+        webhookSecret: process.env.RECHARGEGAMES_WEBHOOK_SECRET || stored.webhookSecret || ''
       };
     }
     return stored;
@@ -928,6 +1073,303 @@ class PlayUpDatabase {
 
     this.save();
     return record;
+  }
+
+  // ==========================================
+  // RECHARGEGAMES TABLES & MARGIN ENGINE
+  // ==========================================
+  public getRechargeGamesMode(): RechargeGamesMode {
+    return this.data.rechargeGamesMode || 'TEST';
+  }
+
+  public setRechargeGamesMode(mode: RechargeGamesMode) {
+    this.data.rechargeGamesMode = mode;
+    const pIdx = this.data.providers.findIndex(p => p.id === 'prov_rechargegames');
+    if (pIdx !== -1) {
+      this.data.providers[pIdx].environment = mode === 'PRODUCTION' ? 'production' : 'sandbox';
+    }
+    this.save();
+  }
+
+  public getRechargeGamesBaseUrl(): string {
+    if (process.env.RECHARGEGAMES_BASE_URL && process.env.RECHARGEGAMES_BASE_URL.trim().length > 0) {
+      return process.env.RECHARGEGAMES_BASE_URL.trim().replace(/\/+$/, '');
+    }
+    return (this.data.rechargeGamesBaseUrl || 'http://127.0.0.1:3000/api/rechargegames-v1-gateway').replace(/\/+$/, '');
+  }
+
+  public setRechargeGamesBaseUrl(url: string) {
+    const clean = url.trim().replace(/\/+$/, '');
+    this.data.rechargeGamesBaseUrl = clean;
+    const pIdx = this.data.providers.findIndex(p => p.id === 'prov_rechargegames');
+    if (pIdx !== -1) {
+      this.data.providers[pIdx].apiUrl = clean;
+    }
+    this.save();
+  }
+
+  public getRechargeGamesMargins(): RechargeGamesMarginConfig {
+    return (
+      this.data.rechargeGamesMargins || {
+        globalMarginPercent: 20,
+        gameMargins: {},
+        regionMargins: {},
+        productMargins: {},
+        updatedAt: new Date().toISOString()
+      }
+    );
+  }
+
+  /**
+   * Computes final PlayUp customer price from RechargeGames provider_price using server-side margin rules
+   * Precedence: productMargins[product_key] > regionMargins[region] > gameMargins[game] > globalMarginPercent
+   */
+  public computePlayUpMarginAndPrice(
+    providerPrice: number,
+    game: string,
+    region: string,
+    productKey: string
+  ): { marginPercent: number; playupPrice: number; profit: number } {
+    const margins = this.getRechargeGamesMargins();
+    let marginPercent = margins.globalMarginPercent ?? 20;
+
+    if (game && typeof margins.gameMargins?.[game] === 'number') {
+      marginPercent = margins.gameMargins[game];
+    }
+    if (region && typeof margins.regionMargins?.[region] === 'number') {
+      marginPercent = margins.regionMargins[region];
+    }
+    if (productKey && typeof margins.productMargins?.[productKey] === 'number') {
+      marginPercent = margins.productMargins[productKey];
+    }
+
+    const safeProviderPrice = Math.max(0, Number(providerPrice) || 0);
+    const playupPrice = Number((safeProviderPrice * (1 + marginPercent / 100)).toFixed(2));
+    const profit = Number((playupPrice - safeProviderPrice).toFixed(2));
+
+    return { marginPercent, playupPrice, profit };
+  }
+
+  public setRechargeGamesMargins(config: Partial<RechargeGamesMarginConfig>): RechargeGamesMarginConfig {
+    const current = this.getRechargeGamesMargins();
+    const updated: RechargeGamesMarginConfig = {
+      globalMarginPercent:
+        typeof config.globalMarginPercent === 'number' ? config.globalMarginPercent : current.globalMarginPercent,
+      gameMargins: config.gameMargins !== undefined ? config.gameMargins : current.gameMargins,
+      regionMargins: config.regionMargins !== undefined ? config.regionMargins : current.regionMargins,
+      productMargins: config.productMargins !== undefined ? config.productMargins : current.productMargins,
+      updatedAt: new Date().toISOString()
+    };
+    this.data.rechargeGamesMargins = updated;
+
+    // Recalculate playup_price for all stored RechargeGames products immediately
+    if (this.data.rechargeGamesProducts && this.data.rechargeGamesProducts.length > 0) {
+      this.data.rechargeGamesProducts = this.data.rechargeGamesProducts.map(prod => {
+        const calc = this.computePlayUpMarginAndPrice(prod.provider_price, prod.game, prod.region, prod.product_key);
+        return {
+          ...prod,
+          margin_percent: calc.marginPercent,
+          playup_price: calc.playupPrice,
+          profit_estimate: calc.profit
+        };
+      });
+    }
+
+    this.save();
+    return updated;
+  }
+
+  // Table: products
+  public getRechargeGamesProducts(filters?: { game?: string; region?: string; activeOnly?: boolean }): RechargeGamesProduct[] {
+    let list = this.data.rechargeGamesProducts || [];
+    if (filters?.activeOnly) {
+      list = list.filter(p => p.active);
+    }
+    if (filters?.game && filters.game !== 'all') {
+      const gLower = filters.game.toLowerCase();
+      list = list.filter(
+        p => p.game.toLowerCase() === gLower || (p.game_slug && p.game_slug.toLowerCase() === gLower)
+      );
+    }
+    if (filters?.region && filters.region !== 'all') {
+      const rLower = filters.region.toLowerCase();
+      list = list.filter(p => p.region.toLowerCase() === rLower);
+    }
+    return list;
+  }
+
+  public getRechargeGamesProductByKey(productKey: string): RechargeGamesProduct | undefined {
+    return (this.data.rechargeGamesProducts || []).find(
+      p => p.product_key === productKey || p.id === productKey
+    );
+  }
+
+  public setRechargeGamesProducts(products: RechargeGamesProduct[]) {
+    this.data.rechargeGamesProducts = products.map(p => {
+      const calc = this.computePlayUpMarginAndPrice(p.provider_price, p.game, p.region, p.product_key);
+      return {
+        ...p,
+        provider: 'rechargegames',
+        margin_percent: calc.marginPercent,
+        playup_price: calc.playupPrice,
+        profit_estimate: calc.profit
+      };
+    });
+    this.save();
+  }
+
+  public getRechargeGamesSyncStats(): RechargeGamesSyncStats {
+    const prods = this.data.rechargeGamesProducts || [];
+    const activeCount = prods.filter(p => p.active).length;
+    const unavailableCount = prods.filter(p => !p.active).length;
+    const regions = Array.from(new Set(prods.map(p => p.region).filter(Boolean)));
+    const games = Array.from(new Set(prods.map(p => p.game).filter(Boolean)));
+    const stored = this.data.rechargeGamesSyncStats || {
+      lastSyncedAt: null,
+      totalProducts: 0,
+      activeProducts: 0,
+      unavailableProducts: 0,
+      regionsAvailable: ['Brazil', 'USA', 'Global'],
+      gamesAvailable: [],
+      syncErrors: [],
+      autoSyncEnabled: true,
+      autoSyncIntervalMinutes: 30
+    };
+    return {
+      ...stored,
+      totalProducts: prods.length,
+      activeProducts: activeCount,
+      unavailableProducts: unavailableCount,
+      regionsAvailable: regions.length > 0 ? regions : ['Brazil', 'USA', 'Global'],
+      gamesAvailable: games
+    };
+  }
+
+  public updateRechargeGamesSyncStats(partial: Partial<RechargeGamesSyncStats>) {
+    const current = this.getRechargeGamesSyncStats();
+    this.data.rechargeGamesSyncStats = {
+      ...current,
+      ...partial
+    };
+    this.save();
+  }
+
+  /**
+   * Generates a strictly unique buyer_ref in the official format: PLAYUP-YYYYMMDD-XXXXXX
+   * Example: PLAYUP-20261005-000001
+   */
+  public generateNextBuyerRef(): string {
+    const now = new Date();
+    const yyyy = now.getUTCFullYear();
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const datePart = `${yyyy}${mm}${dd}`;
+
+    if (typeof this.data.rechargeGamesBuyerRefCounter !== 'number') {
+      this.data.rechargeGamesBuyerRefCounter = (this.data.rechargeGamesOrders || []).length;
+    }
+
+    let candidate = '';
+    do {
+      this.data.rechargeGamesBuyerRefCounter += 1;
+      const seq = String(this.data.rechargeGamesBuyerRefCounter).padStart(6, '0');
+      candidate = `PLAYUP-${datePart}-${seq}`;
+    } while (this.findRechargeGamesOrderByBuyerRef(candidate));
+
+    this.save();
+    return candidate;
+  }
+
+  // Table: orders (RechargeGamesOrderRecord)
+  public getRechargeGamesOrders(userId?: string): RechargeGamesOrderRecord[] {
+    const list = this.data.rechargeGamesOrders || [];
+    if (userId) {
+      return list.filter(o => o.user_id === userId);
+    }
+    return list;
+  }
+
+  public findRechargeGamesOrderById(idOrProviderOrderId: string): RechargeGamesOrderRecord | undefined {
+    return (this.data.rechargeGamesOrders || []).find(
+      o =>
+        o.id === idOrProviderOrderId ||
+        o.provider_order_id === idOrProviderOrderId ||
+        o.buyer_ref === idOrProviderOrderId
+    );
+  }
+
+  public findRechargeGamesOrderByBuyerRef(buyerRef: string): RechargeGamesOrderRecord | undefined {
+    return (this.data.rechargeGamesOrders || []).find(o => o.buyer_ref === buyerRef);
+  }
+
+  public upsertRechargeGamesOrder(order: RechargeGamesOrderRecord): RechargeGamesOrderRecord {
+    if (!this.data.rechargeGamesOrders) {
+      this.data.rechargeGamesOrders = [];
+    }
+    const idx = this.data.rechargeGamesOrders.findIndex(
+      o => o.id === order.id || o.buyer_ref === order.buyer_ref
+    );
+    if (idx !== -1) {
+      this.data.rechargeGamesOrders[idx] = {
+        ...this.data.rechargeGamesOrders[idx],
+        ...order,
+        updated_at: new Date().toISOString()
+      };
+    } else {
+      this.data.rechargeGamesOrders.unshift(order);
+    }
+    this.save();
+    return order;
+  }
+
+  // Table: webhook_events
+  public getRechargeGamesWebhookEvents(): RechargeGamesWebhookEvent[] {
+    return this.data.webhookEvents || [];
+  }
+
+  public hasProcessedRechargeGamesWebhookEvent(eventId: string): boolean {
+    if (!eventId) return false;
+    if (this.data.firestoreWebhookIdempotencyLocks?.[eventId]) {
+      return true;
+    }
+    return (this.data.webhookEvents || []).some(
+      e => e.event_id === eventId && e.processing_status === 'processed'
+    );
+  }
+
+  public getFirestoreWebhookLock(eventId: string): FirestoreWebhookIdempotencyRecord | undefined {
+    if (!eventId) return undefined;
+    return this.data.firestoreWebhookIdempotencyLocks?.[eventId];
+  }
+
+  public getAllFirestoreWebhookLocks(): FirestoreWebhookIdempotencyRecord[] {
+    return Object.values(this.data.firestoreWebhookIdempotencyLocks || {});
+  }
+
+  public saveFirestoreWebhookLock(record: FirestoreWebhookIdempotencyRecord): FirestoreWebhookIdempotencyRecord {
+    if (!this.data.firestoreWebhookIdempotencyLocks) {
+      this.data.firestoreWebhookIdempotencyLocks = {};
+    }
+    this.data.firestoreWebhookIdempotencyLocks[record.eventId] = record;
+    this.save();
+    return record;
+  }
+
+  public addRechargeGamesWebhookEvent(event: RechargeGamesWebhookEvent): RechargeGamesWebhookEvent {
+    if (!this.data.webhookEvents) {
+      this.data.webhookEvents = [];
+    }
+    const sanitized: RechargeGamesWebhookEvent = {
+      ...event,
+      payload_preview: event.payload_preview ? String(this.sanitizeForLogs(event.payload_preview)) : undefined,
+      error_message: event.error_message ? String(this.sanitizeForLogs(event.error_message)) : undefined
+    };
+    this.data.webhookEvents.unshift(sanitized);
+    if (this.data.webhookEvents.length > 300) {
+      this.data.webhookEvents = this.data.webhookEvents.slice(0, 300);
+    }
+    this.save();
+    return sanitized;
   }
 }
 

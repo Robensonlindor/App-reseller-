@@ -2,7 +2,10 @@ import {
   Game, Service, Order, Reseller, ApiKey, SupportTicket, 
   AppSettings, SystemLog, Provider, ConnectionTestResult, ProviderApiLog,
   PlayerCheckResult, UserNotification, ProviderOrder, ProviderWebhookLog, WebhookTestResult,
-  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType
+  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType,
+  RechargeGamesMode, RechargeGamesProduct, RechargeGamesOrderRecord,
+  RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesConfigState,
+  RechargeGamesTestStepResult
 } from '../types';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
 
@@ -10,11 +13,26 @@ async function safeFetchArray<T>(url: string, options?: RequestInit, fallback: T
   try {
     const res = await fetch(url, options);
     if (!res.ok) return fallback;
-    const data = await res.json();
+    const text = await res.text();
+    const data = JSON.parse(text);
     return Array.isArray(data) ? data : fallback;
   } catch {
     return fallback;
   }
+}
+
+async function safeJson<T>(res: Response, fallbackErrorMsg: string): Promise<T> {
+  const text = await res.text();
+  let parsed: any = null;
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(fallbackErrorMsg);
+  }
+  if (!res.ok) {
+    throw new Error(parsed?.error || parsed?.message || fallbackErrorMsg);
+  }
+  return parsed as T;
 }
 
 export const apiClient = {
@@ -769,5 +787,196 @@ export const apiClient = {
     return safeFetchArray<PaymentTransaction>('/api/admin/payment-transactions', {
       headers: { Authorization: `Bearer ${token}` }
     });
+  },
+
+  // ==========================================
+  // RECHARGEGAMES OFFICIAL INTEGRATION CLIENT
+  // ==========================================
+
+  async getRechargeGamesCatalog(params?: { game?: string; region?: string }): Promise<{
+    mode: RechargeGamesMode;
+    regionsAvailable: string[];
+    gamesAvailable: string[];
+    lastSyncedAt: string | null;
+    products: RechargeGamesProduct[];
+  }> {
+    const qs = new URLSearchParams();
+    if (params?.game) qs.set('game', params.game);
+    if (params?.region) qs.set('region', params.region);
+    const url = `/api/rechargegames/catalog${qs.toString() ? `?${qs.toString()}` : ''}`;
+    const res = await fetch(url);
+    return safeJson(res, 'Impossible de charger le catalogue RechargeGames.');
+  },
+
+  async createRechargeGamesOrder(payload: {
+    userId?: string;
+    product_key: string;
+    region: string;
+    player_id: string;
+    player_name?: string;
+    server_id?: string;
+    buyer_ref?: string;
+    paymentConfirmed: boolean;
+    paymentMethod?: string;
+    paymentReference?: string;
+  }): Promise<{
+    success: boolean;
+    message: string;
+    order: RechargeGamesOrderRecord;
+    playupOrder?: Order;
+  }> {
+    const res = await fetch('/api/rechargegames/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.success === false) {
+      throw new Error(body.message || 'Impossible de traiter la commande pour le moment. Veuillez réessayer.');
+    }
+    return body;
+  },
+
+  async getRechargeGamesOrders(userId?: string): Promise<RechargeGamesOrderRecord[]> {
+    const url = userId
+      ? `/api/rechargegames/orders?userId=${encodeURIComponent(userId)}`
+      : '/api/rechargegames/orders';
+    return safeFetchArray<RechargeGamesOrderRecord>(url);
+  },
+
+  async checkRechargeGamesOrderStatus(orderId: string): Promise<{
+    success: boolean;
+    status: 'pending' | 'delivered' | 'failed';
+    order?: RechargeGamesOrderRecord;
+    message: string;
+  }> {
+    const res = await fetch(`/api/rechargegames/orders/${encodeURIComponent(orderId)}/status`);
+    return safeJson(res, 'Impossible de vérifier le statut de la commande.');
+  },
+
+  // Admin RechargeGames
+  async getRechargeGamesAdminDashboard(token: string): Promise<{
+    config: RechargeGamesConfigState;
+    metrics: {
+      totalProducts: number;
+      activeProducts: number;
+      unavailableProducts: number;
+      pendingOrders: number;
+      deliveredOrders: number;
+      refundedOrders?: number;
+      failedOrders: number;
+      totalProfitUsd: number;
+      apiErrorsCount: number;
+    };
+    products: RechargeGamesProduct[];
+    orders: RechargeGamesOrderRecord[];
+    webhookEvents: RechargeGamesWebhookEvent[];
+    apiLogs: ProviderApiLog[];
+  }> {
+    const res = await fetch('/api/admin/rechargegames/dashboard', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    return safeJson(res, 'Erreur chargement dashboard RechargeGames');
+  },
+
+  async updateRechargeGamesConfig(
+    token: string,
+    payload: {
+      mode?: RechargeGamesMode;
+      baseUrl?: string;
+      apiKey?: string;
+      webhookSecret?: string;
+      autoSyncEnabled?: boolean;
+      autoSyncIntervalMinutes?: number;
+    }
+  ): Promise<{ success: boolean; message: string; mode: RechargeGamesMode; baseUrl: string }> {
+    const res = await fetch('/api/admin/rechargegames/config', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+    return safeJson(res, 'Erreur sauvegarde configuration');
+  },
+
+  async testRechargeGamesConnection(token: string): Promise<ConnectionTestResult> {
+    const res = await fetch('/api/admin/rechargegames/test-connection', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    return safeJson(res, 'Erreur lors du test de connexion RechargeGames');
+  },
+
+  async syncRechargeGamesCatalog(token: string): Promise<{
+    success: boolean;
+    message: string;
+    products: RechargeGamesProduct[];
+    stats: any;
+  }> {
+    const res = await fetch('/api/admin/rechargegames/sync', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    return safeJson(res, 'Erreur synchronisation catalogue RechargeGames');
+  },
+
+  async updateRechargeGamesMargins(
+    token: string,
+    payload: Partial<RechargeGamesMarginConfig>
+  ): Promise<{
+    success: boolean;
+    message: string;
+    margins: RechargeGamesMarginConfig;
+    products: RechargeGamesProduct[];
+  }> {
+    const res = await fetch('/api/admin/rechargegames/margins', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+    return safeJson(res, 'Erreur sauvegarde marges RechargeGames');
+  },
+
+  async testRechargeGamesWebhook(
+    token: string,
+    payload: {
+      eventType?: 'webhook.test' | 'order.delivered' | 'order.refunded' | 'order.failed';
+      orderId?: string;
+      simulateInvalidSignature?: boolean;
+      simulateDuplicateEvent?: boolean;
+      simulateInvalidPayload?: boolean;
+    }
+  ): Promise<{
+    httpStatus: number;
+    responseBody: any;
+    webhookEvent: RechargeGamesWebhookEvent;
+  }> {
+    const res = await fetch('/api/admin/rechargegames/test-webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(payload)
+    });
+    return safeJson(res, 'Erreur lors du test webhook RechargeGames');
+  },
+
+  async runRechargeGamesTestSuite(token: string): Promise<{
+    allPassed: boolean;
+    passedCount: number;
+    totalCount: number;
+    results: RechargeGamesTestStepResult[];
+  }> {
+    const res = await fetch('/api/admin/rechargegames/run-test-suite', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    return safeJson(res, 'Erreur lors de l’exécution de la suite de tests RechargeGames');
   }
 };

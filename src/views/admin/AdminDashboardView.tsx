@@ -12,6 +12,7 @@ import {
 import { apiClient } from '../../services/apiClient';
 import { safeStorage } from '../../lib/safeStorage';
 import { GoXtopAdminPanel } from './GoXtopAdminPanel';
+import { RechargeGamesAdminPanel } from './RechargeGamesAdminPanel';
 
 interface AdminDashboardViewProps {
   onClose: () => void;
@@ -26,7 +27,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
 
   // Admin Navigation Tabs
   const [currentTab, setCurrentTab] = useState<
-    'metrics' | 'games' | 'services' | 'orders' | 'users' | 'resellers' | 'payments' | 'providers' | 'support' | 'settings' | 'logs'
+    'metrics' | 'rechargegames' | 'games' | 'services' | 'orders' | 'users' | 'resellers' | 'payments' | 'providers' | 'support' | 'settings' | 'logs'
   >('metrics');
 
   // Loaded State
@@ -389,6 +390,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
 
   const navItems = [
     { id: 'metrics', label: 'Vue d’ensemble', icon: Activity },
+    { id: 'rechargegames', label: 'RechargeGames', icon: Shield },
     { id: 'games', label: 'Jeux & Champs', icon: GamepadIcon },
     { id: 'services', label: 'Services & Tarifs', icon: ShoppingCart },
     { id: 'orders', label: 'Commandes', icon: FileText },
@@ -1463,6 +1465,14 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                 </div>
               </div>
             </div>
+          )}
+
+          {/* TAB RECHARGEGAMES: DEDICATED RECHARGEGAMES INTEGRATION */}
+          {currentTab === 'rechargegames' && token && (
+            <RechargeGamesAdminPanel
+              token={token}
+              onRefreshParent={loadAllAdminData}
+            />
           )}
 
           {/* TAB 8: EXTERNAL PROVIDERS & GOXTOP CONFIGURATION */}

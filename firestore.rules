@@ -89,10 +89,44 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidWebhookIdempotencyRecord(data, eventId) {
+      return data.keys().hasAll([
+          'eventId', 'provider', 'eventType', 'status', 'signatureHash', 'processedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'eventId', 'provider', 'eventType', 'providerOrderId', 'playupOrderId',
+          'buyerRef', 'status', 'signatureHash', 'processedAt'
+        ]) &&
+        data.eventId is string && data.eventId.size() >= 1 && data.eventId.size() <= 128 && data.eventId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.eventId == eventId &&
+        data.provider is string && data.provider.size() <= 32 && data.provider in ['rechargegames'] &&
+        data.eventType is string && data.eventType.size() >= 1 && data.eventType.size() <= 64 &&
+        data.eventType in ['webhook.test', 'order.delivered', 'order.refunded', 'order.failed'] &&
+        (!('providerOrderId' in data) || (data.providerOrderId is string && data.providerOrderId.size() <= 64 && data.providerOrderId.matches('^[a-zA-Z0-9_\\-]+$'))) &&
+        (!('playupOrderId' in data) || (data.playupOrderId is string && data.playupOrderId.size() <= 64 && data.playupOrderId.matches('^[a-zA-Z0-9_\\-]+$'))) &&
+        (!('buyerRef' in data) || (data.buyerRef is string && data.buyerRef.size() <= 64 && data.buyerRef.matches('^[a-zA-Z0-9_\\-]+$'))) &&
+        data.status is string && data.status.size() <= 24 && data.status in ['processed'] &&
+        data.signatureHash is string && data.signatureHash.size() >= 8 && data.signatureHash.size() <= 128 && data.signatureHash.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.processedAt is timestamp;
+    }
+
     // Admins lookup collection (read-only for owner/admin, system-managed)
     match /admins/{adminId} {
       allow get: if isSignedIn() && isValidId(adminId) && request.auth.uid == adminId;
       allow list, create, update, delete: if false;
+    }
+
+    // Immutable Webhook Idempotency Registry (/webhook_events/{eventId})
+    match /webhook_events/{eventId} {
+      allow get: if isSignedIn() && isValidId(eventId) && isAdmin();
+      allow list: if isSignedIn() && resource.data.provider == 'rechargegames' && isAdmin();
+
+      allow create: if isAdmin() &&
+        isValidId(eventId) &&
+        isValidWebhookIdempotencyRecord(incoming(), eventId) &&
+        incoming().processedAt == request.time;
+
+      allow update, delete: if false;
     }
 
     // Public User Profile

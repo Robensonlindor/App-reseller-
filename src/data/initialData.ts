@@ -158,6 +158,38 @@ export const INITIAL_GAMES: Game[] = [
 
 export const INITIAL_PROVIDERS: Provider[] = [
   {
+    id: 'prov_rechargegames',
+    slug: 'rechargegames',
+    adapterType: 'rechargegames',
+    name: 'RechargeGames',
+    apiUrl: 'https://api.rechargegames.com',
+    environment: 'sandbox',
+    authHeaderName: 'Authorization',
+    hasApiKey: false,
+    apiKeyMasked: 'Non configurée',
+    hasWebhookSecret: false,
+    webhookSecretMasked: 'Non configuré',
+    memberId: '',
+    partnerId: '',
+    merchantId: '',
+    webhookUrl: '/api/webhooks/rechargegames',
+    isActive: true,
+    serviceType: 'RechargeGames Official Top-Up API (Catalogue par Région 🇧🇷/🇺🇸/Global, buyer_ref, Webhooks HMAC-SHA256 & GET /v1/orders/{order_id})',
+    priority: 1,
+    endpoints: {
+      getGamesPath: '/v1/products',
+      getProductsPath: '/v1/products',
+      createOrderPath: '/v1/orders',
+      orderStatusPath: '/v1/orders/{order_id}',
+      trackOrderPath: '/v1/orders/{order_id}',
+      checkPlayerPath: '/v1/players/verify'
+    },
+    customParams: [],
+    latencyMs: 0,
+    lastPingStatus: 'untested',
+    lastPingLabel: 'Prêt (Mode TEST / PRODUCTION)'
+  },
+  {
     id: 'prov_goxtop',
     slug: 'goxtop',
     adapterType: 'goxtop',

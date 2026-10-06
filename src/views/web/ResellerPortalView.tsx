@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Reseller, ApiKey, Order, Transaction, WebhookLog, Service } from '../../types';
 import { apiClient } from '../../services/apiClient';
+import { safeStorage } from '../../lib/safeStorage';
 import { Language, translations } from '../../i18n';
 
 interface ResellerPortalViewProps {
@@ -43,16 +44,16 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
   const [webhookMsg, setWebhookMsg] = useState<string | null>(null);
   const [depositAmount, setDepositAmount] = useState('100');
 
-  // Check existing session in localStorage
+  // Check existing session in safeStorage
   useEffect(() => {
-    const saved = localStorage.getItem('playup_reseller_session');
+    const saved = safeStorage.getItem('playup_reseller_session');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
         setSession(parsed);
         loadDashboard(parsed.reseller.id);
       } catch (e) {
-        localStorage.removeItem('playup_reseller_session');
+        safeStorage.removeItem('playup_reseller_session');
       }
     }
   }, []);
@@ -76,7 +77,7 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
     try {
       const res = await apiClient.resellerLogin(loginEmail);
       setSession(res);
-      localStorage.setItem('playup_reseller_session', JSON.stringify(res));
+      safeStorage.setItem('playup_reseller_session', JSON.stringify(res));
       await loadDashboard(res.reseller.id);
     } catch (err: any) {
       setAuthError(err.message);
@@ -93,7 +94,7 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
         company: registerCompany
       });
       setSession(res);
-      localStorage.setItem('playup_reseller_session', JSON.stringify(res));
+      safeStorage.setItem('playup_reseller_session', JSON.stringify(res));
       await loadDashboard(res.reseller.id);
     } catch (err: any) {
       setAuthError(err.message);
@@ -101,7 +102,7 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('playup_reseller_session');
+    safeStorage.removeItem('playup_reseller_session');
     setSession(null);
     setDashboardData(null);
   };
@@ -119,10 +120,8 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
 
   const handleRevokeKey = async (keyId: string) => {
     if (!session?.reseller.id) return;
-    if (confirm('Voulez-vous révoquer cette clé API ? Toutes les requêtes avec cette clé seront immédiatement bloquées.')) {
-      await apiClient.revokeApiKey(session.reseller.id, keyId);
-      await loadDashboard(session.reseller.id);
-    }
+    await apiClient.revokeApiKey(session.reseller.id, keyId);
+    await loadDashboard(session.reseller.id);
   };
 
   const handleSaveWebhook = async () => {

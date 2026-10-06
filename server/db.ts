@@ -1,10 +1,12 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { 
   Game, Service, Provider, Reseller, ApiKey, Order, 
   AppSettings, SupportTicket, SystemLog, Transaction, WebhookLog, 
-  ProviderApiLog, ProviderOrder, UserNotification, ProviderWebhookLog 
+  ProviderApiLog, ProviderOrder, UserNotification, ProviderWebhookLog,
+  AppUser, PaymentGatewayConfig, PaymentTransaction
 } from '../src/types';
 import { 
   INITIAL_GAMES, INITIAL_SERVICES, INITIAL_PROVIDERS, 
@@ -22,6 +24,86 @@ export interface ProviderSecretRecord {
   webhookSecret: string;
 }
 
+export interface UserCredentialRecord {
+  passwordHash: string;
+  passwordSalt: string;
+  resetToken?: string;
+  resetTokenExpiresAt?: string;
+}
+
+export interface PaymentGatewaySecretRecord {
+  apiKey: string;
+  clientSecret: string;
+  webhookSecret: string;
+}
+
+export const DEFAULT_PAYMENT_GATEWAYS: PaymentGatewayConfig[] = [
+  {
+    id: 'gw_card',
+    slug: 'card',
+    name: 'Carte Bancaire (Visa / Mastercard)',
+    providerName: 'Stripe / 3D Secure Card Gateway',
+    description: 'Paiement instantané sécurisé par carte de crédit ou de débit internationale (Visa, Mastercard, Amex).',
+    isEnabled: true,
+    mode: 'sandbox',
+    supportedCurrencies: ['USD', 'EUR', 'HTG'],
+    feePercent: 2.9,
+    fixedFee: 0.30,
+    hasCredentials: false,
+    credentialsMasked: 'Mode Sandbox Actif',
+    webhookUrl: '/api/webhooks/payments/card',
+    instructions: 'Saisissez les informations de votre carte bancaire (validation 3D Secure instantanée).'
+  },
+  {
+    id: 'gw_moncash',
+    slug: 'moncash',
+    name: 'MonCash (Digicel)',
+    providerName: 'Digicel MonCash REST API',
+    description: 'Paiement mobile rapide via compte MonCash Digicel avec confirmation par numéro et code PIN/OTP.',
+    isEnabled: true,
+    mode: 'sandbox',
+    supportedCurrencies: ['HTG', 'USD'],
+    feePercent: 1.5,
+    fixedFee: 0.0,
+    hasCredentials: false,
+    credentialsMasked: 'Mode Sandbox Actif',
+    webhookUrl: '/api/webhooks/payments/moncash',
+    instructions: 'Entrez votre numéro de téléphone Digicel MonCash (ex: +509 37XX-XXXX) et validez la transaction.'
+  },
+  {
+    id: 'gw_natcash',
+    slug: 'natcash',
+    name: 'NatCash (Natcom)',
+    providerName: 'Natcom NatCash Merchant API',
+    description: 'Paiement mobile sécurisé via portefeuille NatCash Natcom avec confirmation instantanée.',
+    isEnabled: true,
+    mode: 'sandbox',
+    supportedCurrencies: ['HTG', 'USD'],
+    feePercent: 1.5,
+    fixedFee: 0.0,
+    hasCredentials: false,
+    credentialsMasked: 'Mode Sandbox Actif',
+    webhookUrl: '/api/webhooks/payments/natcash',
+    instructions: 'Entrez votre numéro de téléphone Natcom NatCash (ex: +509 40XX-XXXX) pour autoriser le débit.'
+  },
+  {
+    id: 'gw_wallet',
+    slug: 'wallet',
+    name: 'Solde PlayUp Wallet',
+    providerName: 'PlayUp Internal Ledger',
+    description: 'Débit instantané sans frais depuis le solde prépayé de votre compte PlayUp.',
+    isEnabled: true,
+    mode: 'live',
+    supportedCurrencies: ['USD', 'HTG', 'EUR'],
+    feePercent: 0,
+    fixedFee: 0,
+    hasCredentials: true,
+    credentialsMasked: 'Interne PlayUp',
+    webhookUrl: '/api/webhooks/payments/wallet',
+    instructions: 'Utilisez directement le solde disponible sur votre compte PlayUp.'
+  }
+];
+
 export interface DatabaseSchema {
   games: Game[];
   services: Service[];
@@ -32,6 +114,11 @@ export interface DatabaseSchema {
   providerWebhookLogs: ProviderWebhookLog[];             // Real-time GoXtop Webhook Diagnostic Logs
   processedWebhookEvents: string[];                      // Deduplication of webhook events
   userNotifications: UserNotification[];
+  users: AppUser[];
+  userCredentials: Record<string, UserCredentialRecord>; // Server-side password hashes & reset tokens
+  paymentGateways: PaymentGatewayConfig[];
+  paymentGatewaySecrets: Record<string, PaymentGatewaySecretRecord>; // Server-side only
+  paymentTransactions: PaymentTransaction[];
   resellers: Reseller[];
   apiKeys: ApiKey[];
   orders: Order[];
@@ -79,19 +166,37 @@ class PlayUpDatabase {
     if (this.data?.providerSecrets) {
       for (const sec of Object.values(this.data.providerSecrets)) {
         if (sec.apiKey && sec.apiKey.trim().length >= 4) {
-          str = str.split(sec.apiKey.trim()).join('[MASKED_API_KEY]');
+          const k = sec.apiKey.trim();
+          const masked = k.length > 8 ? `${k.slice(0, 4)}••••••••${k.slice(-4)}` : '[MASKED_API_KEY]';
+          str = str.split(k).join(masked);
         }
         if (sec.webhookSecret && sec.webhookSecret.trim().length >= 4) {
-          str = str.split(sec.webhookSecret.trim()).join('[MASKED_WEBHOOK_SECRET]');
+          const s = sec.webhookSecret.trim();
+          const masked = s.length > 8 ? `${s.slice(0, 3)}••••••••${s.slice(-4)}` : '[MASKED_WEBHOOK_SECRET]';
+          str = str.split(s).join(masked);
         }
       }
     }
 
     if (process.env.GOXTOP_API_KEY && process.env.GOXTOP_API_KEY.length >= 4) {
-      str = str.split(process.env.GOXTOP_API_KEY).join('[MASKED_ENV_API_KEY]');
+      const k = process.env.GOXTOP_API_KEY;
+      const masked = k.length > 8 ? `${k.slice(0, 4)}••••••••${k.slice(-4)}` : '[MASKED_ENV_API_KEY]';
+      str = str.split(k).join(masked);
+    }
+    if (process.env.GOXTOP_API_KEY_SECRET && process.env.GOXTOP_API_KEY_SECRET.length >= 4) {
+      const s = process.env.GOXTOP_API_KEY_SECRET;
+      const masked = s.length > 8 ? `${s.slice(0, 3)}••••••••${s.slice(-4)}` : '[MASKED_ENV_SECRET]';
+      str = str.split(s).join(masked);
     }
 
-    str = str.replace(/("x-api-key"\s*:\s*")([^"]+)(")/gi, '$1[MASKED]$3');
+    str = str.replace(/("x-api-key"\s*:\s*")([^"]+)(")/gi, (_m, p1, val, p3) => {
+      const masked = val.length > 8 ? `${val.slice(0, 4)}••••••••${val.slice(-4)}` : '[MASKED]';
+      return `${p1}${masked}${p3}`;
+    });
+    str = str.replace(/("x-api-secret"\s*:\s*")([^"]+)(")/gi, (_m, p1, val, p3) => {
+      const masked = val.length > 8 ? `${val.slice(0, 3)}••••••••${val.slice(-4)}` : '[MASKED]';
+      return `${p1}${masked}${p3}`;
+    });
     str = str.replace(/("api_key"\s*:\s*")([^"]+)(")/gi, '$1[MASKED]$3');
     str = str.replace(/("apiKey"\s*:\s*")([^"]+)(")/gi, '$1[MASKED]$3');
     str = str.replace(/("webhookSecret"\s*:\s*")([^"]+)(")/gi, '$1[MASKED]$3');
@@ -102,29 +207,38 @@ class PlayUpDatabase {
       try {
         return JSON.parse(str);
       } catch {
-        return { sanitized: str.slice(0, 600) };
+        return { sanitized: str.slice(0, 3500) };
       }
     }
-    return str.slice(0, 600);
+    return str.slice(0, 3500);
   }
 
   private ensureMigrations() {
     let changed = false;
 
+    const envGoxKey = process.env.GOXTOP_API_KEY || '';
+    const envGoxSecret = process.env.GOXTOP_API_KEY_SECRET || process.env.GOXTOP_WEBHOOK_SECRET || '';
+
     if (!this.data.providerSecrets) {
       this.data.providerSecrets = {
         prov_goxtop: {
-          apiKey: process.env.GOXTOP_API_KEY || '',
-          webhookSecret: process.env.GOXTOP_WEBHOOK_SECRET || ''
+          apiKey: envGoxKey,
+          webhookSecret: envGoxSecret
         }
       };
       changed = true;
-    } else if (process.env.GOXTOP_API_KEY && !this.data.providerSecrets.prov_goxtop?.apiKey) {
-      this.data.providerSecrets.prov_goxtop = {
-        apiKey: process.env.GOXTOP_API_KEY,
-        webhookSecret: process.env.GOXTOP_WEBHOOK_SECRET || this.data.providerSecrets.prov_goxtop?.webhookSecret || ''
-      };
-      changed = true;
+    } else {
+      if (!this.data.providerSecrets.prov_goxtop) {
+        this.data.providerSecrets.prov_goxtop = { apiKey: '', webhookSecret: '' };
+      }
+      if (envGoxKey && !this.data.providerSecrets.prov_goxtop.apiKey) {
+        this.data.providerSecrets.prov_goxtop.apiKey = envGoxKey;
+        changed = true;
+      }
+      if (envGoxSecret && !this.data.providerSecrets.prov_goxtop.webhookSecret) {
+        this.data.providerSecrets.prov_goxtop.webhookSecret = envGoxSecret;
+        changed = true;
+      }
     }
 
     if (!this.data.providerOrders) {
@@ -152,6 +266,57 @@ class PlayUpDatabase {
       changed = true;
     }
 
+    if (!this.data.users || this.data.users.length === 0) {
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = crypto.scryptSync('PlayUp2026!', salt, 64).toString('hex');
+      this.data.users = [
+        {
+          id: 'usr_player_01',
+          name: 'Alex Gamer',
+          email: 'alex@playup.gg',
+          phone: '+509 3711-2233',
+          authProvider: 'email',
+          emailVerified: true,
+          status: 'active',
+          preferredCurrency: 'USD',
+          twoFactorEnabled: false,
+          emailNotifications: true,
+          walletBalance: 45.00,
+          ordersCount: 0,
+          totalSpent: 0,
+          createdAt: '2026-02-15T12:00:00Z',
+          lastLoginAt: new Date().toISOString()
+        }
+      ];
+      this.data.userCredentials = {
+        usr_player_01: {
+          passwordHash: hash,
+          passwordSalt: salt
+        }
+      };
+      changed = true;
+    }
+
+    if (!this.data.userCredentials) {
+      this.data.userCredentials = {};
+      changed = true;
+    }
+
+    if (!this.data.paymentGateways || this.data.paymentGateways.length === 0) {
+      this.data.paymentGateways = DEFAULT_PAYMENT_GATEWAYS;
+      changed = true;
+    }
+
+    if (!this.data.paymentGatewaySecrets) {
+      this.data.paymentGatewaySecrets = {};
+      changed = true;
+    }
+
+    if (!this.data.paymentTransactions) {
+      this.data.paymentTransactions = [];
+      changed = true;
+    }
+
     // Remove any legacy demo/fictitious GoXtop order records if present
     if (this.data.orders.some(o => o.id === 'ord_98210' || o.externalOrderId === 'GOX-ORD-881920')) {
       this.data.orders = this.data.orders.filter(o => o.id !== 'ord_98210' && o.externalOrderId !== 'GOX-ORD-881920');
@@ -166,7 +331,7 @@ class PlayUpDatabase {
       changed = true;
     }
 
-    // Ensure GoXtop provider has the exact documented v.1 endpoints
+    // Ensure GoXtop provider has the exact documented v.1 endpoints and base URL
     const goxIdx = this.data.providers.findIndex(p => p.id === 'prov_goxtop' || p.slug === 'goxtop');
     if (goxIdx === -1) {
       this.data.providers.unshift(INITIAL_PROVIDERS[0]);
@@ -182,6 +347,22 @@ class PlayUpDatabase {
           trackOrderPath: '/api/v.1/:id/track',
           checkPlayerPath: 'REQUIRES GOXTOP DOCUMENTATION'
         };
+        changed = true;
+      }
+    }
+
+    // Align default game externalGameIds with GoXtop real gamecode identifiers
+    for (const g of this.data.games) {
+      if (g.id === 'game_ff' && g.externalGameId === 'freefire') {
+        g.externalGameId = 'freefire_global';
+        changed = true;
+      }
+      if (g.id === 'game_mlbb' && g.externalGameId === 'mlbb') {
+        g.externalGameId = 'mlbb_special';
+        changed = true;
+      }
+      if (g.id === 'game_codm' && g.externalGameId === 'codm') {
+        g.externalGameId = 'codm_sgmy';
         changed = true;
       }
     }
@@ -216,6 +397,11 @@ class PlayUpDatabase {
       providerWebhookLogs: [],
       processedWebhookEvents: [],
       userNotifications: [],
+      users: [],
+      userCredentials: {},
+      paymentGateways: DEFAULT_PAYMENT_GATEWAYS,
+      paymentGatewaySecrets: {},
+      paymentTransactions: [],
       resellers: INITIAL_RESELLERS,
       apiKeys: INITIAL_API_KEYS,
       orders: INITIAL_ORDERS,
@@ -305,7 +491,7 @@ class PlayUpDatabase {
     if (providerId === 'prov_goxtop') {
       return {
         apiKey: stored.apiKey || process.env.GOXTOP_API_KEY || '',
-        webhookSecret: stored.webhookSecret || process.env.GOXTOP_WEBHOOK_SECRET || ''
+        webhookSecret: stored.webhookSecret || process.env.GOXTOP_API_KEY_SECRET || process.env.GOXTOP_WEBHOOK_SECRET || ''
       };
     }
     return stored;
@@ -433,6 +619,8 @@ class PlayUpDatabase {
       ...entry,
       id: 'wlog_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
       timestamp: nowIso,
+      rawPayload: entry.rawPayload ? String(this.sanitizeForLogs(entry.rawPayload)) : undefined,
+      headersReceived: entry.headersReceived ? this.sanitizeForLogs(entry.headersReceived) : undefined,
       backendResponse: String(this.sanitizeForLogs(entry.backendResponse)),
       errorMessage: entry.errorMessage ? String(this.sanitizeForLogs(entry.errorMessage)) : undefined
     };
@@ -471,6 +659,7 @@ class PlayUpDatabase {
       ...entry,
       id: 'plog_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
       timestamp: new Date().toISOString(),
+      requestHeadersMasked: entry.requestHeadersMasked ? this.sanitizeForLogs(entry.requestHeadersMasked) : undefined,
       errorMessage: entry.errorMessage ? String(this.sanitizeForLogs(entry.errorMessage)) : undefined,
       requestPreview: entry.requestPreview ? String(this.sanitizeForLogs(entry.requestPreview)) : undefined,
       responsePreview: entry.responsePreview ? String(this.sanitizeForLogs(entry.responsePreview)) : undefined
@@ -553,7 +742,7 @@ class PlayUpDatabase {
     return this.data.systemLogs;
   }
 
-  public addSystemLog(level: 'info' | 'warn' | 'error', module: 'api' | 'order' | 'provider' | 'webhook' | 'auth' | 'system', message: string, meta?: any) {
+  public addSystemLog(level: 'info' | 'warn' | 'error', module: 'api' | 'order' | 'provider' | 'webhook' | 'auth' | 'system' | 'payment', message: string, meta?: any) {
     const log: SystemLog = {
       id: 'log_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
       level,
@@ -571,6 +760,174 @@ class PlayUpDatabase {
 
   public getAdminToken(): string {
     return this.data.adminToken;
+  }
+
+  // ==========================================
+  // USER AUTHENTICATION & PASSWORD HASHING
+  // ==========================================
+  public hashPassword(password: string, existingSalt?: string): { hash: string; salt: string } {
+    const salt = existingSalt || crypto.randomBytes(16).toString('hex');
+    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    return { hash, salt };
+  }
+
+  public verifyPassword(password: string, userId: string): boolean {
+    const cred = this.data.userCredentials?.[userId];
+    if (!cred || !cred.passwordHash || !cred.passwordSalt) return false;
+    const { hash } = this.hashPassword(password, cred.passwordSalt);
+    try {
+      return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(cred.passwordHash, 'hex'));
+    } catch {
+      return false;
+    }
+  }
+
+  public getUsers(): AppUser[] {
+    return this.data.users || [];
+  }
+
+  public setUsers(users: AppUser[]) {
+    this.data.users = users;
+    this.save();
+  }
+
+  public getUserById(userId: string): AppUser | undefined {
+    return (this.data.users || []).find(u => u.id === userId || (u.uid && u.uid === userId));
+  }
+
+  public getUserByEmail(email: string): AppUser | undefined {
+    const clean = email.trim().toLowerCase();
+    return (this.data.users || []).find(u => u.email.toLowerCase() === clean);
+  }
+
+  public setUserCredential(userId: string, cred: UserCredentialRecord) {
+    if (!this.data.userCredentials) {
+      this.data.userCredentials = {};
+    }
+    this.data.userCredentials[userId] = cred;
+    this.save();
+  }
+
+  public getUserCredential(userId: string): UserCredentialRecord | undefined {
+    return this.data.userCredentials?.[userId];
+  }
+
+  public generateUserSessionToken(userId: string): string {
+    const payload = `${userId}.${Date.now()}`;
+    const sig = crypto
+      .createHmac('sha256', this.data.adminToken || 'playup_secret')
+      .update(payload)
+      .digest('hex');
+    return `plup_usr_${ Buffer.from(payload).toString('base64url') }.${sig}`;
+  }
+
+  public verifyUserSessionToken(token?: string): AppUser | null {
+    if (!token || !token.startsWith('plup_usr_')) return null;
+    try {
+      const raw = token.slice('plup_usr_'.length);
+      const [b64Payload, sig] = raw.split('.');
+      if (!b64Payload || !sig) return null;
+      const payload = Buffer.from(b64Payload, 'base64url').toString('utf8');
+      const expectedSig = crypto
+        .createHmac('sha256', this.data.adminToken || 'playup_secret')
+        .update(payload)
+        .digest('hex');
+      if (sig !== expectedSig) return null;
+      const [userId] = payload.split('.');
+      const user = this.getUserById(userId);
+      if (!user || user.status === 'suspended') return null;
+      return user;
+    } catch {
+      return null;
+    }
+  }
+
+  // ==========================================
+  // PAYMENT GATEWAYS & TRANSACTIONS
+  // ==========================================
+  public getPaymentGateways(): PaymentGatewayConfig[] {
+    const gateways = this.data.paymentGateways || DEFAULT_PAYMENT_GATEWAYS;
+    return gateways.map(gw => {
+      const sec = this.data.paymentGatewaySecrets?.[gw.id];
+      const hasCreds = gw.slug === 'wallet' ? true : Boolean(sec?.apiKey && sec.apiKey.trim().length > 0);
+      return {
+        ...gw,
+        hasCredentials: hasCreds,
+        credentialsMasked:
+          gw.slug === 'wallet'
+            ? 'Interne PlayUp'
+            : hasCreds
+            ? this.maskSecretValue(sec?.apiKey)
+            : gw.mode === 'sandbox'
+            ? 'Mode Sandbox Actif'
+            : 'Non configuré'
+      };
+    });
+  }
+
+  public setPaymentGateways(gateways: PaymentGatewayConfig[]) {
+    this.data.paymentGateways = gateways;
+    this.save();
+  }
+
+  public setPaymentGatewaySecret(gatewayId: string, secret: Partial<PaymentGatewaySecretRecord>) {
+    if (!this.data.paymentGatewaySecrets) {
+      this.data.paymentGatewaySecrets = {};
+    }
+    const existing = this.data.paymentGatewaySecrets[gatewayId] || {
+      apiKey: '',
+      clientSecret: '',
+      webhookSecret: ''
+    };
+    this.data.paymentGatewaySecrets[gatewayId] = {
+      apiKey: secret.apiKey !== undefined ? secret.apiKey : existing.apiKey,
+      clientSecret: secret.clientSecret !== undefined ? secret.clientSecret : existing.clientSecret,
+      webhookSecret: secret.webhookSecret !== undefined ? secret.webhookSecret : existing.webhookSecret
+    };
+    this.save();
+  }
+
+  public getPaymentGatewaySecret(gatewayId: string): PaymentGatewaySecretRecord {
+    return (
+      this.data.paymentGatewaySecrets?.[gatewayId] || {
+        apiKey: '',
+        clientSecret: '',
+        webhookSecret: ''
+      }
+    );
+  }
+
+  public getPaymentTransactions(userId?: string): PaymentTransaction[] {
+    const list = this.data.paymentTransactions || [];
+    if (userId) {
+      return list.filter(t => t.userId === userId);
+    }
+    return list;
+  }
+
+  public addPaymentTransaction(tx: Omit<PaymentTransaction, 'id' | 'createdAt' | 'updatedAt'>): PaymentTransaction {
+    if (!this.data.paymentTransactions) {
+      this.data.paymentTransactions = [];
+    }
+    const nowIso = new Date().toISOString();
+    const record: PaymentTransaction = {
+      ...tx,
+      id: 'ptx_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+    this.data.paymentTransactions.unshift(record);
+    if (this.data.paymentTransactions.length > 500) {
+      this.data.paymentTransactions = this.data.paymentTransactions.slice(0, 500);
+    }
+
+    const gwIdx = (this.data.paymentGateways || []).findIndex(g => g.id === tx.gatewayId || g.slug === tx.paymentMethod);
+    if (gwIdx !== -1) {
+      this.data.paymentGateways[gwIdx].lastTransactionAt = nowIso;
+    }
+
+    this.save();
+    return record;
   }
 }
 

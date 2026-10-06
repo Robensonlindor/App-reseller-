@@ -4,9 +4,24 @@ import { db } from './db';
 import { ProviderEngine } from './providerEngine';
 import { WebhookEngine } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
-import { Game, Service, Order, SupportTicket, Provider } from '../src/types';
+import { Game, Service, Order, SupportTicket, Provider, AppUser, PaymentMethodType } from '../src/types';
 
 export const apiRouter = Router();
+
+// Middleware: Authenticate App User via Session Token
+const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+  const user = db.verifyUserSessionToken(token);
+  if (!user) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Session expirée ou invalide. Veuillez vous reconnecter.'
+    });
+  }
+  (req as any).user = user;
+  return next();
+};
 
 // ==========================================
 // MIDDLEWARES
@@ -151,6 +166,438 @@ apiRouter.get('/games/:idOrSlug', (req, res) => {
 apiRouter.get('/services', (_req, res) => {
   const services = db.getServices().filter(s => s.isActive);
   res.json(services);
+});
+
+// ==========================================
+// 1B. USER AUTHENTICATION & ACCOUNT MANAGEMENT
+// ==========================================
+
+apiRouter.post('/auth/register', (req, res) => {
+  try {
+    const { name, email, password, phone, preferredCurrency } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Le nom, l’adresse email et le mot de passe sont obligatoires.' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères.' });
+    }
+
+    const existing = db.getUserByEmail(email);
+    if (existing) {
+      return res.status(400).json({ error: 'Un compte PlayUp existe déjà avec cette adresse email.' });
+    }
+
+    const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex');
+    const nowIso = new Date().toISOString();
+    const { hash, salt } = db.hashPassword(String(password));
+
+    const newUser: AppUser = {
+      id: userId,
+      name: String(name).trim().slice(0, 80),
+      email: String(email).trim().toLowerCase().slice(0, 160),
+      phone: phone ? String(phone).trim().slice(0, 32) : undefined,
+      authProvider: 'email',
+      emailVerified: true,
+      status: 'active',
+      preferredCurrency: ['USD', 'HTG', 'EUR'].includes(preferredCurrency) ? preferredCurrency : 'USD',
+      twoFactorEnabled: false,
+      emailNotifications: true,
+      walletBalance: 15.00, // Welcome bonus credit for testing PlayUp Wallet
+      ordersCount: 0,
+      totalSpent: 0,
+      createdAt: nowIso,
+      lastLoginAt: nowIso
+    };
+
+    const users = db.getUsers();
+    users.unshift(newUser);
+    db.setUsers(users);
+    db.setUserCredential(userId, {
+      passwordHash: hash,
+      passwordSalt: salt
+    });
+
+    const token = db.generateUserSessionToken(userId);
+    db.addSystemLog('info', 'auth', `New PlayUp user registered: ${newUser.email} (${newUser.name})`);
+
+    return res.status(201).json({
+      user: newUser,
+      token
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Erreur lors de la création du compte' });
+  }
+});
+
+apiRouter.post('/auth/login', (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Veuillez renseigner votre email et votre mot de passe.' });
+    }
+
+    const user = db.getUserByEmail(String(email));
+    if (!user) {
+      return res.status(401).json({ error: 'Identifiants invalides. Aucun compte trouvé avec cet email.' });
+    }
+
+    if (user.status === 'suspended') {
+      return res.status(403).json({ error: 'Ce compte utilisateur a été suspendu par un administrateur.' });
+    }
+
+    const isValid = db.verifyPassword(String(password), user.id);
+    if (!isValid) {
+      db.addSystemLog('warn', 'auth', `Failed login attempt for user ${user.email}`);
+      return res.status(401).json({ error: 'Mot de passe incorrect.' });
+    }
+
+    const users = db.getUsers();
+    const idx = users.findIndex(u => u.id === user.id);
+    if (idx !== -1) {
+      users[idx].lastLoginAt = new Date().toISOString();
+      db.setUsers(users);
+    }
+
+    const token = db.generateUserSessionToken(user.id);
+    db.addSystemLog('info', 'auth', `User logged in: ${user.email}`);
+
+    return res.json({
+      user: users[idx] || user,
+      token
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Erreur de connexion' });
+  }
+});
+
+apiRouter.post('/auth/social', (req, res) => {
+  try {
+    const { provider, uid, email, name, avatarUrl } = req.body;
+    if (!email || !provider) {
+      return res.status(400).json({ error: 'Informations d’authentification sociale incomplètes.' });
+    }
+
+    const users = db.getUsers();
+    let user = users.find(u => u.email.toLowerCase() === String(email).toLowerCase() || (uid && u.uid === uid));
+    const nowIso = new Date().toISOString();
+
+    if (user) {
+      if (user.status === 'suspended') {
+        return res.status(403).json({ error: 'Ce compte utilisateur est suspendu.' });
+      }
+      user.lastLoginAt = nowIso;
+      if (uid && !user.uid) user.uid = uid;
+      if (avatarUrl) user.avatarUrl = avatarUrl;
+      db.setUsers(users);
+    } else {
+      const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex');
+      user = {
+        id: userId,
+        uid: uid || undefined,
+        name: String(name || email.split('@')[0]).slice(0, 80),
+        email: String(email).toLowerCase().slice(0, 160),
+        avatarUrl: avatarUrl || undefined,
+        authProvider: provider === 'facebook' ? 'facebook' : 'google',
+        emailVerified: true,
+        status: 'active',
+        preferredCurrency: 'USD',
+        twoFactorEnabled: false,
+        emailNotifications: true,
+        walletBalance: 15.00,
+        ordersCount: 0,
+        totalSpent: 0,
+        createdAt: nowIso,
+        lastLoginAt: nowIso
+      };
+      users.unshift(user);
+      db.setUsers(users);
+      db.addSystemLog('info', 'auth', `New social login user (${provider}): ${user.email}`);
+    }
+
+    const token = db.generateUserSessionToken(user.id);
+    return res.json({
+      user,
+      token
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Erreur connexion sociale' });
+  }
+});
+
+apiRouter.post('/auth/forgot-password', (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: 'Veuillez saisir votre adresse email.' });
+  }
+
+  const user = db.getUserByEmail(String(email));
+  if (!user) {
+    return res.status(404).json({ error: 'Aucun compte associé à cette adresse email.' });
+  }
+
+  const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  const existingCred = db.getUserCredential(user.id) || db.hashPassword(crypto.randomBytes(12).toString('hex'));
+
+  db.setUserCredential(user.id, {
+    passwordHash: (existingCred as any).passwordHash || (existingCred as any).hash,
+    passwordSalt: (existingCred as any).passwordSalt || (existingCred as any).salt,
+    resetToken: resetCode,
+    resetTokenExpiresAt: expiresAt
+  });
+
+  db.addSystemLog('info', 'auth', `Password reset token generated for ${user.email}`);
+
+  return res.json({
+    success: true,
+    email: user.email,
+    resetCode, // Provided for direct verification in preview environment
+    expiresAt,
+    message: `Code de réinitialisation généré pour ${user.email} (valide 15 minutes).`
+  });
+});
+
+apiRouter.post('/auth/reset-password', (req, res) => {
+  const { email, resetCode, newPassword } = req.body;
+  if (!email || !resetCode || !newPassword) {
+    return res.status(400).json({ error: 'Email, code de sécurité et nouveau mot de passe requis.' });
+  }
+  if (String(newPassword).length < 6) {
+    return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
+  }
+
+  const user = db.getUserByEmail(String(email));
+  if (!user) {
+    return res.status(404).json({ error: 'Compte utilisateur introuvable.' });
+  }
+
+  const cred = db.getUserCredential(user.id);
+  if (!cred || !cred.resetToken || cred.resetToken !== String(resetCode).trim()) {
+    return res.status(400).json({ error: 'Code de réinitialisation invalide.' });
+  }
+
+  if (cred.resetTokenExpiresAt && new Date(cred.resetTokenExpiresAt).getTime() < Date.now()) {
+    return res.status(400).json({ error: 'Ce code de réinitialisation a expiré.' });
+  }
+
+  const { hash, salt } = db.hashPassword(String(newPassword));
+  db.setUserCredential(user.id, {
+    passwordHash: hash,
+    passwordSalt: salt
+  });
+
+  db.addSystemLog('info', 'auth', `Password successfully reset for user ${user.email}`);
+  const token = db.generateUserSessionToken(user.id);
+
+  return res.json({
+    success: true,
+    message: 'Votre mot de passe a été réinitialisé avec succès.',
+    user,
+    token
+  });
+});
+
+apiRouter.get('/auth/me', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const userOrders = db.getOrders().filter(o => o.userId === user.id || (user.uid && o.userId === user.uid));
+  const paymentTxs = db.getPaymentTransactions(user.id);
+  return res.json({
+    user,
+    orders: userOrders,
+    paymentTransactions: paymentTxs
+  });
+});
+
+apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
+  const currentUser = (req as any).user as AppUser;
+  const { name, phone, preferredCurrency, twoFactorEnabled, emailNotifications, currentPassword, newPassword } = req.body;
+
+  const users = db.getUsers();
+  const idx = users.findIndex(u => u.id === currentUser.id);
+  if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  if (newPassword) {
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
+    }
+    const existingCred = db.getUserCredential(currentUser.id);
+    if (existingCred && existingCred.passwordHash) {
+      if (!currentPassword || !db.verifyPassword(String(currentPassword), currentUser.id)) {
+        return res.status(400).json({ error: 'Le mot de passe actuel est incorrect.' });
+      }
+    }
+    const { hash, salt } = db.hashPassword(String(newPassword));
+    db.setUserCredential(currentUser.id, {
+      passwordHash: hash,
+      passwordSalt: salt
+    });
+  }
+
+  if (name) users[idx].name = String(name).trim().slice(0, 80);
+  if (phone !== undefined) users[idx].phone = String(phone).trim().slice(0, 32);
+  if (preferredCurrency && ['USD', 'HTG', 'EUR'].includes(preferredCurrency)) {
+    users[idx].preferredCurrency = preferredCurrency;
+  }
+  if (typeof twoFactorEnabled === 'boolean') users[idx].twoFactorEnabled = twoFactorEnabled;
+  if (typeof emailNotifications === 'boolean') users[idx].emailNotifications = emailNotifications;
+
+  db.setUsers(users);
+  db.addSystemLog('info', 'auth', `User ${users[idx].email} updated account profile`);
+
+  return res.json({
+    user: users[idx],
+    message: 'Profil et paramètres de sécurité mis à jour avec succès.'
+  });
+});
+
+// ==========================================
+// 1C. MODULAR PAYMENT GATEWAY ENGINE (CARD / MONCASH / NATCASH / WALLET)
+// ==========================================
+
+apiRouter.get('/payments/gateways', (_req, res) => {
+  const gateways = db.getPaymentGateways().filter(g => g.isEnabled);
+  res.json(gateways);
+});
+
+apiRouter.post('/payments/process', async (req, res) => {
+  try {
+    const {
+      userId,
+      paymentMethod,
+      amount,
+      currency = 'USD',
+      cardDetails,
+      mobileWalletDetails,
+      purpose = 'order' // 'order' | 'wallet_topup'
+    } = req.body;
+
+    const numAmount = Number(amount);
+    if (isNaN(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: 'Montant de paiement invalide.' });
+    }
+
+    const gateways = db.getPaymentGateways();
+    const gateway = gateways.find(g => g.slug === paymentMethod && g.isEnabled);
+    if (!gateway) {
+      return res.status(400).json({ error: `La méthode de paiement "${paymentMethod}" est indisponible ou désactivée.` });
+    }
+
+    const feeAmount = Number(((numAmount * gateway.feePercent) / 100 + gateway.fixedFee).toFixed(2));
+    const totalCharged = Number((numAmount + feeAmount).toFixed(2));
+    const txRef = `PAY-${gateway.slug.toUpperCase()}-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+
+    let payerIdentifier = '';
+    let externalReference = '';
+    let statusMessage = '';
+
+    // Validate & Process according to selected Payment Provider Adapter
+    if (paymentMethod === 'card') {
+      const cardNumber = String(cardDetails?.cardNumber || '').replace(/\s+/g, '');
+      const expiry = String(cardDetails?.expiry || '').trim();
+      const cvc = String(cardDetails?.cvc || '').trim();
+      const holderName = String(cardDetails?.holderName || '').trim();
+
+      if (cardNumber.length < 12 || !/^\d+$/.test(cardNumber)) {
+        return res.status(400).json({ error: 'Numéro de carte bancaire invalide (12 à 19 chiffres requis).' });
+      }
+      if (!/^\d{2}\/\d{2,4}$/.test(expiry)) {
+        return res.status(400).json({ error: 'Date d’expiration invalide (format MM/YY requis).' });
+      }
+      if (cvc.length < 3 || !/^\d{3,4}$/.test(cvc)) {
+        return res.status(400).json({ error: 'Code CVC/CVV invalide (3 ou 4 chiffres requis).' });
+      }
+      if (!holderName) {
+        return res.status(400).json({ error: 'Le nom du titulaire de la carte est requis.' });
+      }
+
+      payerIdentifier = `•••• ${cardNumber.slice(-4)} (${holderName})`;
+      externalReference = `STRP_${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
+      statusMessage = `Paiement par carte (${payerIdentifier}) autorisé et capturé via ${gateway.providerName} (${gateway.mode.toUpperCase()}).`;
+    } else if (paymentMethod === 'moncash' || paymentMethod === 'natcash') {
+      const phone = String(mobileWalletDetails?.phone || '').trim();
+      const pinOrOtp = String(mobileWalletDetails?.otp || '').trim();
+
+      if (phone.length < 8) {
+        return res.status(400).json({
+          error: `Veuillez saisir un numéro ${paymentMethod === 'moncash' ? 'Digicel MonCash' : 'Natcom NatCash'} valide (ex: +509 37XX-XXXX).`
+        });
+      }
+      if (pinOrOtp.length < 4) {
+        return res.status(400).json({
+          error: `Veuillez saisir le code de confirmation / OTP ${paymentMethod === 'moncash' ? 'MonCash' : 'NatCash'} (minimum 4 chiffres).`
+        });
+      }
+
+      payerIdentifier = phone;
+      externalReference = `${paymentMethod === 'moncash' ? 'MC' : 'NC'}_${Date.now().toString().slice(-7)}`;
+      statusMessage = `Transaction ${gateway.name} confirmée pour le numéro ${phone} (Réf: ${externalReference}).`;
+    } else if (paymentMethod === 'wallet') {
+      if (!userId) {
+        return res.status(401).json({ error: 'Vous devez être connecté à votre compte PlayUp pour payer avec votre solde Wallet.' });
+      }
+      const users = db.getUsers();
+      const uIdx = users.findIndex(u => u.id === userId || u.uid === userId);
+      if (uIdx === -1) {
+        return res.status(404).json({ error: 'Compte utilisateur PlayUp introuvable.' });
+      }
+      if (users[uIdx].walletBalance < totalCharged) {
+        return res.status(400).json({
+          error: `Solde PlayUp Wallet insuffisant ($${users[uIdx].walletBalance.toFixed(2)} disponible, $${totalCharged.toFixed(2)} requis).`
+        });
+      }
+
+      users[uIdx].walletBalance = Number((users[uIdx].walletBalance - totalCharged).toFixed(2));
+      db.setUsers(users);
+      payerIdentifier = users[uIdx].email;
+      externalReference = `WLT_${Date.now().toString().slice(-7)}`;
+      statusMessage = `Débit instantané de $${totalCharged.toFixed(2)} effectué sur votre solde PlayUp Wallet.`;
+    } else {
+      return res.status(400).json({ error: 'Méthode de paiement non reconnue.' });
+    }
+
+    // If purpose is wallet_topup, credit user wallet
+    let updatedUser: AppUser | undefined;
+    if (purpose === 'wallet_topup' && userId) {
+      const users = db.getUsers();
+      const uIdx = users.findIndex(u => u.id === userId || u.uid === userId);
+      if (uIdx !== -1) {
+        users[uIdx].walletBalance = Number((users[uIdx].walletBalance + numAmount).toFixed(2));
+        db.setUsers(users);
+        updatedUser = users[uIdx];
+      }
+    }
+
+    const userObj = userId ? db.getUserById(userId) : undefined;
+    const txRecord = db.addPaymentTransaction({
+      transactionReference: txRef,
+      userId: userObj?.id || userId || 'guest_user',
+      userEmail: userObj?.email,
+      gatewayId: gateway.id,
+      paymentMethod: paymentMethod as PaymentMethodType,
+      amount: numAmount,
+      currency,
+      feeAmount,
+      totalCharged,
+      status: 'completed',
+      externalReference,
+      payerIdentifier,
+      statusMessage
+    });
+
+    db.addSystemLog(
+      'info',
+      'payment',
+      `Payment ${txRef} (${gateway.name}) completed: $${totalCharged.toFixed(2)} ${currency} for ${userObj?.email || userId || 'client'}`
+    );
+
+    return res.status(201).json({
+      success: true,
+      transaction: txRecord,
+      user: updatedUser || userObj
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Erreur lors du traitement du paiement' });
+  }
 });
 
 // ==========================================
@@ -307,6 +754,9 @@ apiRouter.post('/app/orders', async (req, res) => {
       margin,
       currency: pkg.currency,
       status: initialStatus,
+      paymentMethod: req.body.paymentMethod || 'card',
+      paymentTransactionId: req.body.paymentTransactionId || undefined,
+      paymentReference: req.body.paymentReference || undefined,
       providerId: provider?.id || 'prov_goxtop',
       providerName: provider?.name || 'GoXtop',
       createdAt: nowIso,
@@ -331,6 +781,17 @@ apiRouter.post('/app/orders', async (req, res) => {
 
     orders.unshift(newOrder);
     db.setOrders(orders);
+
+    // Update user order stats if linked to a registered user
+    if (newOrder.userId) {
+      const users = db.getUsers();
+      const uIdx = users.findIndex(u => u.id === newOrder.userId || u.uid === newOrder.userId);
+      if (uIdx !== -1) {
+        users[uIdx].ordersCount = (users[uIdx].ordersCount || 0) + 1;
+        users[uIdx].totalSpent = Number(((users[uIdx].totalSpent || 0) + newOrder.chargedAmount).toFixed(2));
+        db.setUsers(users);
+      }
+    }
 
     db.addSystemLog('info', 'order', `New mobile order ${orderNumber} (Partner ID: ${partnerOrderId}) created for ${game.name} - ${pkg.name}`);
 
@@ -373,27 +834,42 @@ apiRouter.get('/app/orders', (req, res) => {
 
 const handleProviderWebhook = async (req: Request, res: Response, providerSlugOrId: string) => {
   const providers = db.getProviders();
-  const provider = providers.find(
+  const provIdx = providers.findIndex(
     p => p.slug.toLowerCase() === providerSlugOrId.toLowerCase() || p.id.toLowerCase() === providerSlugOrId.toLowerCase()
   );
 
-  if (!provider) {
+  if (provIdx === -1) {
     return res.status(404).json({ error: 'Unknown provider webhook endpoint' });
   }
 
+  const provider = providers[provIdx];
   const adapter = ProviderFactory.getProviderInstance(provider.id);
   if (!adapter) {
     return res.status(500).json({ error: 'Provider adapter unavailable' });
   }
 
-  const rawBody = JSON.stringify(req.body || {});
-  const signatureHeader =
-    (req.headers['x-goxtop-signature'] as string) ||
-    (req.headers['x-webhook-signature'] as string) ||
-    (req.headers['x-signature'] as string) ||
-    (req.headers['x-hub-signature-256'] as string);
+  const rawBody = (req as any).rawBody || JSON.stringify(req.body || {});
+  const result = await adapter.handleWebhook(rawBody, req.headers as Record<string, any>, req.body || {});
 
-  const result = await adapter.handleWebhook(rawBody, signatureHeader, req.body || {});
+  // Update provider webhook telemetry
+  const latestProviders = db.getProviders();
+  const latestIdx = latestProviders.findIndex(p => p.id === provider.id);
+  if (latestIdx !== -1) {
+    const isInternalTest = req.body?.event_type === 'TEST_WEBHOOK' || req.body?.type === 'TEST_WEBHOOK';
+    const rawStatus = String(req.body?.status || req.body?.order_status || '').toLowerCase();
+    const evtLabel = isInternalTest
+      ? 'TEST_WEBHOOK'
+      : String(req.body?.event || req.body?.event_type || (rawStatus ? `ORDER_${rawStatus.toUpperCase()}` : 'WEBHOOK_NOTIFICATION'));
+
+    latestProviders[latestIdx].lastWebhookReceivedAt = new Date().toISOString();
+    latestProviders[latestIdx].lastWebhookEvent = evtLabel;
+    latestProviders[latestIdx].lastWebhookHttpStatus = result.httpCode;
+    if (result.body?.hmacValidation) {
+      latestProviders[latestIdx].lastWebhookHmacStatus = result.body.hmacValidation;
+    }
+    db.setProviders(latestProviders);
+  }
+
   return res.status(result.httpCode).json(result.body);
 };
 
@@ -1277,14 +1753,128 @@ apiRouter.post('/admin/providers/:id/sync', authenticateAdmin, async (req, res) 
       ? await adapter.getGames()
       : await adapter.getProducts(gameCode);
 
-  if (syncResult.success) {
-    providers[index].lastSyncAt = new Date().toISOString();
-    db.setProviders(providers);
+  const latestProviders = db.getProviders();
+  const latestIdx = latestProviders.findIndex(p => p.id === provider.id);
+  if (latestIdx !== -1) {
+    if (syncResult.success) {
+      latestProviders[latestIdx].lastSyncAt = new Date().toISOString();
+    }
+    latestProviders[latestIdx].lastSyncSummary = {
+      timestamp: new Date().toISOString(),
+      syncType,
+      success: syncResult.success,
+      httpStatus: syncResult.httpStatus,
+      gamesRetrieved: syncResult.gamesRetrieved ?? latestProviders[latestIdx].lastSyncSummary?.gamesRetrieved ?? 0,
+      productsRetrieved: syncResult.productsRetrieved ?? latestProviders[latestIdx].lastSyncSummary?.productsRetrieved ?? 0,
+      productsAdded: syncResult.productsAdded ?? 0,
+      productsUpdated: syncResult.productsUpdated ?? 0,
+      productsDeactivated: syncResult.productsDeactivated ?? 0,
+      providerErrorMessage: syncResult.providerErrorMessage
+    };
+    db.setProviders(latestProviders);
   }
 
   res.json({
     ...syncResult,
-    syncType
+    syncType,
+    provider: db.getProviders().find(p => p.id === provider.id)
+  });
+});
+
+// Get Provider Webhook Logs (dedicated diagnostic log table)
+apiRouter.get('/admin/providers/:id/webhook-logs', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  if (id === 'all') {
+    return res.json(db.getProviderWebhookLogs());
+  }
+  const providers = db.getProviders();
+  const provider = providers.find(p => p.id === id || p.slug === id);
+  res.json(db.getProviderWebhookLogs(provider?.id || id));
+});
+
+// Internal Diagnostic Test for Provider Webhook (TEST_WEBHOOK — never creates an order or debits money)
+apiRouter.post('/admin/providers/:id/test-webhook', authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { simulateInvalidSignature } = req.body || {};
+  const providers = db.getProviders();
+  const index = providers.findIndex(p => p.id === id || p.slug === id);
+  if (index === -1) return res.status(404).json({ error: 'Fournisseur introuvable' });
+
+  const provider = providers[index];
+  const adapter = ProviderFactory.getProviderInstance(provider.id);
+  if (!adapter) {
+    return res.status(500).json({ error: 'Adaptateur fournisseur non disponible' });
+  }
+
+  const startTime = Date.now();
+  const testPayload = {
+    event_type: 'TEST_WEBHOOK',
+    provider: provider.name,
+    timestamp: new Date().toISOString(),
+    internal_diagnostic: true,
+    note: simulateInvalidSignature
+      ? 'Test de sécurité HMAC-SHA256 (signature volontairement altérée pour vérifier le rejet HTTP 401).'
+      : 'Événement interne de test PlayUp — aucune commande créée chez GoXtop, aucun montant débité.'
+  };
+  const rawBody = JSON.stringify(testPayload);
+
+  // If a Webhook Secret is configured on the server, sign the internal test payload with HMAC-SHA256 to verify the pipeline end-to-end
+  const secrets = db.getProviderSecret(provider.id);
+  const simulatedHeaders: Record<string, string> = {
+    'content-type': 'application/json',
+    'user-agent': 'GoXtop-Webhook-Dispatcher/1.0'
+  };
+
+  if (secrets.webhookSecret && secrets.webhookSecret.trim()) {
+    const signatureHex = crypto
+      .createHmac('sha256', secrets.webhookSecret.trim())
+      .update(rawBody, 'utf8')
+      .digest('hex');
+    simulatedHeaders['x-goxtop-signature'] = simulateInvalidSignature
+      ? `0000000000000000${signatureHex.slice(16)}`
+      : signatureHex;
+  }
+
+  const webhookResult = await adapter.handleWebhook(rawBody, simulatedHeaders, testPayload);
+  const latencyMs = Date.now() - startTime;
+
+  const latestProviders = db.getProviders();
+  const latestIdx = latestProviders.findIndex(p => p.id === provider.id);
+  const hmacValidation = webhookResult.body?.hmacValidation || 'Non applicable (secret non fourni par GoXtop)';
+
+  if (latestIdx !== -1) {
+    latestProviders[latestIdx].lastWebhookReceivedAt = new Date().toISOString();
+    latestProviders[latestIdx].lastWebhookEvent = 'TEST_WEBHOOK';
+    latestProviders[latestIdx].lastWebhookHttpStatus = webhookResult.httpCode;
+    latestProviders[latestIdx].lastWebhookHmacStatus = hmacValidation;
+    db.setProviders(latestProviders);
+  }
+
+  res.json({
+    result: {
+      success: webhookResult.httpCode >= 200 && webhookResult.httpCode < 300,
+      urlCalled: provider.webhookUrl || `/api/webhooks/${provider.slug}`,
+      httpMethod: 'POST' as const,
+      eventType: 'TEST_WEBHOOK',
+      resultLabel: webhookResult.httpCode >= 200 && webhookResult.httpCode < 300 ? 'Succès' : 'Rejeté (Sécurité HMAC)',
+      httpStatus: webhookResult.httpCode,
+      latencyMs,
+      signatureDetected: Boolean(webhookResult.body?.signatureDetected),
+      signatureHeaderName: webhookResult.body?.signatureHeaderName,
+      signatureValueMasked: webhookResult.body?.signatureValueMasked,
+      computedHmacPreview: webhookResult.body?.computedHmacPreview,
+      hmacValidation,
+      processingSteps: webhookResult.body?.processingSteps || [],
+      backendResponse: JSON.stringify(webhookResult.body),
+      details: webhookResult.body?.message || '',
+      timestamp: new Date().toISOString(),
+      message:
+        webhookResult.httpCode >= 200 && webhookResult.httpCode < 300
+          ? `Endpoint POST ${provider.webhookUrl || `/api/webhooks/${provider.slug}`} actif et fonctionnel (HTTP ${webhookResult.httpCode}).`
+          : `Le webhook a été rejeté avec HTTP ${webhookResult.httpCode} (${webhookResult.body?.message || 'Signature HMAC invalide'}).`
+    },
+    provider: db.getProviders().find(p => p.id === provider.id),
+    webhookLogs: db.getProviderWebhookLogs(provider.id)
   });
 });
 
@@ -1504,4 +2094,152 @@ apiRouter.put('/admin/settings', authenticateAdmin, (req, res) => {
 // Admin System Logs
 apiRouter.get('/admin/logs', authenticateAdmin, (_req, res) => {
   res.json(db.getSystemLogs());
+});
+
+// ==========================================
+// ADMIN USERS MANAGEMENT
+// ==========================================
+apiRouter.get('/admin/users', authenticateAdmin, (_req, res) => {
+  res.json(db.getUsers());
+});
+
+apiRouter.put('/admin/users/:id/status', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  const users = db.getUsers();
+  const idx = users.findIndex(u => u.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  users[idx].status = status === 'suspended' ? 'suspended' : 'active';
+  db.setUsers(users);
+  db.addSystemLog('info', 'auth', `Admin updated user ${users[idx].email} status to ${users[idx].status}`);
+  res.json(users[idx]);
+});
+
+apiRouter.post('/admin/users/:id/wallet', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { amount, note } = req.body;
+  const numAmount = Number(amount);
+  if (isNaN(numAmount)) return res.status(400).json({ error: 'Montant invalide' });
+
+  const users = db.getUsers();
+  const idx = users.findIndex(u => u.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  users[idx].walletBalance = Number(Math.max(0, users[idx].walletBalance + numAmount).toFixed(2));
+  db.setUsers(users);
+
+  db.addSystemLog('info', 'payment', `Admin adjusted wallet balance for ${users[idx].email}: ${numAmount >= 0 ? '+' : ''}${numAmount} USD (${note || 'Ajustement admin'})`);
+  res.json(users[idx]);
+});
+
+apiRouter.post('/admin/users/:id/reset-password', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+  if (!newPassword || String(newPassword).length < 6) {
+    return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
+  }
+
+  const users = db.getUsers();
+  const user = users.find(u => u.id === id);
+  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  const { hash, salt } = db.hashPassword(String(newPassword));
+  db.setUserCredential(user.id, {
+    passwordHash: hash,
+    passwordSalt: salt
+  });
+
+  db.addSystemLog('info', 'auth', `Admin reset password for user ${user.email}`);
+  res.json({ success: true, message: `Mot de passe réinitialisé pour ${user.email}.` });
+});
+
+// ==========================================
+// ADMIN RESELLER API KEYS MANAGEMENT
+// ==========================================
+apiRouter.get('/admin/api-keys', authenticateAdmin, (_req, res) => {
+  res.json(db.getApiKeys());
+});
+
+apiRouter.post('/admin/resellers/:id/api-keys', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name } = req.body;
+  const resellers = db.getResellers();
+  const reseller = resellers.find(r => r.id === id);
+  if (!reseller) return res.status(404).json({ error: 'Revendeur introuvable' });
+
+  const apiKeys = db.getApiKeys();
+  const rawKey = 'plup_live_' + crypto.randomBytes(20).toString('hex');
+  const newKey = {
+    id: 'key_' + Date.now(),
+    resellerId: reseller.id,
+    name: name || `Clé API ${reseller.company}`,
+    key: rawKey,
+    maskedKey: `plup_live_${rawKey.slice(10, 14)}...${rawKey.slice(-4)}`,
+    permissions: ['games.read', 'services.read', 'orders.create', 'orders.read', 'balance.read'],
+    status: 'active' as const,
+    createdAt: new Date().toISOString()
+  };
+
+  apiKeys.unshift(newKey);
+  db.setApiKeys(apiKeys);
+  db.addSystemLog('info', 'auth', `Admin generated new API key "${newKey.name}" for reseller ${reseller.company}`);
+  res.status(201).json(newKey);
+});
+
+apiRouter.put('/admin/api-keys/:id/status', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  const apiKeys = db.getApiKeys();
+  const idx = apiKeys.findIndex(k => k.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Clé API introuvable' });
+
+  apiKeys[idx].status = status === 'revoked' ? 'revoked' : 'active';
+  db.setApiKeys(apiKeys);
+  db.addSystemLog('info', 'auth', `Admin changed API key ${apiKeys[idx].maskedKey} status to ${apiKeys[idx].status}`);
+  res.json(apiKeys[idx]);
+});
+
+// ==========================================
+// ADMIN PAYMENT GATEWAYS & TRANSACTIONS
+// ==========================================
+apiRouter.get('/admin/payment-gateways', authenticateAdmin, (_req, res) => {
+  res.json(db.getPaymentGateways());
+});
+
+apiRouter.put('/admin/payment-gateways/:id', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const gateways = db.getPaymentGateways();
+  const idx = gateways.findIndex(g => g.id === id || g.slug === id);
+  if (idx === -1) return res.status(404).json({ error: 'Passerelle de paiement introuvable' });
+
+  const { apiKey, clientSecret, webhookSecret, ...publicFields } = req.body;
+  const rawList = db.getPaymentGateways();
+  rawList[idx] = {
+    ...rawList[idx],
+    ...publicFields
+  };
+  db.setPaymentGateways(rawList);
+
+  const secretUpdate: { apiKey?: string; clientSecret?: string; webhookSecret?: string } = {};
+  if (typeof apiKey === 'string' && !apiKey.includes('••••')) {
+    secretUpdate.apiKey = apiKey.trim();
+  }
+  if (typeof clientSecret === 'string' && !clientSecret.includes('••••')) {
+    secretUpdate.clientSecret = clientSecret.trim();
+  }
+  if (typeof webhookSecret === 'string' && !webhookSecret.includes('••••')) {
+    secretUpdate.webhookSecret = webhookSecret.trim();
+  }
+  if (Object.keys(secretUpdate).length > 0) {
+    db.setPaymentGatewaySecret(rawList[idx].id, secretUpdate);
+  }
+
+  db.addSystemLog('info', 'payment', `Admin updated payment gateway configuration: ${rawList[idx].name}`);
+  const updated = db.getPaymentGateways().find(g => g.id === rawList[idx].id);
+  res.json(updated);
+});
+
+apiRouter.get('/admin/payment-transactions', authenticateAdmin, (_req, res) => {
+  res.json(db.getPaymentTransactions());
 });

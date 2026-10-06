@@ -25,6 +25,8 @@ export interface WebhookSignatureCheckResult {
   valid: boolean;
   signatureDetected: boolean;
   signatureHeaderName?: string;
+  signatureValueMasked?: string;
+  computedHmacPreview?: string;
   hmacValidation: 'Validée' | 'Échec' | 'Non applicable';
   reason?: string;
 }
@@ -73,7 +75,7 @@ export abstract class BaseProvider implements IGameServiceProvider {
   public abstract testConnection(): Promise<ConnectionTestResult>;
 
   protected buildUrl(pathTemplate: string, replacements?: Record<string, string>): string {
-    const base = (this.provider.apiUrl || 'https://goxtop.com').trim().replace(/\/+$/, '');
+    let base = (this.provider.apiUrl || process.env.GOXTOP_API_BASE_URL || 'https://goxtop.com').trim().replace(/\/+$/, '');
     let resolvedPath = (pathTemplate || '').trim();
     if (replacements) {
       for (const [key, val] of Object.entries(replacements)) {
@@ -84,6 +86,10 @@ export abstract class BaseProvider implements IGameServiceProvider {
     }
     if (resolvedPath.startsWith('http://') || resolvedPath.startsWith('https://')) {
       return resolvedPath;
+    }
+    // Prevent duplicate /api/v.1/api/v.1 if base URL already includes /api/v.1
+    if (base.endsWith('/api/v.1') && resolvedPath.startsWith('/api/v.1')) {
+      base = base.slice(0, -'/api/v.1'.length);
     }
     return `${base}${resolvedPath.startsWith('/') ? '' : '/'}${resolvedPath}`;
   }
@@ -99,8 +105,26 @@ export abstract class BaseProvider implements IGameServiceProvider {
     if (this.secrets.apiKey) {
       headers[headerName] = this.secrets.apiKey.trim();
     }
+    const secretVal = (this.secrets.webhookSecret || process.env.GOXTOP_API_KEY_SECRET || '').trim();
+    if (secretVal) {
+      headers['x-api-secret'] = secretVal;
+    }
 
     return headers;
+  }
+
+  protected buildMaskedHeaders(): Record<string, string> {
+    const raw = this.buildHeaders();
+    const masked: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const lower = k.toLowerCase();
+      if (lower.includes('key') || lower.includes('secret') || lower.includes('auth') || lower.includes('token')) {
+        masked[k] = v.length > 8 ? `${v.slice(0, 4)}••••••••${v.slice(-4)}` : '••••••••';
+      } else {
+        masked[k] = v;
+      }
+    }
+    return masked;
   }
 
   /**
@@ -131,6 +155,10 @@ export abstract class BaseProvider implements IGameServiceProvider {
     }
 
     const signatureDetected = Boolean(signatureValue && signatureValue.trim().length > 0);
+    const cleanSig = signatureValue ? signatureValue.replace(/^(sha256=|hmac-sha256=)/i, '').trim() : '';
+    const signatureValueMasked = cleanSig
+      ? (cleanSig.length > 16 ? `sha256=${cleanSig.slice(0, 10)}••••${cleanSig.slice(-8)}` : `sha256=${cleanSig}`)
+      : undefined;
 
     // Case B: Secret not provided by GoXtop / not configured -> Do NOT block integration
     if (!secret) {
@@ -138,22 +166,12 @@ export abstract class BaseProvider implements IGameServiceProvider {
         valid: true,
         signatureDetected,
         signatureHeaderName: detectedHeaderName,
+        signatureValueMasked,
         hmacValidation: 'Non applicable',
         reason: 'Secret fournisseur : non configuré / non fourni par GoXtop'
       };
     }
 
-    // Case A: Secret is configured -> Require and validate HMAC-SHA256 signature on unmodified rawBody
-    if (!signatureDetected || !signatureValue) {
-      return {
-        valid: false,
-        signatureDetected: false,
-        hmacValidation: 'Échec',
-        reason: 'Secret Webhook configuré mais aucune signature HMAC-SHA256 détectée dans les en-têtes HTTP reçus.'
-      };
-    }
-
-    const cleanSig = signatureValue.replace(/^(sha256=|hmac-sha256=)/i, '').trim();
     const expectedHex = crypto
       .createHmac('sha256', secret)
       .update(rawBody, 'utf8')
@@ -162,6 +180,18 @@ export abstract class BaseProvider implements IGameServiceProvider {
       .createHmac('sha256', secret)
       .update(rawBody, 'utf8')
       .digest('base64');
+    const computedHmacPreview = `sha256=${expectedHex.slice(0, 10)}••••${expectedHex.slice(-8)}`;
+
+    // Case A: Secret is configured -> Require and validate HMAC-SHA256 signature on unmodified rawBody
+    if (!signatureDetected || !signatureValue) {
+      return {
+        valid: false,
+        signatureDetected: false,
+        computedHmacPreview,
+        hmacValidation: 'Échec',
+        reason: 'Secret Webhook configuré mais aucune signature HMAC-SHA256 détectée dans les en-têtes HTTP reçus.'
+      };
+    }
 
     try {
       const sigHexBuf = Buffer.from(cleanSig, 'hex');
@@ -171,6 +201,8 @@ export abstract class BaseProvider implements IGameServiceProvider {
           valid: true,
           signatureDetected: true,
           signatureHeaderName: detectedHeaderName,
+          signatureValueMasked,
+          computedHmacPreview,
           hmacValidation: 'Validée'
         };
       }
@@ -182,6 +214,8 @@ export abstract class BaseProvider implements IGameServiceProvider {
           valid: true,
           signatureDetected: true,
           signatureHeaderName: detectedHeaderName,
+          signatureValueMasked,
+          computedHmacPreview,
           hmacValidation: 'Validée'
         };
       }
@@ -190,6 +224,8 @@ export abstract class BaseProvider implements IGameServiceProvider {
         valid: false,
         signatureDetected: true,
         signatureHeaderName: detectedHeaderName,
+        signatureValueMasked,
+        computedHmacPreview,
         hmacValidation: 'Échec',
         reason: `Signature HMAC-SHA256 invalide (en-tête détecté : ${detectedHeaderName})`
       };
@@ -198,6 +234,8 @@ export abstract class BaseProvider implements IGameServiceProvider {
         valid: false,
         signatureDetected: true,
         signatureHeaderName: detectedHeaderName,
+        signatureValueMasked,
+        computedHmacPreview,
         hmacValidation: 'Échec',
         reason: 'Format de signature HMAC-SHA256 malformé'
       };
@@ -235,6 +273,8 @@ export class GoXtopProvider extends BaseProvider {
     const timestamp = new Date().toISOString();
     const gamesPath = this.provider.endpoints?.getGamesPath || '/api/v.1/games';
     const fullUrl = this.buildUrl(gamesPath);
+    const maskedHeaders = this.buildMaskedHeaders();
+    const reqSummary = JSON.stringify({ method: 'GET', url: fullUrl, headers: maskedHeaders });
 
     try {
       const parsed = new URL(fullUrl);
@@ -249,9 +289,10 @@ export class GoXtopProvider extends BaseProvider {
         latencyMs: 0,
         endpointCalled: fullUrl,
         details: `L'URL de base ou l'endpoint "${fullUrl}" est invalide.`,
-        timestamp
+        timestamp,
+        authHeadersUsed: maskedHeaders
       };
-      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, 0, res.label, false, res.details);
+      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, 0, res.label, false, reqSummary, res.details);
       return res;
     }
 
@@ -262,10 +303,11 @@ export class GoXtopProvider extends BaseProvider {
         label: 'API Key invalide',
         latencyMs: 0,
         endpointCalled: fullUrl,
-        details: 'Aucune API Key GoXtop enregistrée côté serveur. Configurez-la dans Settings → Providers → GoXtop.',
-        timestamp
+        details: 'Aucune API Key GoXtop enregistrée côté serveur. Configurez-la dans Administration → Fournisseurs → GoXtop.',
+        timestamp,
+        authHeadersUsed: maskedHeaders
       };
-      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, 0, res.label, false, res.details);
+      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, 0, res.label, false, reqSummary, res.details);
       return res;
     }
 
@@ -294,9 +336,11 @@ export class GoXtopProvider extends BaseProvider {
           latencyMs,
           endpointCalled: fullUrl,
           details: 'GoXtop a refusé l’API Key (HTTP 401 Unauthorized).',
-          timestamp
+          timestamp,
+          authHeadersUsed: maskedHeaders,
+          responseSnippet: rawText.slice(0, 600)
         };
-        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
         return res;
       }
 
@@ -309,9 +353,11 @@ export class GoXtopProvider extends BaseProvider {
           latencyMs,
           endpointCalled: fullUrl,
           details: 'Accès interdit par GoXtop (HTTP 403 Forbidden). Vérifiez vos permissions ou IP autorisées.',
-          timestamp
+          timestamp,
+          authHeadersUsed: maskedHeaders,
+          responseSnippet: rawText.slice(0, 600)
         };
-        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
         return res;
       }
 
@@ -324,9 +370,11 @@ export class GoXtopProvider extends BaseProvider {
           latencyMs,
           endpointCalled: fullUrl,
           details: `Endpoint introuvable (HTTP 404) sur ${fullUrl}.`,
-          timestamp
+          timestamp,
+          authHeadersUsed: maskedHeaders,
+          responseSnippet: rawText.slice(0, 600)
         };
-        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
         return res;
       }
 
@@ -343,9 +391,11 @@ export class GoXtopProvider extends BaseProvider {
             latencyMs,
             endpointCalled: fullUrl,
             details: `HTTP ${httpStatus} reçu mais la réponse n'est pas au format JSON attendu (${contentType || 'HTML/Text'}).`,
-            timestamp
+            timestamp,
+            authHeadersUsed: maskedHeaders,
+            responseSnippet: rawText.slice(0, 600)
           };
-          this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+          this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
           return res;
         }
 
@@ -358,11 +408,17 @@ export class GoXtopProvider extends BaseProvider {
             latencyMs,
             endpointCalled: fullUrl,
             details: `Erreur retournée par GoXtop : ${parsedJson.message || parsedJson.error}`,
-            timestamp
+            timestamp,
+            authHeadersUsed: maskedHeaders,
+            responseSnippet: rawText.slice(0, 600)
           };
-          this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+          this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
           return res;
         }
+
+        const gamesArray = Array.isArray(parsedJson)
+          ? parsedJson
+          : (Array.isArray(parsedJson?.data) ? parsedJson.data : (Array.isArray(parsedJson?.games) ? parsedJson.games : []));
 
         const res: ConnectionTestResult = {
           success: true,
@@ -371,10 +427,13 @@ export class GoXtopProvider extends BaseProvider {
           httpStatus,
           latencyMs,
           endpointCalled: fullUrl,
-          details: `Connexion vérifiée avec succès sur GET /api/v.1/games (${latencyMs} ms). Aucune commande créée.`,
-          timestamp
+          details: `Authentification GoXtop validée (HTTP ${httpStatus} OK en ${latencyMs} ms). ${gamesArray.length} jeux actifs détectés dans le catalogue distant.`,
+          timestamp,
+          authHeadersUsed: maskedHeaders,
+          gamesCountDetected: gamesArray.length,
+          responseSnippet: rawText.slice(0, 800)
         };
-        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, true, undefined, rawText.slice(0, 200));
+        this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, true, reqSummary, rawText.slice(0, 2000));
         return res;
       }
 
@@ -386,9 +445,11 @@ export class GoXtopProvider extends BaseProvider {
         latencyMs,
         endpointCalled: fullUrl,
         details: `GoXtop a répondu avec le code HTTP ${httpStatus}.`,
-        timestamp
+        timestamp,
+        authHeadersUsed: maskedHeaders,
+        responseSnippet: rawText.slice(0, 600)
       };
-      this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, rawText.slice(0, 200));
+      this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, false, reqSummary, rawText.slice(0, 1500));
       return res;
     } catch (err: any) {
       clearTimeout(timeout);
@@ -400,9 +461,10 @@ export class GoXtopProvider extends BaseProvider {
         latencyMs,
         endpointCalled: fullUrl,
         details: `Erreur réseau lors de l'appel à ${fullUrl} : ${err.message || 'Impossible de joindre le serveur'}`,
-        timestamp
+        timestamp,
+        authHeadersUsed: maskedHeaders
       };
-      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, latencyMs, res.label, false, res.details);
+      this.logApi('TEST_CONNECTION', 'GET', fullUrl, null, latencyMs, res.label, false, reqSummary, res.details);
       return res;
     }
   }
@@ -414,10 +476,11 @@ export class GoXtopProvider extends BaseProvider {
     const startTime = Date.now();
     const gamesPath = this.provider.endpoints?.getGamesPath || '/api/v.1/games';
     const fullUrl = this.buildUrl(gamesPath);
+    const reqSummary = JSON.stringify({ method: 'GET', url: fullUrl, headers: this.buildMaskedHeaders() });
 
     if (!this.secrets.apiKey?.trim()) {
       const msg = 'Synchronisation des jeux refusée : API Key GoXtop manquante.';
-      this.logApi('GET_GAMES', 'GET', fullUrl, null, 0, 'API Key invalide', false, msg);
+      this.logApi('GET_GAMES', 'GET', fullUrl, null, 0, 'API Key invalide', false, reqSummary, msg);
       return {
         success: false,
         syncType: 'games',
@@ -448,7 +511,7 @@ export class GoXtopProvider extends BaseProvider {
             : httpStatus === 404
             ? 'URL incorrecte'
             : 'Échec de connexion';
-        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, label, false, undefined, providerErr);
+        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, label, false, reqSummary, rawText.slice(0, 1800) || providerErr);
         return {
           success: false,
           syncType: 'games',
@@ -467,7 +530,7 @@ export class GoXtopProvider extends BaseProvider {
         parsed = JSON.parse(rawText);
       } catch {
         const errDetail = `HTTP ${httpStatus} reçu mais la réponse n'est pas un JSON valide.`;
-        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Réponse inattendue du fournisseur', false, undefined, errDetail);
+        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Réponse inattendue du fournisseur', false, reqSummary, rawText.slice(0, 1500) || errDetail);
         return {
           success: false,
           syncType: 'games',
@@ -484,7 +547,7 @@ export class GoXtopProvider extends BaseProvider {
       const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.data) ? parsed.data : (Array.isArray(parsed.games) ? parsed.games : null));
       if (!list) {
         const errDetail = `Format JSON de GET /api/v.1/games non reconnu : ${rawText.slice(0, 160)}`;
-        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Réponse inattendue du fournisseur', false, undefined, errDetail);
+        this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Réponse inattendue du fournisseur', false, reqSummary, rawText.slice(0, 1500) || errDetail);
         return {
           success: false,
           syncType: 'games',
@@ -503,12 +566,22 @@ export class GoXtopProvider extends BaseProvider {
       let addedCount = 0;
 
       for (const gItem of list) {
-        const gameCode = String(gItem.code || gItem.slug || gItem.id || gItem.game || '');
-        const gameName = String(gItem.name || gItem.title || gameCode);
+        const gameCode = String(gItem.gamecode || gItem.code || gItem.slug || gItem.id || gItem.game || '').trim();
+        const gameName = String(gItem.Name || gItem.name || gItem.title || gameCode).trim();
         if (!gameCode) continue;
 
+        const rawImage = String(gItem.image || gItem.logo || '').trim();
+        const resolvedLogo = rawImage.startsWith('/')
+          ? `https://goxtop.com${rawImage}`
+          : (rawImage || '/src/assets/images/game_cover_freefire_1790988876938.jpg');
+
         const existing = games.find(
-          g => g.externalGameId?.toLowerCase() === gameCode.toLowerCase() || g.slug.toLowerCase() === gameCode.toLowerCase()
+          g =>
+            g.externalGameId?.toLowerCase() === gameCode.toLowerCase() ||
+            g.slug.toLowerCase() === gameCode.toLowerCase() ||
+            (gameCode === 'freefire_global' && g.id === 'game_ff') ||
+            (gameCode === 'mlbb_special' && g.id === 'game_mlbb') ||
+            (gameCode === 'codm_sgmy' && g.id === 'game_codm')
         );
 
         if (existing) {
@@ -521,16 +594,17 @@ export class GoXtopProvider extends BaseProvider {
           updatedCount++;
         } else {
           games.push({
-            id: 'game_' + Date.now() + '_' + (updatedCount + addedCount),
+            id: 'game_' + gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
             slug: gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
             name: gameName,
             externalGameId: gameCode,
             providerId: this.provider.id,
             supportsNameCheck: Boolean(gItem.name_check || gItem.supports_name_check),
-            requiresPlayerId: gItem.requires_player_id !== undefined ? Boolean(gItem.requires_player_id) : true,
+            requiresPlayerId: gItem.requires_player_id !== undefined ? Boolean(gItem.requires_player_id) : !gameCode.includes('pin') && !gameCode.includes('gift-card'),
             category: gItem.category || 'Gaming Top-Up',
-            description: gItem.description || `Service officiel ${gameName} via GoXtop`,
-            logo: gItem.logo || '/src/assets/images/game_cover_freefire_1790988876938.jpg',
+            description: gItem.description || `Service officiel ${gameName} via GoXtop (${gItem.totalProducts || 0} packs disponibles)`,
+            logo: resolvedLogo,
+            banner: resolvedLogo,
             isActive: true,
             displayOrder: games.length + 1,
             fields: Array.isArray(gItem.fields)
@@ -546,7 +620,7 @@ export class GoXtopProvider extends BaseProvider {
                   {
                     id: `f_${gameCode}_uid`,
                     name: 'playerId',
-                    label: 'Player ID',
+                    label: 'Player ID (User ID)',
                     placeholder: 'Entrez votre Player ID',
                     type: 'text',
                     required: true
@@ -561,7 +635,7 @@ export class GoXtopProvider extends BaseProvider {
 
       db.setGames(games);
       const totalGames = updatedCount + addedCount;
-      this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Connexion réussie', true, undefined, `${list.length} jeux récupérés (${addedCount} ajoutés, ${updatedCount} mis à jour)`);
+      this.logApi('GET_GAMES', 'GET', fullUrl, httpStatus, latencyMs, 'Connexion réussie', true, reqSummary, rawText.slice(0, 2200));
 
       return {
         success: true,
@@ -577,7 +651,7 @@ export class GoXtopProvider extends BaseProvider {
       };
     } catch (err: any) {
       const latencyMs = Date.now() - startTime;
-      this.logApi('GET_GAMES', 'GET', fullUrl, null, latencyMs, 'Erreur réseau', false, err.message);
+      this.logApi('GET_GAMES', 'GET', fullUrl, null, latencyMs, 'Erreur réseau', false, reqSummary, err.message);
       return {
         success: false,
         syncType: 'games',
@@ -597,11 +671,18 @@ export class GoXtopProvider extends BaseProvider {
    */
   public async getProducts(gameCode?: string): Promise<ProviderSyncResponse> {
     const startTime = Date.now();
-    const games = db.getGames().filter(g => !gameCode || g.externalGameId === gameCode || g.slug === gameCode);
+    const allGames = db.getGames().filter(g => !gameCode || g.externalGameId === gameCode || g.slug === gameCode || g.id === gameCode);
+    // Prioritize top featured games when syncing without a specific gameCode so synchronization stays fast (< 3s)
+    const games = gameCode
+      ? allGames
+      : allGames
+          .slice()
+          .sort((a, b) => (a.displayOrder || 999) - (b.displayOrder || 999))
+          .slice(0, 12);
 
     if (!this.secrets.apiKey?.trim()) {
       const msg = 'Synchronisation des produits refusée : API Key GoXtop manquante.';
-      const sampleUrl = this.buildUrl(this.provider.endpoints?.getProductsPath || '/api/v.1/products/{game}', { game: gameCode || 'freefire' });
+      const sampleUrl = this.buildUrl(this.provider.endpoints?.getProductsPath || '/api/v.1/products/{game}', { game: gameCode || 'freefire_global' });
       this.logApi('GET_PRODUCTS', 'GET', sampleUrl, null, 0, 'API Key invalide', false, msg);
       return {
         success: false,
@@ -621,11 +702,13 @@ export class GoXtopProvider extends BaseProvider {
     let lastStatus: number | null = null;
     let lastErrorMsg: string | undefined;
     const services = db.getServices();
+    const fullGamesList = db.getGames();
 
     for (const game of games) {
       const gCode = game.externalGameId || game.slug;
       const productsPath = this.provider.endpoints?.getProductsPath || '/api/v.1/products/{game}';
       const fullUrl = this.buildUrl(productsPath, { game: gCode });
+      const reqSummary = JSON.stringify({ method: 'GET', url: fullUrl, gameCode: gCode, headers: this.buildMaskedHeaders() });
 
       try {
         const response = await fetch(fullUrl, {
@@ -646,7 +729,7 @@ export class GoXtopProvider extends BaseProvider {
               : response.status === 404
               ? 'URL incorrecte'
               : 'Échec de connexion';
-          this.logApi('GET_PRODUCTS', 'GET', fullUrl, response.status, Date.now() - startTime, label, false, undefined, provErr);
+          this.logApi('GET_PRODUCTS', 'GET', fullUrl, response.status, Date.now() - startTime, label, false, reqSummary, rawText.slice(0, 1800) || provErr);
           continue;
         }
 
@@ -677,21 +760,91 @@ export class GoXtopProvider extends BaseProvider {
         }
 
         if (!service) continue;
+        service.externalGameId = gCode;
+
+        if (prodList.length > 0) {
+          const validExtIds = new Set(
+            prodList
+              .map((pItem: any) => String(pItem.Pack || pItem.pack || pItem.id || pItem.product_id || pItem.code || pItem.sku || pItem.name || '').trim())
+              .filter(Boolean)
+          );
+          // Remove legacy initial placeholder packages that don't match real GoXtop Pack codes
+          service.packages = service.packages.filter(pkg => !pkg.externalProductId || validExtIds.has(pkg.externalProductId));
+        }
 
         for (const pItem of prodList) {
-          const extProdId = String(pItem.id || pItem.product_id || pItem.code || pItem.sku || '');
+          const extProdId = String(pItem.Pack || pItem.pack || pItem.id || pItem.product_id || pItem.code || pItem.sku || pItem.name || '').trim();
           const goxtopCost = Number(pItem.price ?? pItem.cost ?? pItem.amount_price ?? NaN);
-          const available = pItem.available !== undefined ? Boolean(pItem.available) : (pItem.status ? String(pItem.status).toLowerCase() === 'active' : true);
+          const available =
+            pItem.stockStatus !== undefined
+              ? String(pItem.stockStatus).toLowerCase() === 'in_stock'
+              : pItem.available !== undefined
+              ? Boolean(pItem.available)
+              : pItem.status
+              ? String(pItem.status).toLowerCase() === 'active'
+              : true;
 
           if (!extProdId) continue;
 
-          const existingPkg = service.packages.find(pkg => pkg.externalProductId === extProdId || pkg.id === extProdId);
+          const reqUserId = pItem.requiresUserId !== undefined ? Boolean(pItem.requiresUserId) : (game.requiresPlayerId ?? true);
+          const reqServerId = Boolean(pItem.requiresServerId);
+          const reqCharName = Boolean(pItem.requiresCharName);
+
+          // Ensure parent game has zoneId/serverId field if GoXtop requires it
+          const dbGame = fullGamesList.find(gf => gf.id === game.id);
+          if (dbGame && reqServerId && !dbGame.fields.some(f => f.name === 'serverId' || f.name === 'zoneId')) {
+            dbGame.fields.push({
+              id: `f_${gCode}_server`,
+              name: 'serverId',
+              label: 'Server ID / Zone ID',
+              placeholder: 'Entrez votre Server / Zone ID',
+              type: 'text',
+              required: true
+            });
+          }
+
+          const requiredFields: string[] = [];
+          if (reqUserId) {
+            const uidField = dbGame?.fields.find(f => f.name === 'playerId' || f.name === 'characterId' || f.name === 'userId');
+            requiredFields.push(uidField ? uidField.name : 'playerId');
+          }
+          if (reqServerId) {
+            const srvField = dbGame?.fields.find(f => f.name === 'zoneId' || f.name === 'serverId');
+            requiredFields.push(srvField ? srvField.name : 'serverId');
+          }
+          if (reqCharName) {
+            requiredFields.push('playerName');
+          }
+
+          const rawName = String(pItem.name || pItem.title || extProdId).trim();
+          const parsedNumericAmount = parseInt(rawName.replace(/[^0-9]/g, ''), 10);
+          const numericAmount = !isNaN(parsedNumericAmount) && parsedNumericAmount > 0 ? parsedNumericAmount : Number(pItem.amount || pItem.quantity || 1);
+          const unitLabel = service.category === 'uc' ? 'UC' : 'Diamonds';
+          const displayName = /^\d+$/.test(rawName) ? `${rawName} ${unitLabel}` : rawName;
+
+          const existingPkg = service.packages.find(
+            pkg =>
+              pkg.externalProductId === extProdId ||
+              pkg.id === extProdId ||
+              (pkg.amount === numericAmount && /^\d+$/.test(rawName))
+          );
+
           if (existingPkg) {
+            existingPkg.externalProductId = extProdId;
+            existingPkg.externalGameId = gCode;
+            existingPkg.requiresPlayerId = reqUserId;
+            if (requiredFields.length > 0) {
+              existingPkg.requiredFields = requiredFields;
+            }
             if (!isNaN(goxtopCost) && goxtopCost > 0) {
-              existingPkg.supplierCost = goxtopCost;
-              const currentMargin = typeof existingPkg.margin === 'number' ? existingPkg.margin : Number((existingPkg.publicPrice - goxtopCost).toFixed(2));
+              existingPkg.supplierCost = Number(goxtopCost.toFixed(3));
+              const currentMargin =
+                typeof existingPkg.margin === 'number' && existingPkg.margin > 0
+                  ? existingPkg.margin
+                  : Number((goxtopCost * 0.25).toFixed(2));
               existingPkg.margin = currentMargin;
               existingPkg.publicPrice = Number((existingPkg.supplierCost + existingPkg.margin).toFixed(2));
+              existingPkg.resellerPrice = Number((existingPkg.supplierCost + existingPkg.margin * 0.5).toFixed(2));
             }
             if (!available && existingPkg.isActive) {
               productsDeactivated++;
@@ -699,23 +852,23 @@ export class GoXtopProvider extends BaseProvider {
             existingPkg.isActive = available;
             productsUpdated++;
           } else if (!isNaN(goxtopCost) && goxtopCost > 0) {
-            const defaultMargin = Number((goxtopCost * 0.25).toFixed(2));
+            const defaultMargin = Number(Math.max(0.15, goxtopCost * 0.25).toFixed(2));
             service.packages.push({
-              id: `pkg_${gCode}_${extProdId}`,
+              id: `pkg_${extProdId.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
               serviceId: service.id,
               externalProductId: extProdId,
               externalGameId: gCode,
-              name: String(pItem.name || pItem.title || extProdId),
-              amount: Number(pItem.amount || pItem.quantity || 1),
-              unit: String(pItem.unit || 'Units'),
-              supplierCost: goxtopCost,
+              name: displayName,
+              amount: numericAmount,
+              unit: String(pItem.unit || unitLabel),
+              supplierCost: Number(goxtopCost.toFixed(3)),
               margin: defaultMargin,
               publicPrice: Number((goxtopCost + defaultMargin).toFixed(2)),
               resellerPrice: Number((goxtopCost + defaultMargin * 0.5).toFixed(2)),
               currency: 'USD',
               isActive: available,
-              requiresPlayerId: game.requiresPlayerId ?? true,
-              requiredFields: game.fields.map(f => f.name),
+              requiresPlayerId: reqUserId,
+              requiredFields: requiredFields.length > 0 ? requiredFields : game.fields.map(f => f.name),
               displayOrder: service.packages.length + 1
             });
             if (!available) productsDeactivated++;
@@ -723,13 +876,14 @@ export class GoXtopProvider extends BaseProvider {
           }
         }
 
-        this.logApi('GET_PRODUCTS', 'GET', fullUrl, response.status, Date.now() - startTime, 'Connexion réussie', true, undefined, `${prodList.length} produits reçus pour ${gCode}`);
+        this.logApi('GET_PRODUCTS', 'GET', fullUrl, response.status, Date.now() - startTime, 'Connexion réussie', true, reqSummary, rawText.slice(0, 2200));
       } catch (err: any) {
         lastErrorMsg = `Erreur réseau : ${err.message}`;
-        this.logApi('GET_PRODUCTS', 'GET', fullUrl, null, Date.now() - startTime, 'Erreur réseau', false, undefined, err.message);
+        this.logApi('GET_PRODUCTS', 'GET', fullUrl, null, Date.now() - startTime, 'Erreur réseau', false, reqSummary, err.message);
       }
     }
 
+    db.setGames(fullGamesList);
     db.setServices(services);
     const totalLatency = Date.now() - startTime;
     const totalUpdated = productsAdded + productsUpdated;
@@ -1018,14 +1172,32 @@ export class GoXtopProvider extends BaseProvider {
       }
     }
 
+    const resolvedUserId =
+      order.playerId ||
+      order.gameProfileData?.playerId ||
+      order.gameProfileData?.characterId ||
+      order.gameProfileData?.userId ||
+      order.gameProfileData?.username ||
+      '';
+    const resolvedServerId =
+      order.serverId ||
+      order.gameProfileData?.serverId ||
+      order.gameProfileData?.zoneId ||
+      '';
+    const resolvedCharName =
+      order.verifiedPlayerName ||
+      order.gameProfileData?.playerName ||
+      order.gameProfileData?.charname ||
+      '';
+
     const requestPayload: Record<string, any> = {
-      partner_orderid: order.partnerOrderId,
       game: order.externalGameId || order.gameId,
-      product: order.externalProductId || order.packageId,
-      ...(order.playerId ? { player_id: order.playerId } : {}),
-      ...(order.serverId ? { server_id: order.serverId } : {}),
-      ...order.gameProfileData,
-      webhook_url: webhookCallbackUrl,
+      denom: order.externalProductId || order.packageId,
+      userid: resolvedUserId,
+      ...(resolvedServerId ? { serverid: resolvedServerId } : {}),
+      ...(resolvedCharName ? { charname: resolvedCharName } : {}),
+      partner_webhook_url: webhookCallbackUrl,
+      partner_orderid: order.partnerOrderId,
       ...customEntries
     };
 
@@ -1204,12 +1376,25 @@ export class GoXtopProvider extends BaseProvider {
 
     // 1. Verify HMAC-SHA256 signature on unmodified rawBody
     const sigCheck = this.verifyWebhookSignature(rawBody, headers);
+    const processingSteps: string[] = [
+      `[1] Réception HTTP POST sur ${endpoint} (${rawBody.length} octets bruts)`,
+      sigCheck.hmacValidation === 'Validée'
+        ? `[2] Signature HMAC-SHA256 (${sigCheck.signatureHeaderName || 'header'}) vérifiée avec succès via crypto.timingSafeEqual (${sigCheck.signatureValueMasked})`
+        : sigCheck.hmacValidation === 'Non applicable'
+        ? `[2] Signature HMAC-SHA256 : Non applicable (aucun Webhook Secret imposé côté serveur)`
+        : `[2] ÉCHEC vérification HMAC-SHA256 : ${sigCheck.reason}`
+    ];
+
     if (!sigCheck.valid) {
+      processingSteps.push(`[3] Rejet de l'événement (HTTP 401 Unauthorized) — aucune modification de commande effectuée`);
       const errResp = {
         status: 'error',
         code: 'INVALID_HMAC_SIGNATURE',
         hmacValidation: sigCheck.hmacValidation,
         signatureDetected: sigCheck.signatureDetected,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
+        processingSteps,
         message: sigCheck.reason
       };
       db.addProviderWebhookLog({
@@ -1220,14 +1405,20 @@ export class GoXtopProvider extends BaseProvider {
         goxtopOrderId: providerOrderId || undefined,
         receivedStatus: rawStatus || undefined,
         httpStatus: 401,
+        latencyMs: Date.now() - startTime,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        rawPayload: rawBody,
+        headersReceived: headers,
+        processingSteps,
         backendResponse: JSON.stringify(errResp),
         errorMessage: sigCheck.reason,
         isInternalTest
       });
-      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 401, Date.now() - startTime, 'Erreur d\'authentification', false, rawBody.slice(0, 200), sigCheck.reason);
+      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 401, Date.now() - startTime, 'Erreur d\'authentification', false, rawBody.slice(0, 600), sigCheck.reason);
       return {
         httpCode: 401,
         body: errResp
@@ -1236,13 +1427,19 @@ export class GoXtopProvider extends BaseProvider {
 
     // 2. Handle Internal Diagnostic "TEST_WEBHOOK" (never creates order, never debits money)
     if (isInternalTest) {
+      processingSteps.push(`[3] Identification de l'événement diagnostic interne : TEST_WEBHOOK`);
+      processingSteps.push(`[4] Isolation garantie : aucune commande GoXtop créée, aucun solde débité`);
+      processingSteps.push(`[5] Confirmation HTTP 200 OK retournée par le pipeline Webhook PlayUp`);
       const testResp = {
         status: 'acknowledged',
         event_type: 'TEST_WEBHOOK',
         internal_test: true,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        processingSteps,
         message: 'Test interne PlayUp Webhook réussi (aucune commande créée chez GoXtop, aucun montant débité).'
       };
       db.addProviderWebhookLog({
@@ -1252,13 +1449,19 @@ export class GoXtopProvider extends BaseProvider {
         partnerOrderId: 'TEST_INTERNAL_NO_ORDER',
         receivedStatus: 'test_ok',
         httpStatus: 200,
+        latencyMs: Date.now() - startTime,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        rawPayload: rawBody,
+        headersReceived: headers,
+        processingSteps,
         backendResponse: JSON.stringify(testResp),
         isInternalTest: true
       });
-      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 200, Date.now() - startTime, 'Connexion réussie', true, rawBody.slice(0, 200), 'TEST_WEBHOOK interne validé');
+      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 200, Date.now() - startTime, 'Connexion réussie', true, rawBody.slice(0, 600), JSON.stringify(testResp));
       return {
         httpCode: 200,
         body: testResp
@@ -1273,7 +1476,9 @@ export class GoXtopProvider extends BaseProvider {
     );
 
     if (eventId && db.hasProcessedWebhookEvent(eventId)) {
-      const dupResp = { status: 'acknowledged', duplicate: true, eventId };
+      processingSteps.push(`[3] Contrôle d'idempotence : Événement "${eventId}" déjà traité précédemment`);
+      processingSteps.push(`[4] Doublon ignoré en toute sécurité (HTTP 200 OK retourné)`);
+      const dupResp = { status: 'acknowledged', duplicate: true, eventId, processingSteps };
       db.addProviderWebhookLog({
         providerId: this.provider.id,
         providerName: this.provider.name,
@@ -1282,17 +1487,25 @@ export class GoXtopProvider extends BaseProvider {
         goxtopOrderId: providerOrderId || undefined,
         receivedStatus: rawStatus || undefined,
         httpStatus: 200,
+        latencyMs: Date.now() - startTime,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        rawPayload: rawBody,
+        headersReceived: headers,
+        processingSteps,
         backendResponse: JSON.stringify(dupResp)
       });
-      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 200, Date.now() - startTime, 'Connexion réussie', true, rawBody.slice(0, 200), `Événement doublon ${eventId} ignoré (idempotent)`);
+      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 200, Date.now() - startTime, 'Connexion réussie', true, rawBody.slice(0, 600), `Événement doublon ${eventId} ignoré (idempotent)`);
       return {
         httpCode: 200,
         body: dupResp
       };
     }
+
+    processingSteps.push(`[3] Contrôle d'idempotence validé (clé événement : ${eventId || 'nouveau'})`);
 
     // 4. Locate PlayUp Order
     const orders = db.getOrders();
@@ -1304,7 +1517,8 @@ export class GoXtopProvider extends BaseProvider {
 
     if (orderIdx === -1) {
       const notFoundMsg = `Aucune commande PlayUp trouvée pour partner_orderid="${partnerOrderId || 'N/A'}" / goxtop_order_id="${providerOrderId || 'N/A'}"`;
-      const errBody = { status: 'error', message: notFoundMsg };
+      processingSteps.push(`[4] Recherche commande échouée : ${notFoundMsg}`);
+      const errBody = { status: 'error', message: notFoundMsg, processingSteps };
       db.addProviderWebhookLog({
         providerId: this.provider.id,
         providerName: this.provider.name,
@@ -1313,13 +1527,19 @@ export class GoXtopProvider extends BaseProvider {
         goxtopOrderId: providerOrderId || undefined,
         receivedStatus: rawStatus || undefined,
         httpStatus: 404,
+        latencyMs: Date.now() - startTime,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        rawPayload: rawBody,
+        headersReceived: headers,
+        processingSteps,
         backendResponse: JSON.stringify(errBody),
         errorMessage: notFoundMsg
       });
-      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 404, Date.now() - startTime, 'Réponse inattendue du fournisseur', false, rawBody.slice(0, 200), notFoundMsg);
+      this.logApi('WEBHOOK_EVENT', 'POST', endpoint, 404, Date.now() - startTime, 'Réponse inattendue du fournisseur', false, rawBody.slice(0, 600), notFoundMsg);
       return {
         httpCode: 404,
         body: errBody
@@ -1327,6 +1547,7 @@ export class GoXtopProvider extends BaseProvider {
     }
 
     const order = orders[orderIdx];
+    processingSteps.push(`[4] Commande PlayUp localisée : ${order.orderNumber} (${order.gameName} — ${order.packageName})`);
 
     // 5. Map status ONLY when meaning is confirmed
     let mappedStatus: OrderStatus | null = null;
@@ -1339,7 +1560,8 @@ export class GoXtopProvider extends BaseProvider {
 
     if (!mappedStatus) {
       const unconfirmedMsg = `Statut GoXtop "${rawStatus}" non reconnu — REQUIRES PROVIDER CONFIRMATION`;
-      const unconfBody = { status: 'acknowledged_unmapped', rawStatus, note: unconfirmedMsg };
+      processingSteps.push(`[5] ${unconfirmedMsg}`);
+      const unconfBody = { status: 'acknowledged_unmapped', rawStatus, note: unconfirmedMsg, processingSteps };
       db.addProviderWebhookLog({
         providerId: this.provider.id,
         providerName: this.provider.name,
@@ -1348,9 +1570,15 @@ export class GoXtopProvider extends BaseProvider {
         goxtopOrderId: providerOrderId || order.externalOrderId,
         receivedStatus: rawStatus || 'inconnu',
         httpStatus: 200,
+        latencyMs: Date.now() - startTime,
         signatureDetected: sigCheck.signatureDetected,
         signatureHeaderName: sigCheck.signatureHeaderName,
+        signatureValueMasked: sigCheck.signatureValueMasked,
+        computedHmacPreview: sigCheck.computedHmacPreview,
         hmacValidation: sigCheck.hmacValidation,
+        rawPayload: rawBody,
+        headersReceived: headers,
+        processingSteps,
         backendResponse: JSON.stringify(unconfBody),
         errorMessage: unconfirmedMsg
       });
@@ -1380,6 +1608,7 @@ export class GoXtopProvider extends BaseProvider {
     });
 
     db.setOrders(orders);
+    processingSteps.push(`[5] Statut de la commande ${order.orderNumber} mis à jour : ${mappedStatus.toUpperCase()}`);
 
     // 6. Update provider_orders table
     const existingPord = db.findProviderOrderByPartnerId(order.partnerOrderId);
@@ -1396,6 +1625,7 @@ export class GoXtopProvider extends BaseProvider {
       created_at: existingPord?.created_at || order.createdAt,
       updated_at: new Date().toISOString()
     });
+    processingSteps.push(`[6] Table provider_orders synchronisée et notification client envoyée`);
 
     // 7. Mark event as processed (idempotency)
     if (eventId) {
@@ -1433,7 +1663,8 @@ export class GoXtopProvider extends BaseProvider {
       partner_orderid: order.partnerOrderId,
       goxtop_order_id: order.externalOrderId,
       updatedStatus: order.status,
-      hmacValidation: sigCheck.hmacValidation
+      hmacValidation: sigCheck.hmacValidation,
+      processingSteps
     };
 
     db.addProviderWebhookLog({
@@ -1444,9 +1675,15 @@ export class GoXtopProvider extends BaseProvider {
       goxtopOrderId: providerOrderId || order.externalOrderId,
       receivedStatus: rawStatus,
       httpStatus: 200,
+      latencyMs: Date.now() - startTime,
       signatureDetected: sigCheck.signatureDetected,
       signatureHeaderName: sigCheck.signatureHeaderName,
+      signatureValueMasked: sigCheck.signatureValueMasked,
+      computedHmacPreview: sigCheck.computedHmacPreview,
       hmacValidation: sigCheck.hmacValidation,
+      rawPayload: rawBody,
+      headersReceived: headers,
+      processingSteps,
       backendResponse: JSON.stringify(okBody)
     });
 
@@ -1458,8 +1695,8 @@ export class GoXtopProvider extends BaseProvider {
       Date.now() - startTime,
       'Connexion réussie',
       true,
-      rawBody.slice(0, 200),
-      `Order ${order.orderNumber} -> ${mappedStatus}`,
+      rawBody.slice(0, 600),
+      JSON.stringify(okBody),
       order.orderNumber,
       order.partnerOrderId
     );
@@ -1495,9 +1732,10 @@ export class GoXtopProvider extends BaseProvider {
       latencyMs,
       resultLabel,
       success,
+      requestHeadersMasked: this.buildMaskedHeaders(),
       requestPreview,
       errorMessage: !success ? responseOrError : undefined,
-      responsePreview: success ? responseOrError : undefined
+      responsePreview: responseOrError
     });
   }
 }

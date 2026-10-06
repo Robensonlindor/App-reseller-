@@ -32,8 +32,20 @@ async function startServer() {
     next();
   });
 
+  // Healthcheck endpoint
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok', service: 'PlayUp Core Engine', timestamp: new Date().toISOString() });
+  });
+
   // Mount API Router under /api
   app.use('/api', apiRouter);
+
+  // Explicit JSON 404 handler for any unmatched /api/* route so it never falls through to Vite HTML SPA fallback
+  app.use('/api', (req, res) => {
+    res.status(404).json({
+      error: `Endpoint API non trouvé: ${req.method} ${req.originalUrl}`
+    });
+  });
 
   // Serve static generated assets if needed
   app.use('/src/assets', express.static(path.resolve(__dirname, 'src/assets')));
@@ -59,6 +71,16 @@ async function startServer() {
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
+
+  // Global error handler so server never crashes on unhandled route errors
+  app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[PlayUp Engine] Unhandled error:', err);
+    if (req.url.startsWith('/api')) {
+      res.status(500).json({ error: err?.message || 'Erreur interne du serveur PlayUp' });
+    } else {
+      res.status(500).send('Internal Server Error');
+    }
+  });
 
   app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`[PlayUp Engine] Server running on http://0.0.0.0:${PORT}`);

@@ -29,6 +29,9 @@ export interface ConnectionTestResult {
   endpointCalled: string;
   details: string;
   timestamp: string;
+  authHeadersUsed?: Record<string, string>;
+  gamesCountDetected?: number;
+  responseSnippet?: string;
 }
 
 export interface ProviderEndpointsConfig {
@@ -83,7 +86,31 @@ export interface Provider {
   webhookLastReceivedAt?: string;
   webhookLastEvent?: string;
   webhookLastHttpStatus?: number;
-  webhookLastHmacStatus?: 'Validée' | 'Échec' | 'Non applicable';
+  webhookLastHmacStatus?: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable' | string;
+  lastWebhookReceivedAt?: string;
+  lastWebhookEvent?: string;
+  lastWebhookHttpStatus?: number;
+  lastWebhookHmacStatus?: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable' | string;
+  lastSyncSummary?: {
+    timestamp: string;
+    syncType?: string;
+    success?: boolean;
+    gamesRetrieved?: number;
+    productsRetrieved?: number;
+    productsAdded?: number;
+    productsUpdated?: number;
+    productsDeactivated?: number;
+    httpStatus?: number | null;
+    providerErrorMessage?: string;
+    gamesSynced?: number;
+    servicesSynced?: number;
+    packagesSynced?: number;
+    addedCount?: number;
+    updatedCount?: number;
+    disabledCount?: number;
+    status?: 'success' | 'error';
+    message?: string;
+  };
 }
 
 export interface ProviderWebhookLog {
@@ -96,23 +123,36 @@ export interface ProviderWebhookLog {
   goxtopOrderId?: string;
   receivedStatus?: string;
   httpStatus: number;
+  latencyMs?: number;
   signatureDetected: boolean; // Oui / Non
   signatureHeaderName?: string;
-  hmacValidation: 'Validée' | 'Échec' | 'Non applicable';
+  signatureValueMasked?: string;
+  computedHmacPreview?: string;
+  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable';
+  rawPayload?: string;
+  headersReceived?: Record<string, string>;
+  processingSteps?: string[];
   backendResponse: string;
   errorMessage?: string;
   isInternalTest?: boolean;
 }
 
 export interface WebhookTestResult {
+  success?: boolean;
+  message?: string;
   urlCalled: string;
   httpMethod: 'POST';
-  eventType: 'TEST_WEBHOOK';
+  eventType: string;
   resultLabel: string;
   httpStatus: number;
   latencyMs: number;
   signatureDetected: boolean;
-  hmacValidation: 'Validée' | 'Échec' | 'Non applicable';
+  signatureHeaderName?: string;
+  signatureValueMasked?: string;
+  computedHmacPreview?: string;
+  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable';
+  processingSteps?: string[];
+  backendResponse?: any;
   details: string;
   timestamp: string;
 }
@@ -154,6 +194,7 @@ export interface ProviderApiLog {
   resultLabel: string;
   success: boolean;
   errorMessage?: string;
+  requestHeadersMasked?: Record<string, string>;
   requestPreview?: string;
   responsePreview?: string;
 }
@@ -304,6 +345,9 @@ export interface Order {
   margin: number;              // PlayUp margin
   currency: string;
   status: OrderStatus;         // pending | paid | processing | completed | failed | cancelled | refunded
+  paymentMethod?: PaymentMethodType;
+  paymentTransactionId?: string;
+  paymentReference?: string;
   providerId: string;
   providerName: string;
   providerReference?: string;
@@ -388,8 +432,71 @@ export interface AppSettings {
 export interface SystemLog {
   id: string;
   level: 'info' | 'warn' | 'error';
-  module: 'api' | 'order' | 'provider' | 'webhook' | 'auth' | 'system';
+  module: 'api' | 'order' | 'provider' | 'webhook' | 'auth' | 'system' | 'payment';
   message: string;
   meta?: any;
   timestamp: string;
 }
+
+export interface AppUser {
+  id: string;
+  uid?: string; // Firebase Auth UID if linked
+  name: string;
+  email: string;
+  phone?: string;
+  avatarUrl?: string;
+  authProvider: 'email' | 'google' | 'facebook';
+  emailVerified: boolean;
+  status: 'active' | 'suspended';
+  preferredCurrency: 'USD' | 'HTG' | 'EUR';
+  twoFactorEnabled: boolean;
+  emailNotifications: boolean;
+  walletBalance: number;
+  ordersCount: number;
+  totalSpent: number;
+  createdAt: string;
+  lastLoginAt: string;
+}
+
+export type PaymentMethodType = 'card' | 'moncash' | 'natcash' | 'wallet';
+
+export interface PaymentGatewayConfig {
+  id: string;
+  slug: PaymentMethodType;
+  name: string;
+  providerName: string; // e.g. 'Stripe / Visa & Mastercard', 'Digicel MonCash API', 'Natcom NatCash API', 'PlayUp Wallet'
+  description: string;
+  isEnabled: boolean;
+  mode: 'sandbox' | 'live';
+  supportedCurrencies: string[];
+  feePercent: number;
+  fixedFee: number;
+  hasCredentials: boolean;
+  credentialsMasked: string;
+  webhookUrl: string;
+  instructions?: string;
+  lastTransactionAt?: string;
+}
+
+export interface PaymentTransaction {
+  id: string;
+  transactionReference: string;
+  orderId?: string;
+  orderNumber?: string;
+  partnerOrderId?: string;
+  userId: string;
+  userEmail?: string;
+  gatewayId: string;
+  paymentMethod: PaymentMethodType;
+  amount: number;
+  currency: string;
+  feeAmount: number;
+  totalCharged: number;
+  status: 'initiated' | 'authorized' | 'completed' | 'failed' | 'refunded';
+  externalReference?: string;
+  payerIdentifier?: string; // e.g. masked card last4 or MonCash/NatCash phone number
+  statusMessage: string;
+  createdAt: string;
+  updatedAt: string;
+}
+

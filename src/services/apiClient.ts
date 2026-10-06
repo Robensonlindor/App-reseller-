@@ -1,19 +1,40 @@
 import { 
   Game, Service, Order, Reseller, ApiKey, SupportTicket, 
   AppSettings, SystemLog, Provider, ConnectionTestResult, ProviderApiLog,
-  PlayerCheckResult, UserNotification, ProviderOrder
+  PlayerCheckResult, UserNotification, ProviderOrder, ProviderWebhookLog, WebhookTestResult,
+  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType
 } from '../types';
+import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
+
+async function safeFetchArray<T>(url: string, options?: RequestInit, fallback: T[] = []): Promise<T[]> {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok) return fallback;
+    const data = await res.json();
+    return Array.isArray(data) ? data : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 export const apiClient = {
   // Public
   async getSettings(): Promise<AppSettings> {
-    const res = await fetch('/api/settings');
-    return res.json();
+    try {
+      const res = await fetch('/api/settings');
+      if (!res.ok) return INITIAL_SETTINGS;
+      const data = await res.json();
+      if (data && typeof data === 'object' && data.downloadLinks) {
+        return data as AppSettings;
+      }
+      return INITIAL_SETTINGS;
+    } catch {
+      return INITIAL_SETTINGS;
+    }
   },
 
   async getGames(): Promise<Game[]> {
-    const res = await fetch('/api/games');
-    return res.json();
+    return safeFetchArray<Game>('/api/games', undefined, INITIAL_GAMES);
   },
 
   async getGame(idOrSlug: string): Promise<Game & { services: Service[] }> {
@@ -22,8 +43,154 @@ export const apiClient = {
   },
 
   async getServices(): Promise<Service[]> {
-    const res = await fetch('/api/services');
+    return safeFetchArray<Service>('/api/services', undefined, INITIAL_SERVICES);
+  },
+
+  // User Authentication & Account Management
+  async registerUser(data: {
+    name: string;
+    email: string;
+    password: string;
+    phone?: string;
+    preferredCurrency?: 'USD' | 'HTG' | 'EUR';
+  }): Promise<{ user: AppUser; token: string }> {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Erreur lors de la création du compte');
+    return body;
+  },
+
+  async loginUser(email: string, password: string): Promise<{ user: AppUser; token: string }> {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Email ou mot de passe incorrect');
+    return body;
+  },
+
+  async socialLoginUser(data: {
+    provider: 'google' | 'facebook';
+    uid?: string;
+    email: string;
+    name: string;
+    avatarUrl?: string;
+  }): Promise<{ user: AppUser; token: string }> {
+    const res = await fetch('/api/auth/social', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Erreur de connexion sociale');
+    return body;
+  },
+
+  async forgotUserPassword(email: string): Promise<{
+    success: boolean;
+    email: string;
+    resetCode: string;
+    expiresAt: string;
+    message: string;
+  }> {
+    const res = await fetch('/api/auth/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Impossible de générer le code de réinitialisation');
+    return body;
+  },
+
+  async resetUserPassword(data: {
+    email: string;
+    resetCode: string;
+    newPassword: string;
+  }): Promise<{ success: boolean; message: string; user: AppUser; token: string }> {
+    const res = await fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Erreur lors de la réinitialisation du mot de passe');
+    return body;
+  },
+
+  async getUserProfile(token: string): Promise<{
+    user: AppUser;
+    orders: Order[];
+    paymentTransactions: PaymentTransaction[];
+  }> {
+    const res = await fetch('/api/auth/me', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error('Session expirée');
     return res.json();
+  },
+
+  async updateUserProfile(
+    token: string,
+    data: {
+      name?: string;
+      phone?: string;
+      preferredCurrency?: 'USD' | 'HTG' | 'EUR';
+      twoFactorEnabled?: boolean;
+      emailNotifications?: boolean;
+      currentPassword?: string;
+      newPassword?: string;
+    }
+  ): Promise<{ user: AppUser; message: string }> {
+    const res = await fetch('/api/auth/profile', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Erreur lors de la mise à jour du profil');
+    return body;
+  },
+
+  // Payment Gateways
+  async getPaymentGateways(): Promise<PaymentGatewayConfig[]> {
+    return safeFetchArray<PaymentGatewayConfig>('/api/payments/gateways');
+  },
+
+  async processPayment(data: {
+    userId?: string;
+    paymentMethod: PaymentMethodType;
+    amount: number;
+    currency?: string;
+    purpose?: 'order' | 'wallet_topup';
+    cardDetails?: {
+      cardNumber: string;
+      expiry: string;
+      cvc: string;
+      holderName: string;
+    };
+    mobileWalletDetails?: {
+      phone: string;
+      otp: string;
+    };
+  }): Promise<{ success: boolean; transaction: PaymentTransaction; user?: AppUser }> {
+    const res = await fetch('/api/payments/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Échec de la transaction de paiement');
+    return body;
   },
 
   // PlayUp Mobile App
@@ -38,8 +205,7 @@ export const apiClient = {
 
   async getNotifications(userId?: string): Promise<UserNotification[]> {
     const url = userId ? `/api/app/notifications?userId=${encodeURIComponent(userId)}` : '/api/app/notifications';
-    const res = await fetch(url);
-    return res.json();
+    return safeFetchArray<UserNotification>(url);
   },
 
   async markNotificationRead(id: string): Promise<void> {
@@ -53,6 +219,9 @@ export const apiClient = {
     gameProfileData: Record<string, string>;
     verifiedPlayerName?: string;
     paymentConfirmed?: boolean;
+    paymentMethod?: PaymentMethodType;
+    paymentTransactionId?: string;
+    paymentReference?: string;
     userId?: string;
     partnerOrderId?: string;
   }): Promise<Order> {
@@ -76,8 +245,7 @@ export const apiClient = {
 
   async getRecentOrders(userId?: string): Promise<Order[]> {
     const url = userId ? `/api/app/orders?userId=${encodeURIComponent(userId)}` : '/api/app/orders';
-    const res = await fetch(url);
-    return res.json();
+    return safeFetchArray<Order>(url);
   },
 
   // Reseller Portal
@@ -217,10 +385,9 @@ export const apiClient = {
   },
 
   async getAdminGames(token: string): Promise<Game[]> {
-    const res = await fetch('/api/admin/games', {
+    return safeFetchArray<Game>('/api/admin/games', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async saveAdminGame(token: string, game: Partial<Game>, isNew = false): Promise<Game> {
@@ -246,10 +413,9 @@ export const apiClient = {
   },
 
   async getAdminServices(token: string): Promise<Service[]> {
-    const res = await fetch('/api/admin/services', {
+    return safeFetchArray<Service>('/api/admin/services', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async saveAdminService(token: string, service: Partial<Service>, isNew = false): Promise<Service> {
@@ -268,10 +434,9 @@ export const apiClient = {
 
   // Providers & GoXtop Configuration
   async getAdminProviders(token: string): Promise<Provider[]> {
-    const res = await fetch('/api/admin/providers', {
+    return safeFetchArray<Provider>('/api/admin/providers', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async createAdminProvider(token: string, data: Partial<Provider> & { apiKey?: string; webhookSecret?: string }): Promise<Provider> {
@@ -353,9 +518,31 @@ export const apiClient = {
   },
 
   async getProviderApiLogs(token: string, providerId = 'all'): Promise<ProviderApiLog[]> {
-    const res = await fetch(`/api/admin/providers/${providerId}/logs`, {
+    return safeFetchArray<ProviderApiLog>(`/api/admin/providers/${providerId}/logs`, {
       headers: { Authorization: `Bearer ${token}` }
     });
+  },
+
+  async getProviderWebhookLogs(token: string, providerId = 'all'): Promise<ProviderWebhookLog[]> {
+    return safeFetchArray<ProviderWebhookLog>(`/api/admin/providers/${providerId}/webhook-logs`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  },
+
+  async testProviderWebhook(
+    token: string,
+    providerId: string,
+    options?: { simulateInvalidSignature?: boolean }
+  ): Promise<{ result: WebhookTestResult; provider: Provider; webhookLogs: ProviderWebhookLog[] }> {
+    const res = await fetch(`/api/admin/providers/${providerId}/test-webhook`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(options || {})
+    });
+    if (!res.ok) throw new Error('Échec du test webhook');
     return res.json();
   },
 
@@ -366,10 +553,9 @@ export const apiClient = {
     if (filters?.search) params.append('search', filters.search);
     if (params.toString()) url += `?${params.toString()}`;
 
-    const res = await fetch(url, {
+    return safeFetchArray<Order>(url, {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async retryAdminOrder(token: string, orderId: string): Promise<Order> {
@@ -381,10 +567,9 @@ export const apiClient = {
   },
 
   async getProviderOrders(token: string): Promise<ProviderOrder[]> {
-    const res = await fetch('/api/admin/provider-orders', {
+    return safeFetchArray<ProviderOrder>('/api/admin/provider-orders', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async checkAdminOrderStatus(token: string, orderId: string): Promise<{ result: any; order: Order }> {
@@ -416,10 +601,9 @@ export const apiClient = {
   },
 
   async getAdminResellers(token: string): Promise<Reseller[]> {
-    const res = await fetch('/api/admin/resellers', {
+    return safeFetchArray<Reseller>('/api/admin/resellers', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async adjustResellerBalance(token: string, resellerId: string, amount: number, note?: string) {
@@ -447,10 +631,9 @@ export const apiClient = {
   },
 
   async getAdminSupport(token: string): Promise<SupportTicket[]> {
-    const res = await fetch('/api/admin/support', {
+    return safeFetchArray<SupportTicket>('/api/admin/support', {
       headers: { Authorization: `Bearer ${token}` }
     });
-    return res.json();
   },
 
   async replyAdminSupport(token: string, ticketId: string, replyText: string, newStatus?: string) {
@@ -478,9 +661,113 @@ export const apiClient = {
   },
 
   async getAdminLogs(token: string): Promise<SystemLog[]> {
-    const res = await fetch('/api/admin/logs', {
+    return safeFetchArray<SystemLog>('/api/admin/logs', {
       headers: { Authorization: `Bearer ${token}` }
     });
+  },
+
+  // Admin Users
+  async getAdminUsers(token: string): Promise<AppUser[]> {
+    return safeFetchArray<AppUser>('/api/admin/users', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  },
+
+  async updateAdminUserStatus(token: string, userId: string, status: 'active' | 'suspended'): Promise<AppUser> {
+    const res = await fetch(`/api/admin/users/${userId}/status`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ status })
+    });
     return res.json();
+  },
+
+  async adjustAdminUserWallet(token: string, userId: string, amount: number, note?: string): Promise<AppUser> {
+    const res = await fetch(`/api/admin/users/${userId}/wallet`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ amount, note })
+    });
+    return res.json();
+  },
+
+  async resetAdminUserPassword(token: string, userId: string, newPassword: string): Promise<{ success: boolean; message: string }> {
+    const res = await fetch(`/api/admin/users/${userId}/reset-password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ newPassword })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || 'Erreur réinitialisation mot de passe');
+    return body;
+  },
+
+  // Admin API Keys
+  async getAdminApiKeys(token: string): Promise<ApiKey[]> {
+    return safeFetchArray<ApiKey>('/api/admin/api-keys', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  },
+
+  async createAdminResellerApiKey(token: string, resellerId: string, name: string): Promise<ApiKey> {
+    const res = await fetch(`/api/admin/resellers/${resellerId}/api-keys`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ name })
+    });
+    return res.json();
+  },
+
+  async updateAdminApiKeyStatus(token: string, keyId: string, status: 'active' | 'revoked'): Promise<ApiKey> {
+    const res = await fetch(`/api/admin/api-keys/${keyId}/status`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ status })
+    });
+    return res.json();
+  },
+
+  // Admin Payment Gateways & Transactions
+  async getAdminPaymentGateways(token: string): Promise<PaymentGatewayConfig[]> {
+    return safeFetchArray<PaymentGatewayConfig>('/api/admin/payment-gateways', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  },
+
+  async updateAdminPaymentGateway(
+    token: string,
+    gatewayId: string,
+    data: Partial<PaymentGatewayConfig> & { apiKey?: string; clientSecret?: string; webhookSecret?: string }
+  ): Promise<PaymentGatewayConfig> {
+    const res = await fetch(`/api/admin/payment-gateways/${gatewayId}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify(data)
+    });
+    return res.json();
+  },
+
+  async getAdminPaymentTransactions(token: string): Promise<PaymentTransaction[]> {
+    return safeFetchArray<PaymentTransaction>('/api/admin/payment-transactions', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
   }
 };

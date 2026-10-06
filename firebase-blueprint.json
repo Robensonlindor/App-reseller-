@@ -1,0 +1,171 @@
+{
+  "entities": {
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Publicly visible profile metadata for a PlayUp user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Display name of the player or reseller."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII and account settings for a PlayUp user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 160,
+          "description": "Verified email address."
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Optional phone number for MonCash/NatCash."
+        },
+        "preferredCurrency": {
+          "type": "string",
+          "enum": ["USD", "HTG", "EUR"],
+          "maxLength": 8,
+          "description": "Preferred display currency."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["uid", "email", "preferredCurrency", "createdAt", "updatedAt"]
+    },
+    "UserOrderRecord": {
+      "title": "UserOrderRecord",
+      "description": "Synchronized order summary belonging to an authenticated PlayUp user.",
+      "type": "object",
+      "properties": {
+        "orderNumber": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique PlayUp order number."
+        },
+        "partnerOrderId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique server-side partner_orderid."
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the user who placed the order."
+        },
+        "gameName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Name of the game."
+        },
+        "packageName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Name of the top-up package."
+        },
+        "amount": {
+          "type": "number",
+          "description": "Total charged amount."
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["USD", "HTG", "EUR"],
+          "maxLength": 8,
+          "description": "Order currency."
+        },
+        "paymentMethod": {
+          "type": "string",
+          "enum": ["card", "moncash", "natcash", "wallet"],
+          "maxLength": 24,
+          "description": "Payment gateway used."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "paid", "processing", "completed", "failed", "cancelled", "refunded"],
+          "maxLength": 24,
+          "description": "Current order lifecycle status."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp."
+        }
+      },
+      "required": [
+        "orderNumber",
+        "partnerOrderId",
+        "ownerId",
+        "gameName",
+        "packageName",
+        "amount",
+        "currency",
+        "paymentMethod",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "Root public user profile document."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated PII document for the user (strictly owner or admin access)."
+    },
+    "/users/{userId}/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/UserOrderRecord" },
+      "description": "Subcollection of orders belonging to a specific user."
+    }
+  }
+}

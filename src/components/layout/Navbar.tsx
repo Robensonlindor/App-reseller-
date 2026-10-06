@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { 
   Menu, X, Smartphone, Globe, Shield, Terminal, ArrowUpRight, 
-  Sparkles, Layers
+  Sparkles, Layers, User
 } from 'lucide-react';
 import { Language, translations } from '../../i18n';
 
@@ -113,6 +113,19 @@ export const Navbar: React.FC<NavbarProps> = ({
               <span>App Mobile PlayUp</span>
             </button>
 
+            {/* User Account Login / Profile */}
+            <button
+              onClick={() => onNavigate('account')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                currentTab === 'account'
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-700 bg-slate-100 hover:bg-slate-200'
+              }`}
+            >
+              <User className="w-3.5 h-3.5" />
+              <span>Mon Compte</span>
+            </button>
+
             {/* Reseller Portal Login */}
             <button
               onClick={() => onNavigate('reseller')}
@@ -205,7 +218,13 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Smartphone className="w-4 h-4" />
               <span>Ouvrir l’App Mobile PlayUp</span>
             </button>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                onClick={() => handleLinkClick('account')}
+                className="py-2 px-3 text-center border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Mon Compte
+              </button>
               <button
                 onClick={() => handleLinkClick('reseller')}
                 className="py-2 px-3 text-center border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"

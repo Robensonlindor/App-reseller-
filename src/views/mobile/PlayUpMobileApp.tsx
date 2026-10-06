@@ -1,12 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Home, Gamepad2, ShoppingBag, HelpCircle, User, ArrowLeft, 
   Check, CheckCircle2, AlertCircle, RefreshCw, Smartphone, 
   CreditCard, ShieldCheck, Zap, Bell, ChevronRight, Search, 
-  ExternalLink, Sparkles 
+  ExternalLink, Sparkles, Lock, Mail, Key, Wallet, LogOut, Settings,
+  Activity, Clock
 } from 'lucide-react';
-import { Game, Service, ServicePackage, Order, PlayerCheckResult, UserNotification } from '../../types';
+import {
+  Game, Service, ServicePackage, Order, PlayerCheckResult, UserNotification,
+  AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType
+} from '../../types';
 import { apiClient } from '../../services/apiClient';
+import { signInWithGooglePopup, signOutFirebase } from '../../lib/firebase';
+import { safeStorage } from '../../lib/safeStorage';
 import { Language, translations } from '../../i18n';
 
 interface PlayUpMobileAppProps {
@@ -61,9 +67,15 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   const [pendingPartnerOrderId, setPendingPartnerOrderId] = useState<string>('');
   const [notifications, setNotifications] = useState<UserNotification[]>([]);
 
-  // Recent user orders
+  // Recent user orders & Order Tracker state
   const [userOrders, setUserOrders] = useState<Order[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
+  const [trackerSearchQuery, setTrackerSearchQuery] = useState('');
+  const [trackerLookupError, setTrackerLookupError] = useState<string | null>(null);
+  const [isPollingOrder, setIsPollingOrder] = useState(false);
+  const [pollAttempts, setPollAttempts] = useState(0);
+  const [lastPolledAt, setLastPolledAt] = useState<string | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Search in Games tab
   const [gameSearch, setGameSearch] = useState('');
@@ -75,10 +87,233 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   // Notifications drawer
   const [showNotifications, setShowNotifications] = useState(false);
 
+  // User Authentication & Account State
+  const [authUser, setAuthUser] = useState<AppUser | null>(() => {
+    const saved = safeStorage.getItem('playup_user_profile');
+    if (saved) {
+      try { return JSON.parse(saved); } catch { return null; }
+    }
+    return null;
+  });
+  const [userToken, setUserToken] = useState<string>(() => safeStorage.getItem('playup_user_token') || '');
+  const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
+  const [authEmail, setAuthEmail] = useState('alex@playup.gg');
+  const [authPassword, setAuthPassword] = useState('PlayUp2026!');
+  const [authName, setAuthName] = useState('');
+  const [authPhone, setAuthPhone] = useState('');
+  const [resetCodeInput, setResetCodeInput] = useState('');
+  const [generatedResetCode, setGeneratedResetCode] = useState<string | null>(null);
+  const [newResetPassword, setNewResetPassword] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSuccess, setAuthSuccess] = useState<string | null>(null);
+
+  // Profile Settings State
+  const [profileName, setProfileName] = useState('');
+  const [profilePhone, setProfilePhone] = useState('');
+  const [profileCurrency, setProfileCurrency] = useState<'USD' | 'HTG' | 'EUR'>('USD');
+  const [profileTwoFactor, setProfileTwoFactor] = useState(false);
+  const [profileEmailNotifs, setProfileEmailNotifs] = useState(true);
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('');
+  const [newPasswordInput, setNewPasswordInput] = useState('');
+  const [profileSaving, setProfileSaving] = useState(false);
+
+  // Payment Gateways & Checkout State
+  const [paymentGateways, setPaymentGateways] = useState<PaymentGatewayConfig[]>([]);
+  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<PaymentMethodType>('moncash');
+  const [cardHolderName, setCardHolderName] = useState('ALEX GAMER');
+  const [cardNumber, setCardNumber] = useState('4532015112830366');
+  const [cardExpiry, setCardExpiry] = useState('08/28');
+  const [cardCvc, setCardCvc] = useState('842');
+  const [mobilePhone, setMobilePhone] = useState('+509 3711-2233');
+  const [mobileOtp, setMobileOtp] = useState('482910');
+  const [lastPaymentTx, setLastPaymentTx] = useState<PaymentTransaction | null>(null);
+  const [userPaymentTransactions, setUserPaymentTransactions] = useState<PaymentTransaction[]>([]);
+
+  // Wallet Top-Up State
+  const [showWalletTopUp, setShowWalletTopUp] = useState(false);
+  const [topUpAmount, setTopUpAmount] = useState('20');
+  const [topUpMethod, setTopUpMethod] = useState<PaymentMethodType>('moncash');
+  const [topUpProcessing, setTopUpProcessing] = useState(false);
+
   useEffect(() => {
     loadUserOrders();
     loadNotifications();
-  }, []);
+    loadPaymentGateways();
+  }, [authUser?.id]);
+
+  const loadPaymentGateways = async () => {
+    try {
+      const gws = await apiClient.getPaymentGateways();
+      setPaymentGateways(gws);
+      if (gws.length > 0 && !gws.some(g => g.slug === selectedPaymentMethod)) {
+        setSelectedPaymentMethod(gws[0].slug);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const syncUserState = (user: AppUser, token: string) => {
+    setAuthUser(user);
+    setUserToken(token);
+    safeStorage.setItem('playup_user_token', token);
+    safeStorage.setItem('playup_user_profile', JSON.stringify(user));
+    setProfileName(user.name);
+    setProfilePhone(user.phone || '');
+    setProfileCurrency(user.preferredCurrency || 'USD');
+    setProfileTwoFactor(Boolean(user.twoFactorEnabled));
+    setProfileEmailNotifs(user.emailNotifications !== false);
+    if (user.phone) setMobilePhone(user.phone);
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      if (authMode === 'login') {
+        const res = await apiClient.loginUser(authEmail, authPassword);
+        syncUserState(res.user, res.token);
+        const prof = await apiClient.getUserProfile(res.token);
+        setUserPaymentTransactions(prof.paymentTransactions || []);
+        setAuthSuccess(`Bienvenue, ${res.user.name} !`);
+      } else if (authMode === 'register') {
+        const res = await apiClient.registerUser({
+          name: authName,
+          email: authEmail,
+          password: authPassword,
+          phone: authPhone
+        });
+        syncUserState(res.user, res.token);
+        setAuthSuccess('Compte créé avec succès ! $15.00 de bonus crédités sur votre PlayUp Wallet.');
+      } else if (authMode === 'forgot') {
+        const res = await apiClient.forgotUserPassword(authEmail);
+        setGeneratedResetCode(res.resetCode);
+        setResetCodeInput(res.resetCode);
+        setAuthMode('reset');
+        setAuthSuccess(`${res.message} Code de sécurité : ${res.resetCode}`);
+      } else if (authMode === 'reset') {
+        const res = await apiClient.resetUserPassword({
+          email: authEmail,
+          resetCode: resetCodeInput,
+          newPassword: newResetPassword
+        });
+        syncUserState(res.user, res.token);
+        setGeneratedResetCode(null);
+        setAuthSuccess(res.message);
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Erreur d’authentification');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      const fbData = await signInWithGooglePopup();
+      const res = await apiClient.socialLoginUser({
+        provider: 'google',
+        uid: fbData.uid,
+        email: fbData.email,
+        name: fbData.name,
+        avatarUrl: fbData.avatarUrl
+      });
+      syncUserState(res.user, res.token);
+      setAuthSuccess(`Connecté via Google (${res.user.email})`);
+    } catch (err: any) {
+      setAuthError(err.message || 'Connexion Google annulée ou indisponible dans cette fenêtre.');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleFacebookQuickLogin = async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      const res = await apiClient.socialLoginUser({
+        provider: 'facebook',
+        email: 'gamer.fb@playup.gg',
+        name: 'Joueur Facebook PlayUp'
+      });
+      syncUserState(res.user, res.token);
+      setAuthSuccess(`Connecté avec Facebook (${res.user.name})`);
+    } catch (err: any) {
+      setAuthError(err.message || 'Erreur connexion Facebook');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleUpdateAccountSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!userToken) return;
+    setProfileSaving(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      const res = await apiClient.updateUserProfile(userToken, {
+        name: profileName,
+        phone: profilePhone,
+        preferredCurrency: profileCurrency,
+        twoFactorEnabled: profileTwoFactor,
+        emailNotifications: profileEmailNotifs,
+        ...(newPasswordInput ? { currentPassword: currentPasswordInput, newPassword: newPasswordInput } : {})
+      });
+      setAuthUser(res.user);
+      setCurrentPasswordInput('');
+      setNewPasswordInput('');
+      setAuthSuccess(res.message);
+    } catch (err: any) {
+      setAuthError(err.message || 'Erreur mise à jour profil');
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handleWalletTopUpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authUser) return;
+    setTopUpProcessing(true);
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      const payRes = await apiClient.processPayment({
+        userId: authUser.id,
+        paymentMethod: topUpMethod,
+        amount: Number(topUpAmount),
+        currency: 'USD',
+        purpose: 'wallet_topup',
+        cardDetails: topUpMethod === 'card' ? {
+          cardNumber,
+          expiry: cardExpiry,
+          cvc: cardCvc,
+          holderName: cardHolderName
+        } : undefined,
+        mobileWalletDetails: (topUpMethod === 'moncash' || topUpMethod === 'natcash') ? {
+          phone: mobilePhone,
+          otp: mobileOtp
+        } : undefined
+      });
+      if (payRes.user) {
+        setAuthUser(payRes.user);
+      }
+      setUserPaymentTransactions(prev => [payRes.transaction, ...prev]);
+      setShowWalletTopUp(false);
+      setAuthSuccess(`Rechargement réussi ! Réf: ${payRes.transaction.transactionReference} (+$${Number(topUpAmount).toFixed(2)})`);
+    } catch (err: any) {
+      setAuthError(err.message || 'Échec du rechargement');
+    } finally {
+      setTopUpProcessing(false);
+    }
+  };
 
   const loadNotifications = async () => {
     try {
@@ -92,8 +327,15 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   const loadUserOrders = async () => {
     setOrdersLoading(true);
     try {
-      const orders = await apiClient.getRecentOrders();
+      const orders = await apiClient.getRecentOrders(authUser?.id);
       setUserOrders(orders);
+      if (userToken) {
+        const prof = await apiClient.getUserProfile(userToken).catch(() => null);
+        if (prof) {
+          setAuthUser(prof.user);
+          setUserPaymentTransactions(prof.paymentTransactions || []);
+        }
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -178,7 +420,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setShowPaymentStep(true);
   };
 
-  // Submit order (Idempotent with partner_orderid)
+  // Submit order (First processes payment through selected Payment Gateway, then creates PlayUp & GoXtop order)
   const handleConfirmOrder = async () => {
     if (!selectedGame || !selectedService || !selectedPackage || isOrdering) return;
 
@@ -186,6 +428,31 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setOrderError(null);
 
     try {
+      // 1. Process Payment through selected Payment Gateway (Card, MonCash, NatCash, or PlayUp Wallet)
+      const paymentRes = await apiClient.processPayment({
+        userId: authUser?.id,
+        paymentMethod: selectedPaymentMethod,
+        amount: selectedPackage.publicPrice,
+        currency: selectedPackage.currency || 'USD',
+        purpose: 'order',
+        cardDetails: selectedPaymentMethod === 'card' ? {
+          cardNumber,
+          expiry: cardExpiry,
+          cvc: cardCvc,
+          holderName: cardHolderName
+        } : undefined,
+        mobileWalletDetails: (selectedPaymentMethod === 'moncash' || selectedPaymentMethod === 'natcash') ? {
+          phone: mobilePhone,
+          otp: mobileOtp
+        } : undefined
+      });
+
+      setLastPaymentTx(paymentRes.transaction);
+      if (paymentRes.user) {
+        setAuthUser(paymentRes.user);
+      }
+
+      // 2. Create PlayUp Order & Dispatch to GoXtop with verified payment reference
       const order = await apiClient.createMobileOrder({
         gameId: selectedGame.id,
         serviceId: selectedService.id,
@@ -193,6 +460,10 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
         gameProfileData: gameProfileInputs,
         verifiedPlayerName: playerCheckResult?.verified ? playerCheckResult.playerName : undefined,
         paymentConfirmed: true,
+        paymentMethod: selectedPaymentMethod,
+        paymentTransactionId: paymentRes.transaction.id,
+        paymentReference: paymentRes.transaction.transactionReference,
+        userId: authUser?.id,
         partnerOrderId: pendingPartnerOrderId || undefined
       });
 
@@ -226,25 +497,172 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     }
   };
 
+  const stopOrderPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setIsPollingOrder(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
+
   const pollOrderStatus = (orderId: string) => {
+    stopOrderPolling();
+    setIsPollingOrder(true);
+    setPollAttempts(0);
+    setLastPolledAt(new Date().toLocaleTimeString());
+
     let attempts = 0;
     const interval = setInterval(async () => {
       attempts++;
+      setPollAttempts(attempts);
       try {
         const refreshed = await apiClient.getMobileOrder(orderId);
         setCurrentOrder(refreshed);
-        if (refreshed.status === 'completed' || refreshed.status === 'failed' || attempts > 10) {
+        setLastPolledAt(new Date().toLocaleTimeString());
+        if (
+          refreshed.status === 'completed' ||
+          refreshed.status === 'failed' ||
+          refreshed.status === 'cancelled' ||
+          refreshed.status === 'refunded' ||
+          attempts > 15
+        ) {
           clearInterval(interval);
+          pollIntervalRef.current = null;
+          setIsPollingOrder(false);
           loadUserOrders();
           loadNotifications();
         }
       } catch (e) {
         clearInterval(interval);
+        pollIntervalRef.current = null;
+        setIsPollingOrder(false);
       }
     }, 1500);
+
+    pollIntervalRef.current = interval;
+  };
+
+  const handleOpenOrderTracker = async (orderOrId: Order | string) => {
+    setTrackerLookupError(null);
+    if (typeof orderOrId !== 'string') {
+      setCurrentOrder(orderOrId);
+      try {
+        const refreshed = await apiClient.getMobileOrder(orderOrId.id);
+        setCurrentOrder(refreshed);
+        setLastPolledAt(new Date().toLocaleTimeString());
+        if (refreshed.status === 'pending' || refreshed.status === 'paid' || refreshed.status === 'processing') {
+          pollOrderStatus(refreshed.id);
+        } else {
+          stopOrderPolling();
+        }
+      } catch {
+        if (orderOrId.status === 'pending' || orderOrId.status === 'paid' || orderOrId.status === 'processing') {
+          pollOrderStatus(orderOrId.id);
+        }
+      }
+      return;
+    }
+
+    const query = orderOrId.trim();
+    if (!query) return;
+    try {
+      const found = await apiClient.getMobileOrder(query);
+      setCurrentOrder(found);
+      setLastPolledAt(new Date().toLocaleTimeString());
+      if (found.status === 'pending' || found.status === 'paid' || found.status === 'processing') {
+        pollOrderStatus(found.id);
+      } else {
+        stopOrderPolling();
+      }
+    } catch (err: any) {
+      setTrackerLookupError(`Aucune commande trouvée pour "${query}". Vérifiez votre N° PLUP ou Partner ID.`);
+    }
+  };
+
+  const getOrderProgressInfo = (order: Order) => {
+    const hasPaidHistory = order.statusHistory?.some(h => h.status === 'paid');
+    const hasProcessingHistory = order.statusHistory?.some(h => h.status === 'processing');
+
+    let progressPercent = 25;
+    let stageIndex = 1; // 1 to 4
+    let statusLabel = 'Commande initiée';
+    let barColorClass = 'from-orange-500 to-amber-500';
+
+    if (order.status === 'pending') {
+      progressPercent = 25;
+      stageIndex = 1;
+      statusLabel = 'En attente de validation paiement';
+      barColorClass = 'from-amber-500 to-orange-500';
+    } else if (order.status === 'paid') {
+      progressPercent = 55;
+      stageIndex = 2;
+      statusLabel = 'Paiement validé · Envoi vers GoXtop';
+      barColorClass = 'from-orange-500 to-amber-500';
+    } else if (order.status === 'processing') {
+      progressPercent = 82;
+      stageIndex = 3;
+      statusLabel = 'Traitement GoXtop en cours...';
+      barColorClass = 'from-orange-600 via-amber-500 to-emerald-500';
+    } else if (order.status === 'completed') {
+      progressPercent = 100;
+      stageIndex = 4;
+      statusLabel = 'Livraison confirmée à 100%';
+      barColorClass = 'from-emerald-500 to-teal-500';
+    } else if (order.status === 'failed' || order.status === 'cancelled' || order.status === 'refunded') {
+      progressPercent = 100;
+      stageIndex = 4;
+      statusLabel = order.status === 'refunded' ? 'Commande remboursée' : 'Échec de traitement';
+      barColorClass = 'from-red-500 to-rose-600';
+    }
+
+    const steps = [
+      {
+        step: 1,
+        title: 'Initiée',
+        subtitle: 'ID PlayUp créé',
+        done: stageIndex >= 1,
+        active: stageIndex === 1,
+        failed: false
+      },
+      {
+        step: 2,
+        title: 'Paiement',
+        subtitle: order.paymentMethod ? order.paymentMethod.toUpperCase() : 'Validé',
+        done: stageIndex >= 2 || Boolean(hasPaidHistory),
+        active: stageIndex === 2,
+        failed: false
+      },
+      {
+        step: 3,
+        title: 'GoXtop API',
+        subtitle: 'Serveur de jeu',
+        done: stageIndex >= 3 || Boolean(hasProcessingHistory),
+        active: stageIndex === 3,
+        failed: false
+      },
+      {
+        step: 4,
+        title: order.status === 'failed' ? 'Échec' : 'Livrée',
+        subtitle: order.status === 'completed' ? 'Crédits reçus' : order.status === 'failed' ? 'Non livrée' : 'Confirmation',
+        done: order.status === 'completed',
+        active: stageIndex === 4 && order.status !== 'completed' && order.status !== 'failed',
+        failed: order.status === 'failed' || order.status === 'cancelled'
+      }
+    ];
+
+    return { progressPercent, stageIndex, statusLabel, barColorClass, steps };
   };
 
   const resetPurchaseFlow = () => {
+    stopOrderPolling();
     setSelectedGame(null);
     setSelectedService(null);
     setSelectedPackage(null);
@@ -282,12 +700,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
       {/* Main Smartphone Shell Container */}
       <div className={`w-full transition-all duration-300 ${
         deviceFrameMode 
-          ? 'max-w-[420px] h-[860px] max-h-[92vh] rounded-[44px] border-[10px] border-slate-900 shadow-2xl relative overflow-hidden bg-white flex flex-col ring-1 ring-slate-700/50' 
-          : 'max-w-2xl h-[92vh] rounded-3xl border border-slate-700 shadow-2xl bg-white flex flex-col overflow-hidden'
+          ? 'h-[calc(100dvh-44px)] sm:max-w-[420px] sm:h-[860px] sm:max-h-[92vh] sm:rounded-[44px] sm:border-[10px] sm:border-slate-900 shadow-2xl relative overflow-hidden bg-white flex flex-col sm:ring-1 sm:ring-slate-700/50' 
+          : 'max-w-2xl h-[calc(100dvh-44px)] sm:h-[92vh] sm:rounded-3xl sm:border sm:border-slate-700 shadow-2xl bg-white flex flex-col overflow-hidden'
       }`}>
-        {/* Phone Notch / Dynamic Island */}
+        {/* Phone Notch / Dynamic Island (Desktop simulator only) */}
         {deviceFrameMode && (
-          <div className="w-full bg-slate-900 h-6 flex justify-center items-center shrink-0">
+          <div className="hidden sm:flex w-full bg-slate-900 h-6 justify-center items-center shrink-0">
             <div className="w-24 h-4 bg-slate-950 rounded-full flex items-center justify-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-slate-800" />
               <span className="w-2 h-2 rounded-full bg-slate-700/80" />
@@ -297,7 +715,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
         {/* Mobile App Header */}
         <div className="bg-white border-b border-slate-100 px-5 py-3 flex items-center justify-between shrink-0">
-          {selectedGame ? (
+          {(selectedGame || currentOrder) ? (
             <button
               onClick={resetPurchaseFlow}
               className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-orange-600 transition-colors"
@@ -325,9 +743,16 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
               <span className="absolute top-1 right-1 w-2 h-2 bg-orange-600 rounded-full" />
             </button>
 
-            <div className="px-2.5 py-1 bg-orange-50 border border-orange-200 rounded-lg text-xs font-bold text-orange-700">
-              USD ($)
-            </div>
+            <button
+              onClick={() => {
+                resetPurchaseFlow();
+                setActiveTab('profile');
+              }}
+              className="px-2.5 py-1 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-lg text-xs font-bold text-orange-700 flex items-center gap-1.5 transition-colors"
+            >
+              <Wallet className="w-3.5 h-3.5" />
+              <span>{authUser ? `$${authUser.walletBalance.toFixed(2)}` : 'Connexion'}</span>
+            </button>
           </div>
         </div>
 
@@ -372,103 +797,225 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
         {/* Mobile Viewport Content Area */}
         <div className="flex-1 overflow-y-auto bg-slate-50/50">
-          {/* FLOW: ORDER IN PROGRESS / CONFIRMED */}
+          {/* FLOW: REAL-TIME ORDER TRACKER VIEW */}
           {currentOrder ? (
-            <div className="p-6 space-y-6">
-              <div className="text-center space-y-2 pt-4">
-                <div className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto ${
-                  currentOrder.status === 'completed' ? 'bg-emerald-100 text-emerald-600' :
-                  currentOrder.status === 'failed' ? 'bg-red-100 text-red-600' : 'bg-orange-100 text-orange-600 animate-pulse'
-                }`}>
-                  {currentOrder.status === 'completed' ? (
-                    <CheckCircle2 className="w-8 h-8" />
-                  ) : currentOrder.status === 'failed' ? (
-                    <AlertCircle className="w-8 h-8" />
-                  ) : (
-                    <RefreshCw className="w-8 h-8 animate-spin" />
-                  )}
-                </div>
+            (() => {
+              const progressInfo = getOrderProgressInfo(currentOrder);
+              const isTerminal =
+                currentOrder.status === 'completed' ||
+                currentOrder.status === 'failed' ||
+                currentOrder.status === 'cancelled' ||
+                currentOrder.status === 'refunded';
 
-                <h3 className="font-display text-xl font-bold text-slate-900">
-                  {currentOrder.status === 'completed' ? 'Recharge Livrée avec Succès !' :
-                   currentOrder.status === 'failed' ? 'Échec de Livraison' :
-                   'Commande en cours de traitement...'}
-                </h3>
-
-                <p className="text-xs text-slate-500 max-w-xs mx-auto">
-                  {currentOrder.status === 'completed'
-                    ? 'Les diamants ont été crédités directement sur le compte joueur.'
-                    : currentOrder.status === 'failed'
-                    ? currentOrder.errorMessage || 'Impossible de livrer sur cet identifiant'
-                    : 'La passerelle contacte actuellement le serveur de jeu...'}
-                </p>
-              </div>
-
-              {/* Order Status Timeline */}
-              <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
-                <div className="flex justify-between items-center pb-2 border-b border-slate-100 text-xs">
-                  <span className="text-slate-400">N° Commande / Partner ID</span>
-                  <div className="text-right font-mono">
-                    <span className="font-bold text-slate-900 block">{currentOrder.orderNumber}</span>
-                    <span className="text-[10px] text-orange-600">{currentOrder.partnerOrderId}</span>
-                  </div>
-                </div>
-
-                <div className="space-y-2 text-xs">
-                  {currentOrder.statusHistory.map((item, idx) => (
-                    <div key={idx} className="flex items-start gap-2.5">
-                      <div className="w-2 h-2 rounded-full bg-orange-600 mt-1.5 shrink-0" />
+              return (
+                <div className="p-5 space-y-5">
+                  {/* Top Order Tracker Live Banner */}
+                  <div className="flex items-center justify-between bg-slate-900 text-white px-3.5 py-2.5 rounded-2xl border border-slate-800">
+                    <div className="flex items-center gap-2">
+                      <Activity className={`w-4 h-4 ${isPollingOrder ? 'text-orange-400 animate-pulse' : 'text-emerald-400'}`} />
                       <div>
-                        <div className="font-semibold text-slate-800 capitalize">{item.status}</div>
-                        <div className="text-[11px] text-slate-500">{item.note}</div>
+                        <span className="text-[11px] font-bold uppercase tracking-wider block">
+                          Order Tracker Temps Réel
+                        </span>
+                        <span className="text-[10px] text-slate-400 block">
+                          {isPollingOrder
+                            ? `Synchronisation active (cycle #${pollAttempts + 1})`
+                            : lastPolledAt
+                            ? `Mis à jour à ${lastPolledAt}`
+                            : 'Suivi en direct GoXtop'}
+                        </span>
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
+                    <button
+                      type="button"
+                      onClick={() => pollOrderStatus(currentOrder.id)}
+                      className="px-2.5 py-1.5 bg-white/10 hover:bg-white/20 rounded-xl text-[11px] font-semibold flex items-center gap-1.5 transition-colors"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isPollingOrder ? 'animate-spin text-orange-400' : ''}`} />
+                      <span>{isPollingOrder ? 'Live' : 'Actualiser'}</span>
+                    </button>
+                  </div>
 
-              {/* Summary Details */}
-              <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2 text-xs">
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Jeu :</span>
-                  <span className="font-semibold text-slate-900">{currentOrder.gameName}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Pack :</span>
-                  <span className="font-semibold text-slate-900">{currentOrder.packageName}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Profil :</span>
-                  <span className="font-mono text-slate-800">
-                    {Object.entries(currentOrder.gameProfileData).map(([k, v]) => `${k}:${v}`).join(' ')}
-                  </span>
-                </div>
-                <div className="flex justify-between pt-2 border-t border-slate-100">
-                  <span className="font-bold text-slate-900">Total payé :</span>
-                  <span className="font-mono font-bold text-orange-600 text-sm">
-                    ${currentOrder.chargedAmount.toFixed(2)} USD
-                  </span>
-                </div>
-              </div>
+                  {/* Hero Status Icon & Headline */}
+                  <div className="text-center space-y-2 pt-1">
+                    <div className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto ${
+                      currentOrder.status === 'completed' ? 'bg-emerald-100 text-emerald-600' :
+                      currentOrder.status === 'failed' ? 'bg-red-100 text-red-600' : 'bg-orange-100 text-orange-600 animate-pulse'
+                    }`}>
+                      {currentOrder.status === 'completed' ? (
+                        <CheckCircle2 className="w-8 h-8" />
+                      ) : currentOrder.status === 'failed' ? (
+                        <AlertCircle className="w-8 h-8" />
+                      ) : (
+                        <RefreshCw className="w-8 h-8 animate-spin" />
+                      )}
+                    </div>
 
-              <div className="space-y-2 pt-2">
-                <button
-                  onClick={resetPurchaseFlow}
-                  className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold text-xs rounded-xl shadow-xs transition-colors"
-                >
-                  Effectuer un nouvel achat
-                </button>
-                <button
-                  onClick={() => {
-                    setCurrentOrder(null);
-                    setActiveTab('orders');
-                  }}
-                  className="w-full py-2.5 text-xs text-slate-600 hover:text-slate-900 font-medium"
-                >
-                  Voir mes commandes
-                </button>
-              </div>
-            </div>
+                    <h3 className="font-display text-xl font-bold text-slate-900">
+                      {currentOrder.status === 'completed' ? 'Recharge Livrée avec Succès !' :
+                       currentOrder.status === 'failed' ? 'Échec de Livraison' :
+                       'Commande en cours de traitement...'}
+                    </h3>
+
+                    <p className="text-xs text-slate-500 max-w-xs mx-auto">
+                      {currentOrder.status === 'completed'
+                        ? 'Les diamants ont été crédités directement sur le compte joueur.'
+                        : currentOrder.status === 'failed'
+                        ? currentOrder.errorMessage || 'Impossible de livrer sur cet identifiant'
+                        : 'La passerelle contacte actuellement le serveur de jeu...'}
+                    </p>
+                  </div>
+
+                  {/* REAL-TIME PROGRESS BAR & 4-STAGE STEPPER */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-4 shadow-2xs">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-slate-800 flex items-center gap-1.5">
+                        <Zap className="w-3.5 h-3.5 text-orange-600" />
+                        <span>{progressInfo.statusLabel}</span>
+                      </span>
+                      <span className={`font-mono font-extrabold text-xs px-2 py-0.5 rounded-md ${
+                        currentOrder.status === 'completed'
+                          ? 'bg-emerald-50 text-emerald-700'
+                          : currentOrder.status === 'failed'
+                          ? 'bg-red-50 text-red-700'
+                          : 'bg-orange-50 text-orange-700'
+                      }`}>
+                        {progressInfo.progressPercent}%
+                      </span>
+                    </div>
+
+                    {/* Animated Progress Bar */}
+                    <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden p-0.5 border border-slate-200/80">
+                      <div
+                        className={`h-full rounded-full bg-gradient-to-r ${progressInfo.barColorClass} transition-all duration-700 ease-out ${
+                          !isTerminal ? 'animate-pulse' : ''
+                        }`}
+                        style={{ width: `${progressInfo.progressPercent}%` }}
+                      />
+                    </div>
+
+                    {/* 4-Stage Visual Stepper */}
+                    <div className="grid grid-cols-4 gap-1.5 pt-1">
+                      {progressInfo.steps.map((s) => (
+                        <div key={s.step} className="flex flex-col items-center text-center space-y-1">
+                          <div
+                            className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold border transition-all ${
+                              s.failed
+                                ? 'bg-red-600 border-red-600 text-white'
+                                : s.done
+                                ? 'bg-emerald-600 border-emerald-600 text-white'
+                                : s.active
+                                ? 'bg-orange-600 border-orange-600 text-white ring-4 ring-orange-100'
+                                : 'bg-slate-50 border-slate-300 text-slate-400'
+                            }`}
+                          >
+                            {s.failed ? '✕' : s.done ? <Check className="w-3.5 h-3.5" /> : s.step}
+                          </div>
+                          <div className="text-[10px] font-bold text-slate-800 leading-tight">{s.title}</div>
+                          <div className="text-[9px] text-slate-400 leading-tight truncate max-w-full">{s.subtitle}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Order Status Timeline */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
+                    <div className="flex justify-between items-center pb-2 border-b border-slate-100 text-xs">
+                      <span className="text-slate-400">N° Commande / Partner ID</span>
+                      <div className="text-right font-mono">
+                        <span className="font-bold text-slate-900 block">{currentOrder.orderNumber}</span>
+                        <span className="text-[10px] text-orange-600">{currentOrder.partnerOrderId}</span>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2.5 text-xs">
+                      {currentOrder.statusHistory.map((item, idx) => (
+                        <div key={idx} className="flex items-start justify-between gap-2.5">
+                          <div className="flex items-start gap-2.5">
+                            <div className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${
+                              item.status === 'completed' ? 'bg-emerald-600' :
+                              item.status === 'failed' ? 'bg-red-600' : 'bg-orange-600'
+                            }`} />
+                            <div>
+                              <div className="font-semibold text-slate-800 capitalize">{item.status}</div>
+                              <div className="text-[11px] text-slate-500">{item.note}</div>
+                            </div>
+                          </div>
+                          {item.timestamp && (
+                            <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                              {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Summary Details */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Jeu :</span>
+                      <span className="font-semibold text-slate-900">{currentOrder.gameName}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Pack :</span>
+                      <span className="font-semibold text-slate-900">{currentOrder.packageName}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Profil :</span>
+                      <span className="font-mono text-slate-800">
+                        {Object.entries(currentOrder.gameProfileData).map(([k, v]) => `${k}:${v}`).join(' ')}
+                      </span>
+                    </div>
+                    {currentOrder.externalOrderId && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Réf. Fournisseur (GoXtop) :</span>
+                        <span className="font-mono font-bold text-slate-800">{currentOrder.externalOrderId}</span>
+                      </div>
+                    )}
+                    {currentOrder.paymentMethod && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Passerelle de paiement :</span>
+                        <span className="font-bold uppercase text-emerald-700">{currentOrder.paymentMethod}</span>
+                      </div>
+                    )}
+                    {(currentOrder.paymentReference || lastPaymentTx?.transactionReference) && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Réf. Paiement :</span>
+                        <span className="font-mono text-[11px] font-bold text-slate-900">
+                          {currentOrder.paymentReference || lastPaymentTx?.transactionReference}
+                        </span>
+                      </div>
+                    )}
+                    <div className="flex justify-between pt-2 border-t border-slate-100">
+                      <span className="font-bold text-slate-900">Total payé :</span>
+                      <span className="font-mono font-bold text-orange-600 text-sm">
+                        ${currentOrder.chargedAmount.toFixed(2)} USD
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2 pt-1">
+                    <button
+                      onClick={resetPurchaseFlow}
+                      className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold text-xs rounded-xl shadow-xs transition-colors"
+                    >
+                      Effectuer un nouvel achat
+                    </button>
+                    <button
+                      onClick={() => {
+                        stopOrderPolling();
+                        setCurrentOrder(null);
+                        setActiveTab('orders');
+                      }}
+                      className="w-full py-2.5 text-xs text-slate-600 hover:text-slate-900 font-medium"
+                    >
+                      Retour à l'Order Tracker &amp; Historique
+                    </button>
+                  </div>
+                </div>
+              );
+            })()
           ) : selectedGame ? (
             /* STEP 2-5: DYNAMIC PURCHASE FLOW FOR SELECTED GAME */
             <div className="p-4 sm:p-5 space-y-5">
@@ -639,11 +1186,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 </div>
               )}
 
-              {/* Step 4 & 5: Confirmation -> Paiement -> Création Commande PlayUp & GoXtop */}
+              {/* Step 4 & 5: Confirmation -> Passerelle de Paiement -> Création Commande PlayUp & GoXtop */}
               {showPaymentStep && selectedPackage ? (
-                <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-3 border border-orange-500/40">
+                <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-4 border border-orange-500/40">
                   <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                    <span className="text-xs font-bold text-orange-400 uppercase">Étape 3 : Confirmation & Paiement</span>
+                    <span className="text-xs font-bold text-orange-400 uppercase">Étape 3 : Passerelle de Paiement Sécurisée</span>
                     <button
                       type="button"
                       onClick={() => setShowPaymentStep(false)}
@@ -653,7 +1200,159 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     </button>
                   </div>
 
-                  <div className="space-y-1.5 text-xs">
+                  {/* Payment Method Selector (MonCash, NatCash, Card, Wallet) */}
+                  <div className="space-y-2">
+                    <label className="text-[11px] font-bold text-slate-300 uppercase block">
+                      Choisir le mode de paiement
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(paymentGateways.length > 0 ? paymentGateways : [
+                        { id: 'gw_moncash', slug: 'moncash' as const, name: 'MonCash (Digicel)', feePercent: 1.5, fixedFee: 0 },
+                        { id: 'gw_natcash', slug: 'natcash' as const, name: 'NatCash (Natcom)', feePercent: 1.5, fixedFee: 0 },
+                        { id: 'gw_card', slug: 'card' as const, name: 'Carte Bancaire', feePercent: 2.9, fixedFee: 0.3 },
+                        { id: 'gw_wallet', slug: 'wallet' as const, name: 'PlayUp Wallet', feePercent: 0, fixedFee: 0 }
+                      ]).map((gw) => {
+                        const isSelected = selectedPaymentMethod === gw.slug;
+                        return (
+                          <button
+                            key={gw.id}
+                            type="button"
+                            onClick={() => setSelectedPaymentMethod(gw.slug)}
+                            className={`p-2.5 rounded-xl border text-left text-xs transition-all ${
+                              isSelected
+                                ? 'bg-orange-600/20 border-orange-500 text-white ring-1 ring-orange-500'
+                                : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:border-slate-600'
+                            }`}
+                          >
+                            <div className="font-bold flex items-center justify-between">
+                              <span>
+                                {gw.slug === 'moncash' && 'MonCash'}
+                                {gw.slug === 'natcash' && 'NatCash'}
+                                {gw.slug === 'card' && 'Carte Visa/MC'}
+                                {gw.slug === 'wallet' && 'PlayUp Wallet'}
+                              </span>
+                              {isSelected && <Check className="w-3.5 h-3.5 text-orange-400" />}
+                            </div>
+                            <span className="text-[10px] text-slate-400 block mt-0.5">
+                              {gw.slug === 'wallet'
+                                ? (authUser ? `Solde: $${authUser.walletBalance.toFixed(2)}` : 'Connexion requise')
+                                : gw.slug === 'moncash'
+                                ? 'Digicel Mobile Money'
+                                : gw.slug === 'natcash'
+                                ? 'Natcom Mobile Money'
+                                : '3D Secure Instantané'}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Dynamic Gateway Form Inputs */}
+                  {(selectedPaymentMethod === 'moncash' || selectedPaymentMethod === 'natcash') && (
+                    <div className="p-3 bg-slate-800/90 border border-slate-700 rounded-xl space-y-2.5 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-orange-400">
+                          {selectedPaymentMethod === 'moncash' ? 'Passerelle Digicel MonCash' : 'Passerelle Natcom NatCash'}
+                        </span>
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono">
+                          API Sécurisée
+                        </span>
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 block mb-1">
+                          Numéro de téléphone {selectedPaymentMethod === 'moncash' ? 'MonCash' : 'NatCash'}
+                        </label>
+                        <input
+                          type="text"
+                          value={mobilePhone}
+                          onChange={(e) => setMobilePhone(e.target.value)}
+                          placeholder={selectedPaymentMethod === 'moncash' ? '+509 37XX-XXXX' : '+509 40XX-XXXX'}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 block mb-1">
+                          Code PIN / OTP de confirmation
+                        </label>
+                        <input
+                          type="password"
+                          value={mobileOtp}
+                          onChange={(e) => setMobileOtp(e.target.value)}
+                          placeholder="Code à 4 ou 6 chiffres"
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedPaymentMethod === 'card' && (
+                    <div className="p-3 bg-slate-800/90 border border-slate-700 rounded-xl space-y-2.5 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-orange-400">Carte de Crédit / Débit (Visa, Mastercard)</span>
+                        <Lock className="w-3.5 h-3.5 text-emerald-400" />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 block mb-1">Nom sur la carte</label>
+                        <input
+                          type="text"
+                          value={cardHolderName}
+                          onChange={(e) => setCardHolderName(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-slate-300 block mb-1">Numéro de carte</label>
+                        <input
+                          type="text"
+                          value={cardNumber}
+                          onChange={(e) => setCardNumber(e.target.value)}
+                          placeholder="4532 •••• •••• ••••"
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[11px] text-slate-300 block mb-1">Expiration (MM/YY)</label>
+                          <input
+                            type="text"
+                            value={cardExpiry}
+                            onChange={(e) => setCardExpiry(e.target.value)}
+                            placeholder="08/28"
+                            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] text-slate-300 block mb-1">CVC / CVV</label>
+                          <input
+                            type="password"
+                            value={cardCvc}
+                            onChange={(e) => setCardCvc(e.target.value)}
+                            placeholder="•••"
+                            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-white"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedPaymentMethod === 'wallet' && (
+                    <div className="p-3 bg-slate-800/90 border border-slate-700 rounded-xl text-xs space-y-1.5">
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-300">Solde PlayUp disponible :</span>
+                        <span className="font-mono font-bold text-emerald-400">
+                          ${authUser ? authUser.walletBalance.toFixed(2) : '0.00'} USD
+                        </span>
+                      </div>
+                      {!authUser && (
+                        <p className="text-[11px] text-amber-300">
+                          Veuillez vous connecter dans l’onglet « Profil » pour payer avec votre solde PlayUp Wallet.
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5 text-xs pt-1 border-t border-slate-800">
                     <div className="flex justify-between">
                       <span className="text-slate-400">Produit :</span>
                       <span className="font-semibold">{selectedGame.name} — {selectedPackage.name}</span>
@@ -690,12 +1389,21 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     {isOrdering ? (
                       <>
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Création commande PlayUp & GoXtop...</span>
+                        <span>Validation du paiement &amp; envoi GoXtop...</span>
                       </>
                     ) : (
                       <>
                         <CreditCard className="w-4 h-4" />
-                        <span>Payer ${selectedPackage.publicPrice.toFixed(2)} & Exécuter la commande</span>
+                        <span>
+                          Payer ${selectedPackage.publicPrice.toFixed(2)} via{' '}
+                          {selectedPaymentMethod === 'moncash'
+                            ? 'MonCash'
+                            : selectedPaymentMethod === 'natcash'
+                            ? 'NatCash'
+                            : selectedPaymentMethod === 'wallet'
+                            ? 'PlayUp Wallet'
+                            : 'Carte Bancaire'}
+                        </span>
                       </>
                     )}
                   </button>
@@ -783,21 +1491,40 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
                   {/* Recent Activity */}
                   <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
-                    <h4 className="text-xs font-bold text-slate-900 uppercase tracking-tight">
-                      Dernières Recharges effectuées
-                    </h4>
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-slate-900 uppercase tracking-tight">
+                        Dernières Recharges (Suivi Direct)
+                      </h4>
+                      <button
+                        onClick={() => setActiveTab('orders')}
+                        className="text-[11px] font-semibold text-orange-600"
+                      >
+                        Order Tracker →
+                      </button>
+                    </div>
                     <div className="space-y-2 text-xs">
                       {userOrders.slice(0, 3).map(o => (
-                        <div key={o.id} className="flex items-center justify-between py-1.5 border-b border-slate-50 last:border-0">
+                        <div
+                          key={o.id}
+                          onClick={() => handleOpenOrderTracker(o)}
+                          className="flex items-center justify-between py-2 px-2.5 rounded-xl hover:bg-slate-50 cursor-pointer border border-transparent hover:border-slate-200 transition-all"
+                        >
                           <div>
                             <span className="font-semibold text-slate-800">{o.gameName}</span>
-                            <span className="text-slate-400 text-[10px] block">{o.packageName}</span>
+                            <span className="text-slate-400 text-[10px] block">
+                              {o.packageName} · <span className="font-mono">{o.orderNumber}</span>
+                            </span>
                           </div>
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            o.status === 'completed' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'
-                          }`}>
-                            {o.status}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              o.status === 'completed' ? 'bg-emerald-100 text-emerald-800' :
+                              o.status === 'processing' ? 'bg-amber-100 text-amber-800' :
+                              o.status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-slate-100 text-slate-600'
+                            }`}>
+                              {o.status}
+                            </span>
+                            <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                          </div>
                         </div>
                       ))}
                       {userOrders.length === 0 && (
@@ -850,50 +1577,132 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 </div>
               )}
 
-              {/* TAB: COMMANDES */}
+              {/* TAB: COMMANDES & ORDER TRACKER */}
               {activeTab === 'orders' && (
-                <div className="space-y-3">
+                <div className="space-y-4">
+                  {/* Live Order Tracker Search Card */}
+                  <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-3 border border-slate-800 shadow-xs">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Activity className="w-4 h-4 text-orange-400" />
+                        <h3 className="text-xs font-bold uppercase tracking-wider text-white">
+                          Order Tracker — Suivi en Direct
+                        </h3>
+                      </div>
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-300 font-semibold">
+                        Polling Temps Réel
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      Recherchez une commande par N° PlayUp (<span className="font-mono text-slate-300">PLUP-...</span>) ou cliquez sur une commande ci-dessous pour afficher sa barre de progression en direct.
+                    </p>
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        handleOpenOrderTracker(trackerSearchQuery);
+                      }}
+                      className="flex gap-2"
+                    >
+                      <input
+                        type="text"
+                        value={trackerSearchQuery}
+                        onChange={(e) => {
+                          setTrackerSearchQuery(e.target.value);
+                          setTrackerLookupError(null);
+                        }}
+                        placeholder="Ex: PLUP-2026-84920 ou PTNR-..."
+                        className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-xs font-mono text-white placeholder:text-slate-500 focus:outline-none focus:border-orange-500"
+                      />
+                      <button
+                        type="submit"
+                        className="px-3.5 py-2 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-xl text-xs transition-colors shrink-0"
+                      >
+                        Suivre
+                      </button>
+                    </form>
+                    {trackerLookupError && (
+                      <div className="p-2.5 bg-red-500/20 border border-red-500/40 rounded-xl text-[11px] text-red-200">
+                        {trackerLookupError}
+                      </div>
+                    )}
+                  </div>
+
                   <div className="flex justify-between items-center">
                     <h3 className="text-xs font-bold text-slate-800 uppercase tracking-tight">
-                      Mes Commandes de Jeu
+                      Mes Commandes ({userOrders.length})
                     </h3>
-                    <button onClick={loadUserOrders} className="text-xs text-orange-600">
-                      Actualiser
+                    <button
+                      onClick={loadUserOrders}
+                      className="text-xs text-orange-600 font-semibold flex items-center gap-1"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${ordersLoading ? 'animate-spin' : ''}`} />
+                      <span>Actualiser</span>
                     </button>
                   </div>
 
                   <div className="space-y-2.5">
-                    {userOrders.map(order => (
-                      <div key={order.id} className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-2">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="font-mono font-bold text-slate-900">{order.orderNumber}</span>
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                            order.status === 'completed' ? 'bg-emerald-100 text-emerald-800' :
-                            order.status === 'processing' ? 'bg-amber-100 text-amber-800' :
-                            order.status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-slate-100 text-slate-800'
-                          }`}>
-                            {order.status}
-                          </span>
-                        </div>
+                    {userOrders.map(order => {
+                      const info = getOrderProgressInfo(order);
+                      const isInProgress = order.status === 'pending' || order.status === 'paid' || order.status === 'processing';
+                      return (
+                        <div
+                          key={order.id}
+                          onClick={() => handleOpenOrderTracker(order)}
+                          className="bg-white border border-slate-200 hover:border-orange-500 rounded-2xl p-3.5 space-y-2.5 cursor-pointer transition-all shadow-2xs"
+                        >
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-mono font-bold text-slate-900">{order.orderNumber}</span>
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                              order.status === 'completed' ? 'bg-emerald-100 text-emerald-800' :
+                              order.status === 'processing' ? 'bg-amber-100 text-amber-800' :
+                              order.status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-slate-100 text-slate-800'
+                            }`}>
+                              {order.status}
+                            </span>
+                          </div>
 
-                        <div className="text-xs">
-                          <span className="font-semibold text-slate-900">{order.gameName}</span> - {order.packageName}
-                        </div>
+                          <div className="text-xs">
+                            <span className="font-semibold text-slate-900">{order.gameName}</span> - {order.packageName}
+                          </div>
 
-                        <div className="text-[11px] text-slate-500 font-mono">
-                          {Object.entries(order.gameProfileData).map(([k, v]) => `${k}: ${v}`).join(' · ')}
-                        </div>
+                          <div className="text-[11px] text-slate-500 font-mono">
+                            {Object.entries(order.gameProfileData).map(([k, v]) => `${k}: ${v}`).join(' · ')}
+                          </div>
 
-                        <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
-                          <span className="text-slate-400 text-[10px]">
-                            {new Date(order.createdAt).toLocaleDateString()}
-                          </span>
-                          <span className="font-mono font-bold text-orange-600">
-                            ${order.chargedAmount.toFixed(2)}
-                          </span>
+                          {/* Real-time mini progress bar */}
+                          <div className="space-y-1 pt-0.5">
+                            <div className="flex items-center justify-between text-[10px]">
+                              <span className="text-slate-500 font-medium">{info.statusLabel}</span>
+                              <span className="font-mono font-bold text-slate-700">{info.progressPercent}%</span>
+                            </div>
+                            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full bg-gradient-to-r ${info.barColorClass} transition-all duration-500 ${
+                                  isInProgress ? 'animate-pulse' : ''
+                                }`}
+                                style={{ width: `${info.progressPercent}%` }}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
+                            <span className="text-slate-400 text-[10px] flex items-center gap-1">
+                              <Clock className="w-3 h-3" />
+                              <span>{new Date(order.createdAt).toLocaleDateString()}</span>
+                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono font-bold text-orange-600">
+                                ${order.chargedAmount.toFixed(2)}
+                              </span>
+                              <span className="text-[10px] font-bold text-orange-600 bg-orange-50 px-2 py-0.5 rounded-lg flex items-center gap-0.5">
+                                <span>Suivre</span>
+                                <ChevronRight className="w-3 h-3" />
+                              </span>
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                     {userOrders.length === 0 && (
                       <div className="text-center py-12 text-slate-400 text-xs">
                         Aucune commande effectuée pour le moment.
@@ -952,27 +1761,413 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 </div>
               )}
 
-              {/* TAB: PROFIL */}
+              {/* TAB: PROFIL & AUTHENTIFICATION COMPLÈTE */}
               {activeTab === 'profile' && (
                 <div className="space-y-4">
-                  <div className="bg-white border border-slate-200 rounded-2xl p-4 flex items-center gap-3">
-                    <div className="w-12 h-12 rounded-xl bg-orange-100 flex items-center justify-center text-orange-600 font-bold text-lg">
-                      G
+                  {authError && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-center justify-between">
+                      <span>{authError}</span>
+                      <button onClick={() => setAuthError(null)} className="text-red-500 font-bold">✕</button>
                     </div>
-                    <div>
-                      <h4 className="font-bold text-sm text-slate-900">Joueur PlayUp</h4>
-                      <p className="text-xs text-slate-500">Profil de jeu rapide actif</p>
+                  )}
+                  {authSuccess && (
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-center justify-between">
+                      <span>{authSuccess}</span>
+                      <button onClick={() => setAuthSuccess(null)} className="text-emerald-700 font-bold">✕</button>
                     </div>
-                  </div>
+                  )}
+
+                  {!authUser ? (
+                    <div className="bg-white border border-slate-200 rounded-2xl p-5 space-y-4 shadow-2xs text-xs">
+                      <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                        <div>
+                          <h3 className="font-display text-base font-bold text-slate-900">
+                            {authMode === 'login' && 'Connexion Compte PlayUp'}
+                            {authMode === 'register' && 'Créer un Compte PlayUp'}
+                            {authMode === 'forgot' && 'Réinitialiser le mot de passe'}
+                            {authMode === 'reset' && 'Validation du code de sécurité'}
+                          </h3>
+                          <p className="text-[11px] text-slate-500">
+                            Accédez à votre portefeuille PlayUp, votre historique et vos profils de jeu.
+                          </p>
+                        </div>
+                        <Lock className="w-5 h-5 text-orange-600 shrink-0" />
+                      </div>
+
+                      {/* Mode Switcher */}
+                      <div className="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-xl">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthMode('login');
+                            setAuthError(null);
+                          }}
+                          className={`py-2 rounded-lg font-bold transition-colors ${
+                            authMode === 'login' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'
+                          }`}
+                        >
+                          Se connecter
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthMode('register');
+                            setAuthError(null);
+                          }}
+                          className={`py-2 rounded-lg font-bold transition-colors ${
+                            authMode === 'register' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600'
+                          }`}
+                        >
+                          S’inscrire
+                        </button>
+                      </div>
+
+                      <form onSubmit={handleEmailAuth} className="space-y-3">
+                        {authMode === 'register' && (
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Nom complet / Pseudo</label>
+                            <input
+                              type="text"
+                              required
+                              value={authName}
+                              onChange={(e) => setAuthName(e.target.value)}
+                              placeholder="Ex: Robenson Pierre"
+                              className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+                            />
+                          </div>
+                        )}
+
+                        <div>
+                          <label className="font-semibold text-slate-700 block mb-1">Adresse Email</label>
+                          <input
+                            type="email"
+                            required
+                            value={authEmail}
+                            onChange={(e) => setAuthEmail(e.target.value)}
+                            placeholder="votre@email.com"
+                            className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+                          />
+                        </div>
+
+                        {authMode === 'register' && (
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Téléphone (MonCash / NatCash)</label>
+                            <input
+                              type="text"
+                              value={authPhone}
+                              onChange={(e) => setAuthPhone(e.target.value)}
+                              placeholder="+509 37XX-XXXX"
+                              className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono"
+                            />
+                          </div>
+                        )}
+
+                        {(authMode === 'login' || authMode === 'register') && (
+                          <div>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="font-semibold text-slate-700">Mot de passe</label>
+                              {authMode === 'login' && (
+                                <button
+                                  type="button"
+                                  onClick={() => setAuthMode('forgot')}
+                                  className="text-[11px] text-orange-600 font-semibold hover:underline"
+                                >
+                                  Mot de passe oublié ?
+                                </button>
+                              )}
+                            </div>
+                            <input
+                              type="password"
+                              required
+                              value={authPassword}
+                              onChange={(e) => setAuthPassword(e.target.value)}
+                              placeholder="••••••••"
+                              className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+                            />
+                          </div>
+                        )}
+
+                        {authMode === 'reset' && (
+                          <>
+                            <div>
+                              <label className="font-semibold text-slate-700 block mb-1">Code de réinitialisation (6 chiffres)</label>
+                              <input
+                                type="text"
+                                required
+                                value={resetCodeInput}
+                                onChange={(e) => setResetCodeInput(e.target.value)}
+                                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono font-bold"
+                              />
+                            </div>
+                            <div>
+                              <label className="font-semibold text-slate-700 block mb-1">Nouveau mot de passe</label>
+                              <input
+                                type="password"
+                                required
+                                value={newResetPassword}
+                                onChange={(e) => setNewResetPassword(e.target.value)}
+                                placeholder="Minimum 6 caractères"
+                                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+                              />
+                            </div>
+                          </>
+                        )}
+
+                        <button
+                          type="submit"
+                          disabled={authLoading}
+                          className="w-full py-2.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white font-bold rounded-xl shadow-xs transition-colors"
+                        >
+                          {authLoading
+                            ? 'Traitement sécurisé...'
+                            : authMode === 'login'
+                            ? 'Se connecter'
+                            : authMode === 'register'
+                            ? 'Créer mon compte'
+                            : authMode === 'forgot'
+                            ? 'Recevoir le code de réinitialisation'
+                            : 'Valider le nouveau mot de passe'}
+                        </button>
+                      </form>
+
+                      {/* Social Logins */}
+                      <div className="pt-3 border-t border-slate-100 space-y-2">
+                        <span className="text-[11px] text-slate-400 text-center block">Ou continuer avec</span>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            disabled={authLoading}
+                            onClick={handleGoogleSignIn}
+                            className="py-2 px-3 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl font-semibold text-slate-800 flex items-center justify-center gap-1.5"
+                          >
+                            <span>Google</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={authLoading}
+                            onClick={handleFacebookQuickLogin}
+                            className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-semibold flex items-center justify-center gap-1.5"
+                          >
+                            <span>Facebook</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Authenticated User Header & Wallet Card */}
+                      <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className="w-11 h-11 rounded-xl bg-orange-600 flex items-center justify-center text-white font-bold text-base">
+                              {authUser.name.charAt(0).toUpperCase()}
+                            </div>
+                            <div>
+                              <h4 className="font-bold text-sm text-white">{authUser.name}</h4>
+                              <p className="text-[11px] text-slate-400">{authUser.email}</p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              signOutFirebase().catch(() => {});
+                              safeStorage.removeItem('playup_user_token');
+                              safeStorage.removeItem('playup_user_profile');
+                              setAuthUser(null);
+                              setUserToken('');
+                            }}
+                            className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800"
+                            title="Déconnexion"
+                          >
+                            <LogOut className="w-4 h-4" />
+                          </button>
+                        </div>
+
+                        <div className="p-3 bg-slate-800/90 border border-slate-700 rounded-xl flex items-center justify-between">
+                          <div>
+                            <span className="text-[10px] uppercase tracking-wider text-slate-400 block">
+                              Solde PlayUp Wallet
+                            </span>
+                            <span className="font-mono text-lg font-extrabold text-orange-400">
+                              ${authUser.walletBalance.toFixed(2)} {authUser.preferredCurrency || 'USD'}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setShowWalletTopUp(!showWalletTopUp)}
+                            className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-xs font-bold transition-colors"
+                          >
+                            + Recharger
+                          </button>
+                        </div>
+
+                        {/* Wallet Top-Up Drawer */}
+                        {showWalletTopUp && (
+                          <form onSubmit={handleWalletTopUpSubmit} className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl space-y-2.5 text-xs">
+                            <div className="font-bold text-orange-400">Recharger mon PlayUp Wallet</div>
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <label className="text-[11px] text-slate-400 block mb-1">Montant (USD)</label>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  step="1"
+                                  value={topUpAmount}
+                                  onChange={(e) => setTopUpAmount(e.target.value)}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 font-mono text-white"
+                                />
+                              </div>
+                              <div>
+                                <label className="text-[11px] text-slate-400 block mb-1">Passerelle</label>
+                                <select
+                                  value={topUpMethod}
+                                  onChange={(e) => setTopUpMethod(e.target.value as PaymentMethodType)}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+                                >
+                                  <option value="moncash">MonCash (Digicel)</option>
+                                  <option value="natcash">NatCash (Natcom)</option>
+                                  <option value="card">Carte Bancaire</option>
+                                </select>
+                              </div>
+                            </div>
+                            <button
+                              type="submit"
+                              disabled={topUpProcessing}
+                              className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg"
+                            >
+                              {topUpProcessing ? 'Traitement en cours...' : `Créditer $${topUpAmount} via ${topUpMethod.toUpperCase()}`}
+                            </button>
+                          </form>
+                        )}
+                      </div>
+
+                      {/* Account & Security Settings Form */}
+                      <form onSubmit={handleUpdateAccountSettings} className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3 text-xs">
+                        <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                          <span className="font-bold text-slate-900 uppercase tracking-tight">
+                            Paramètres du Compte &amp; Sécurité
+                          </span>
+                          <Settings className="w-4 h-4 text-slate-400" />
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Nom d’affichage</label>
+                            <input
+                              type="text"
+                              value={profileName}
+                              onChange={(e) => setProfileName(e.target.value)}
+                              className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5"
+                            />
+                          </div>
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Téléphone MonCash / NatCash</label>
+                            <input
+                              type="text"
+                              value={profilePhone}
+                              onChange={(e) => setProfilePhone(e.target.value)}
+                              className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5 font-mono"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2.5">
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Devise préférée</label>
+                            <select
+                              value={profileCurrency}
+                              onChange={(e) => setProfileCurrency(e.target.value as 'USD' | 'HTG' | 'EUR')}
+                              className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5"
+                            >
+                              <option value="USD">USD ($)</option>
+                              <option value="HTG">HTG (Gourdes)</option>
+                              <option value="EUR">EUR (€)</option>
+                            </select>
+                          </div>
+                          <div className="flex flex-col justify-end space-y-1">
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={profileTwoFactor}
+                                onChange={(e) => setProfileTwoFactor(e.target.checked)}
+                                className="rounded text-orange-600"
+                              />
+                              <span className="text-[11px] font-semibold text-slate-700">Double Auth (2FA)</span>
+                            </label>
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={profileEmailNotifs}
+                                onChange={(e) => setProfileEmailNotifs(e.target.checked)}
+                                className="rounded text-orange-600"
+                              />
+                              <span className="text-[11px] font-semibold text-slate-700">Alertes Email</span>
+                            </label>
+                          </div>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <input
+                            type="password"
+                            value={currentPasswordInput}
+                            onChange={(e) => setCurrentPasswordInput(e.target.value)}
+                            placeholder="Mot de passe actuel (si changement)"
+                            className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5"
+                          />
+                          <input
+                            type="password"
+                            value={newPasswordInput}
+                            onChange={(e) => setNewPasswordInput(e.target.value)}
+                            placeholder="Nouveau mot de passe"
+                            className="w-full border border-slate-300 rounded-lg px-2.5 py-1.5"
+                          />
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={profileSaving}
+                          className="w-full py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl transition-colors"
+                        >
+                          {profileSaving ? 'Enregistrement...' : 'Enregistrer mes paramètres'}
+                        </button>
+                      </form>
+
+                      {/* Payment Transactions History */}
+                      <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-2.5 text-xs">
+                        <h4 className="font-bold text-slate-900 uppercase tracking-tight">
+                          Historique des Transactions de Paiement
+                        </h4>
+                        <div className="space-y-2">
+                          {userPaymentTransactions.slice(0, 5).map(tx => (
+                            <div key={tx.id} className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between">
+                              <div>
+                                <div className="font-mono font-bold text-slate-900 text-[11px]">{tx.transactionReference}</div>
+                                <div className="text-[10px] text-slate-500">
+                                  {tx.paymentMethod.toUpperCase()} · {tx.payerIdentifier || 'Validé'}
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <span className="font-mono font-bold text-emerald-700 block">
+                                  ${tx.totalCharged.toFixed(2)}
+                                </span>
+                                <span className="text-[10px] text-slate-400">
+                                  {new Date(tx.createdAt).toLocaleDateString()}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                          {userPaymentTransactions.length === 0 && (
+                            <p className="text-[11px] text-slate-400">Aucune transaction enregistrée.</p>
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  )}
 
                   <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
                     <h4 className="font-bold text-xs text-slate-900 uppercase tracking-tight">
-                      Mes Profils Enregistrés (1-Click Reorder)
+                      Mes Profils de Jeu Enregistrés (1-Click Reorder)
                     </h4>
-                    <p className="text-[11px] text-slate-500">
-                      Vos identifiants de jeu enregistrés pour recharger en un seul clic sans avoir à retaper votre ID.
-                    </p>
-
                     <div className="space-y-2">
                       {savedProfiles.map(prof => (
                         <div key={prof.id} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs flex items-center justify-between">

@@ -294,23 +294,23 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
   };
 
   const getRegionBadge = (region: string) => {
-    const r = region.toLowerCase();
+    const r = (region || '').toLowerCase();
     if (r === 'brazil' || r === 'br') return '🇧🇷 Brazil';
     if (r === 'usa' || r === 'us') return '🇺🇸 USA';
     if (r === 'global') return '🌐 Global';
-    return `🌍 ${region}`;
+    return `🌍 ${region || 'Global'}`;
   };
 
   const filteredProducts = products.filter(p => {
-    if (regionFilter !== 'all' && p.region.toLowerCase() !== regionFilter.toLowerCase()) return false;
-    if (gameFilter !== 'all' && p.game.toLowerCase() !== gameFilter.toLowerCase()) return false;
+    if (regionFilter !== 'all' && (p.region || '').toLowerCase() !== (regionFilter || '').toLowerCase()) return false;
+    if (gameFilter !== 'all' && (p.game || '').toLowerCase() !== (gameFilter || '').toLowerCase()) return false;
     if (catalogSearch.trim()) {
       const q = catalogSearch.toLowerCase();
       return (
-        p.product_key.toLowerCase().includes(q) ||
-        p.name.toLowerCase().includes(q) ||
-        p.game.toLowerCase().includes(q) ||
-        p.region.toLowerCase().includes(q)
+        (p.product_key || '').toLowerCase().includes(q) ||
+        (p.name || '').toLowerCase().includes(q) ||
+        (p.game || '').toLowerCase().includes(q) ||
+        (p.region || '').toLowerCase().includes(q)
       );
     }
     return true;

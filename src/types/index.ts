@@ -34,6 +34,8 @@ export interface ConnectionTestResult {
   authHeadersUsed?: Record<string, string>;
   gamesCountDetected?: number;
   productsCountDetected?: number;
+  walletBalance?: number;
+  walletCurrency?: string;
   responseSnippet?: string;
 }
 
@@ -42,8 +44,8 @@ export interface ProviderEndpointsConfig {
   getProductsPath: string;      // Documented: GET /api/v.1/products/{game}
   createOrderPath: string;      // Documented: POST /api/v.1/create
   orderStatusPath: string;      // Documented: GET /api/v.1/:partner_orderid
-  trackOrderPath: string;       // Documented: POST /api/v.1/:id/track
-  checkPlayerPath: string;      // Name Checker endpoint (configurable / REQUIRES GOXTOP DOCUMENTATION if not set)
+  trackOrderPath: string;       // Documented: POST /api/v.1/:partner_orderid/track
+  checkPlayerPath: string;      // Documented: GET /api/check/game-check
 }
 
 export interface ProviderCustomParam {
@@ -125,13 +127,16 @@ export interface ProviderWebhookLog {
   partnerOrderId?: string;
   goxtopOrderId?: string;
   receivedStatus?: string;
+  statusReceived?: string;
+  processingResult?: string;
   httpStatus: number;
   latencyMs?: number;
   signatureDetected: boolean; // Oui / Non
+  signatureHeader?: string;
   signatureHeaderName?: string;
   signatureValueMasked?: string;
   computedHmacPreview?: string;
-  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable';
+  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Échouée' | 'Invalide' | 'Non applicable';
   rawPayload?: string;
   headersReceived?: Record<string, string>;
   processingSteps?: string[];
@@ -153,7 +158,7 @@ export interface WebhookTestResult {
   signatureHeaderName?: string;
   signatureValueMasked?: string;
   computedHmacPreview?: string;
-  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Invalide' | 'Non applicable';
+  hmacValidation: 'Validée' | 'Valide' | 'Échec' | 'Échouée' | 'Invalide' | 'Non applicable';
   processingSteps?: string[];
   backendResponse?: any;
   details: string;
@@ -163,9 +168,16 @@ export interface WebhookTestResult {
 export interface ProviderOrder {
   id: string;
   playup_order_id: string;
-  provider: string;
+  provider?: string;
+  provider_name?: string;
   provider_order_id: string;
   partner_order_id: string;
+  game_code?: string;
+  product_id?: string;
+  player_data?: any;
+  cost_price?: number;
+  selling_price?: number;
+  profit?: number;
   request_payload: any;   // Secured / sanitized payload
   response_payload: any;  // Secured / sanitized payload
   status: OrderStatus;
@@ -179,7 +191,8 @@ export interface ProviderApiLog {
   providerId: string;
   providerName: string;
   timestamp: string;
-  requestType:
+  actionType?: string;
+  requestType?:
     | 'TEST_CONNECTION'
     | 'GET_GAMES'
     | 'GET_PRODUCTS'
@@ -205,7 +218,18 @@ export interface ProviderApiLog {
 export interface PlayerCheckResult {
   supported: boolean;
   verified: boolean;
+  status?: string;
   playerName?: string;
+  playerId?: string;
+  region?: string;
+  detectedRegion?: string;
+  provider?: string;
+  game?: string;
+  code?: string;
+  httpStatus?: number | null;
+  endpointCalled?: string;
+  ipDetected?: string;
+  rawResponse?: any;
   requiresDocumentation?: boolean;
   message: string;
 }

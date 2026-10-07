@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { db, ProviderSecretRecord } from '../db';
 import { 
-  Provider, ConnectionTestResult, Order, PlayerCheckResult, OrderStatus 
+  Provider, ConnectionTestResult, Order, PlayerCheckResult, OrderStatus, GameField 
 } from '../../src/types';
 import { WebhookEngine } from '../webhookEngine';
 
@@ -35,10 +35,453 @@ export interface ProviderOrderDispatchResult {
   accepted: boolean;
   status: OrderStatus;
   externalOrderId?: string;
+  verifiedPlayerName?: string;
   httpStatus: number | null;
   latencyMs: number;
   rawResponse: any;
   errorMessage?: string;
+}
+
+export interface GoXtopNameCheckGameSpec {
+  code: string;               // Official code in GoXtop GET /api/check/games
+  name: string;
+  zone?: boolean;             // Requires server_code (Zone ID / Server ID)
+  zoneOptional?: boolean;
+  zoneValues?: string[];      // Allowed server_code values
+  regions?: string[];         // Allowed region values (e.g. ['global', 'mysg', 'bd', 'id', 'vn'])
+  defaultRegion?: string;
+  idFieldLabel?: string;
+  idPlaceholder?: string;
+}
+
+/**
+ * Official GoXtop Name Checker Catalog Specification (from GET https://goxtop.com/api/check/games)
+ * Maps GoXtop gamecode / slug to exact parameters required by GET /api/check/game-check
+ */
+export const GOXTOP_OFFICIAL_CHECK_SPECS: Record<string, GoXtopNameCheckGameSpec> = {
+  'free-fire': {
+    code: 'free-fire',
+    name: 'Free Fire',
+    regions: ['global', 'mysg', 'bd', 'id', 'vn'],
+    defaultRegion: 'global',
+    idFieldLabel: 'Free Fire ID',
+    idPlaceholder: '16777227705'
+  },
+  'mobile-legends': {
+    code: 'mobile-legends',
+    name: 'Mobile Legends',
+    zone: true,
+    idFieldLabel: 'Player ID (User ID)',
+    idPlaceholder: '2009663813'
+  },
+  'mobile-legends-adventure': {
+    code: 'mobile-legends-adventure',
+    name: 'Mobile Legends: Adventure',
+    zone: true,
+    idFieldLabel: 'Player ID (User ID)',
+    idPlaceholder: '12345678'
+  },
+  'pubg': {
+    code: 'pubg',
+    name: 'PUBG Mobile',
+    idFieldLabel: 'Character ID (PUBG ID)',
+    idPlaceholder: '5123984712'
+  },
+  'call-of-duty-mobile': {
+    code: 'call-of-duty-mobile',
+    name: 'Call of Duty: Mobile',
+    idFieldLabel: 'Call of Duty Mobile ID',
+    idPlaceholder: '68192309123849102'
+  },
+  '8-ball-pool': {
+    code: '8-ball-pool',
+    name: '8 Ball Pool',
+    idFieldLabel: '8 Ball Pool Unique ID',
+    idPlaceholder: '1234567890'
+  },
+  'ace-racer': {
+    code: 'ace-racer',
+    name: 'Ace Racer',
+    zone: true
+  },
+  'arena-breakout': {
+    code: 'arena-breakout',
+    name: 'Arena Breakout',
+    idFieldLabel: 'Arena Breakout Player ID',
+    idPlaceholder: '1234567890'
+  },
+  'arena-of-valor': {
+    code: 'arena-of-valor',
+    name: 'Arena of Valor'
+  },
+  'asphalt-9-legends': {
+    code: 'asphalt-9-legends',
+    name: 'Asphalt 9: Legends'
+  },
+  'bigo': {
+    code: 'bigo',
+    name: 'Bigo Live'
+  },
+  'blood-strike': {
+    code: 'blood-strike',
+    name: 'Blood Strike',
+    idFieldLabel: 'Blood Strike Account ID',
+    idPlaceholder: '586013280424'
+  },
+  'brawl-stars': {
+    code: 'brawl-stars',
+    name: 'Brawl Stars'
+  },
+  'chamet': {
+    code: 'chamet',
+    name: 'Chamet'
+  },
+  'clash-of-clans': {
+    code: 'clash-of-clans',
+    name: 'Clash of Clans'
+  },
+  'clash-royale': {
+    code: 'clash-royale',
+    name: 'Clash Royale'
+  },
+  'football-master-2': {
+    code: 'football-master-2',
+    name: 'Football Master 2'
+  },
+  'genshin-impact': {
+    code: 'genshin-impact',
+    name: 'Genshin Impact',
+    zoneOptional: true,
+    regions: ['global', 'br', 'kh', 'id', 'my', 'ph', 'kr', 'th', 'us', 'eu', 'latam']
+  },
+  'hago': {
+    code: 'hago',
+    name: 'Hago'
+  },
+  'hayday': {
+    code: 'hayday',
+    name: 'Hay Day'
+  },
+  'honkai-impact-3': {
+    code: 'honkai-impact-3',
+    name: 'Honkai Impact 3rd'
+  },
+  'honkai-star-rail': {
+    code: 'honkai-star-rail',
+    name: 'Honkai: Star Rail',
+    zone: true,
+    zoneValues: ['america', 'europe', 'THM']
+  },
+  'honor-of-kings': {
+    code: 'honor-of-kings',
+    name: 'Honor of Kings'
+  },
+  'identity-v': {
+    code: 'identity-v',
+    name: 'Identity V'
+  },
+  'league-of-legends-wild-rift': {
+    code: 'league-of-legends-wild-rift',
+    name: 'League of Legends: Wild Rift'
+  },
+  'lifeafter': {
+    code: 'lifeafter',
+    name: 'LifeAfter'
+  },
+  'magic-chess-gogo': {
+    code: 'magic-chess-gogo',
+    name: 'Magic Chess: Go Go',
+    zone: true
+  },
+  'marvel-rivals': {
+    code: 'marvel-rivals',
+    name: 'Marvel Rivals'
+  },
+  'nimo': {
+    code: 'nimo',
+    name: 'Nimo TV'
+  },
+  'point-blank': {
+    code: 'point-blank',
+    name: 'Point Blank'
+  },
+  'punishing-gray-raven': {
+    code: 'punishing-gray-raven',
+    name: 'Punishing: Gray Raven'
+  },
+  'rainbow-six-mobile': {
+    code: 'rainbow-six-mobile',
+    name: 'Rainbow Six Mobile'
+  },
+  'sausage-man': {
+    code: 'sausage-man',
+    name: 'Sausage Man'
+  },
+  'super-sus': {
+    code: 'super-sus',
+    name: 'Super Sus'
+  },
+  'sword-of-justice': {
+    code: 'sword-of-justice',
+    name: 'Sword of Justice',
+    zone: true,
+    zoneValues: ['ea', 'na', 'sea']
+  },
+  'teen-patti-gold': {
+    code: 'teen-patti-gold',
+    name: 'Teen Patti Gold'
+  },
+  'tomb-busters': {
+    code: 'tomb-busters',
+    name: 'Tomb Busters'
+  },
+  'valo': {
+    code: 'valo',
+    name: 'Valorant'
+  },
+  'where-winds-meet': {
+    code: 'where-winds-meet',
+    name: 'Where Winds Meet'
+  },
+  'wuthering-waves': {
+    code: 'wuthering-waves',
+    name: 'Wuthering Waves'
+  },
+  'zenless-zone-zero': {
+    code: 'zenless-zone-zero',
+    name: 'Zenless Zone Zero'
+  },
+  'zepeto': {
+    code: 'zepeto',
+    name: 'ZEPETO'
+  }
+};
+
+/**
+ * Resolves any GoXtop gamecode (from GET /api/v.1/games) or PlayUp game slug to its documented
+ * GoXtop Name Checker specification (from GET /api/check/games).
+ * Returns null if the game is not documented in GoXtop's /api/check/games table.
+ */
+export function resolveGoXtopNameCheckSpec(gameCodeOrSlug: string): GoXtopNameCheckGameSpec | null {
+  const clean = (gameCodeOrSlug || '').trim().toLowerCase();
+  if (!clean) return null;
+
+  // Exclude PIN / voucher games that do not use a Player ID
+  if (clean.includes('pin') || clean.includes('voucher') || clean.includes('gift-card')) {
+    return null;
+  }
+
+  if (GOXTOP_OFFICIAL_CHECK_SPECS[clean]) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS[clean];
+  }
+
+  const hyphenated = clean.replace(/_/g, '-');
+  if (GOXTOP_OFFICIAL_CHECK_SPECS[hyphenated]) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS[hyphenated];
+  }
+
+  // Free Fire regional & global gamecodes in GoXtop
+  if (clean.startsWith('freefire') || clean.startsWith('free-fire') || clean === 'game_ff') {
+    let defaultRegion = 'global';
+    if (clean.endsWith('_bd') || clean.endsWith('-bd')) defaultRegion = 'bd';
+    else if (clean.endsWith('_id') || clean.endsWith('-id')) defaultRegion = 'id';
+    else if (clean.endsWith('_vn') || clean.endsWith('-vn')) defaultRegion = 'vn';
+    else if (clean.endsWith('_sgmy') || clean.endsWith('_sg') || clean.endsWith('_kh') || clean.endsWith('-sgmy') || clean.endsWith('-sg')) {
+      defaultRegion = 'mysg';
+    }
+    return {
+      ...GOXTOP_OFFICIAL_CHECK_SPECS['free-fire'],
+      defaultRegion
+    };
+  }
+
+  // Mobile Legends gamecodes in GoXtop
+  if (clean.includes('mlbb') || clean.includes('mobile_legends') || clean.includes('mobile-legends')) {
+    if (clean.includes('adventure') || clean === 'mla') {
+      return GOXTOP_OFFICIAL_CHECK_SPECS['mobile-legends-adventure'];
+    }
+    return GOXTOP_OFFICIAL_CHECK_SPECS['mobile-legends'];
+  }
+
+  // PUBG Mobile gamecodes
+  if (clean.startsWith('pubg') || clean === 'game_pubg') {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['pubg'];
+  }
+
+  // Call of Duty Mobile gamecodes
+  if (clean.startsWith('codm') || clean.startsWith('cod_mobile') || clean.startsWith('cod-mobile') || clean === 'game_codm') {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['call-of-duty-mobile'];
+  }
+
+  // Arena Breakout
+  if (clean.startsWith('arena_breakout') || clean.startsWith('arena-breakout')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['arena-breakout'];
+  }
+
+  // Arena of Valor
+  if (clean === 'aove' || clean.startsWith('aov_') || clean.startsWith('arena_of_valor')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['arena-of-valor'];
+  }
+
+  // Blood Strike
+  if (clean.startsWith('blood_strike') || clean.startsWith('blood-strike')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['blood-strike'];
+  }
+
+  // Genshin Impact
+  if (clean.startsWith('genshin')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['genshin-impact'];
+  }
+
+  // Honkai Star Rail & Honkai Impact 3
+  if (clean === 'hsr' || clean.startsWith('honkai_star_rail') || clean.startsWith('honkai-star-rail')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['honkai-star-rail'];
+  }
+  if (clean === 'honkai' || clean.startsWith('honkai_impact')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['honkai-impact-3'];
+  }
+
+  // Honor of Kings
+  if (clean === 'hok' || clean.startsWith('honor_of_kings')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['honor-of-kings'];
+  }
+
+  // Wild Rift
+  if (clean.startsWith('wild_rift') || clean.startsWith('wild-rift')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['league-of-legends-wild-rift'];
+  }
+
+  // Magic Chess Go Go
+  if (clean === 'mcgg' || clean.startsWith('magic_chess')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['magic-chess-gogo'];
+  }
+
+  // Punishing Gray Raven
+  if (clean === 'pgr' || clean.startsWith('punishing')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['punishing-gray-raven'];
+  }
+
+  // Rainbow Six Mobile
+  if (clean === 'rsm' || clean.startsWith('rsm_') || clean.startsWith('rainbow_six')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['rainbow-six-mobile'];
+  }
+
+  // Sword of Justice
+  if (clean.startsWith('swordofjustice') || clean.startsWith('sword_of_justice')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['sword-of-justice'];
+  }
+
+  // Valorant
+  if (clean.startsWith('valorant') || clean === 'valo') {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['valo'];
+  }
+
+  // Where Winds Meet
+  if (clean === 'wwm' || clean.startsWith('where_winds_meet')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['where-winds-meet'];
+  }
+
+  // Wuthering Waves
+  if (clean === 'wuwa' || clean.startsWith('wuthering')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['wuthering-waves'];
+  }
+
+  // Zenless Zone Zero
+  if (clean === 'zzz' || clean.startsWith('zenless')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['zenless-zone-zero'];
+  }
+
+  // Bigo Live
+  if (clean.startsWith('bigo')) {
+    return GOXTOP_OFFICIAL_CHECK_SPECS['bigo'];
+  }
+
+  return null;
+}
+
+/**
+ * Builds dynamic GameField[] for a game based on its GoXtop Name Checker & Product requirements
+ */
+export function buildDynamicFieldsForGoXtopGame(
+  gameCode: string,
+  gameName: string,
+  requiresServerIdFromProducts = false
+): GameField[] {
+  const spec = resolveGoXtopNameCheckSpec(gameCode);
+  const cleanCode = gameCode.toLowerCase();
+
+  if (cleanCode.includes('pin') || cleanCode.includes('voucher') || cleanCode.includes('gift-card')) {
+    return [];
+  }
+
+  const fields: GameField[] = [];
+
+  if (cleanCode.startsWith('freefire') || cleanCode.startsWith('free-fire')) {
+    fields.push({
+      id: `f_${gameCode}_uid`,
+      name: 'playerId',
+      label: 'Free Fire ID',
+      placeholder: '16777227705',
+      type: 'text',
+      required: true,
+      helperText: 'Saisissez votre Free Fire ID (ex: 16777227705) puis cliquez sur "Vérifier l’ID".',
+      validationRegex: '^[0-9]{5,16}$'
+    });
+    return fields;
+  }
+
+  if (spec?.code === 'pubg') {
+    fields.push({
+      id: `f_${gameCode}_uid`,
+      name: 'characterId',
+      label: 'Character ID (PUBG ID)',
+      placeholder: spec.idPlaceholder || '5123984712',
+      type: 'text',
+      required: true,
+      helperText: 'Votre Character ID numérique PUBG Mobile.',
+      validationRegex: '^[0-9]{5,16}$'
+    });
+    return fields;
+  }
+
+  fields.push({
+    id: `f_${gameCode}_uid`,
+    name: 'playerId',
+    label: spec?.idFieldLabel || `${gameName} ID (User ID)`,
+    placeholder: spec?.idPlaceholder || 'Entrez votre Player ID',
+    type: 'text',
+    required: true,
+    helperText: spec
+      ? `Identifiant joueur requis par GoXtop (${spec.code}). Cliquez sur "Vérifier l’ID" avant de commander.`
+      : `Identifiant joueur requis pour ${gameName}.`
+  });
+
+  if (spec?.zone || requiresServerIdFromProducts) {
+    if (spec?.zoneValues && spec.zoneValues.length > 0) {
+      fields.push({
+        id: `f_${gameCode}_zone`,
+        name: 'zoneId',
+        label: 'Server / Zone',
+        placeholder: spec.zoneValues[0],
+        type: 'select',
+        options: spec.zoneValues,
+        required: true,
+        helperText: `Serveur requis (${spec.zoneValues.join(', ')})`
+      });
+    } else {
+      fields.push({
+        id: `f_${gameCode}_zone`,
+        name: spec?.code?.includes('mobile-legends') ? 'zoneId' : 'serverId',
+        label: spec?.code?.includes('mobile-legends') ? 'Zone ID (Server Code)' : 'Server ID / Zone ID',
+        placeholder: spec?.code?.includes('mobile-legends') ? 'ex: 6104' : 'Entrez votre Server / Zone ID',
+        type: 'text',
+        required: true,
+        helperText: 'Identifiant de serveur / zone requis pour ce service.'
+      });
+    }
+  }
+
+  return fields;
 }
 
 /**
@@ -48,10 +491,10 @@ export interface ProviderOrderDispatchResult {
 export interface IGameServiceProvider {
   getGames(): Promise<ProviderSyncResponse>;
   getProducts(gameCode?: string): Promise<ProviderSyncResponse>;
-  checkPlayer(gameCode: string, playerData: Record<string, string>): Promise<PlayerCheckResult>;
+  checkPlayer(gameCode: string, playerData: Record<string, string>, clientIp?: string): Promise<PlayerCheckResult>;
   createOrder(order: Order, webhookCallbackUrl: string): Promise<ProviderOrderDispatchResult>;
-  getOrderStatus(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; raw?: any; message?: string }>;
-  trackOrder(providerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; raw?: any; message?: string }>;
+  getOrderStatus(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; verifiedPlayerName?: string; raw?: any; message?: string }>;
+  trackOrder(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; raw?: any; message?: string }>;
   handleWebhook(rawBody: string, headers: Record<string, any>, payload: any): Promise<{ httpCode: number; body: any }>;
   testConnection(): Promise<ConnectionTestResult>;
 }
@@ -67,10 +510,10 @@ export abstract class BaseProvider implements IGameServiceProvider {
 
   public abstract getGames(): Promise<ProviderSyncResponse>;
   public abstract getProducts(gameCode?: string): Promise<ProviderSyncResponse>;
-  public abstract checkPlayer(gameCode: string, playerData: Record<string, string>): Promise<PlayerCheckResult>;
+  public abstract checkPlayer(gameCode: string, playerData: Record<string, string>, clientIp?: string): Promise<PlayerCheckResult>;
   public abstract createOrder(order: Order, webhookCallbackUrl: string): Promise<ProviderOrderDispatchResult>;
-  public abstract getOrderStatus(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; raw?: any; message?: string }>;
-  public abstract trackOrder(providerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; raw?: any; message?: string }>;
+  public abstract getOrderStatus(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; verifiedPlayerName?: string; raw?: any; message?: string }>;
+  public abstract trackOrder(partnerOrderId: string): Promise<{ success: boolean; status?: OrderStatus; providerOrderId?: string; raw?: any; message?: string }>;
   public abstract handleWebhook(rawBody: string, headers: Record<string, any>, payload: any): Promise<{ httpCode: number; body: any }>;
   public abstract testConnection(): Promise<ConnectionTestResult>;
 
@@ -88,13 +531,13 @@ export abstract class BaseProvider implements IGameServiceProvider {
       return resolvedPath;
     }
     // Prevent duplicate /api/v.1/api/v.1 if base URL already includes /api/v.1
-    if (base.endsWith('/api/v.1') && resolvedPath.startsWith('/api/v.1')) {
+    if (base.endsWith('/api/v.1') && (resolvedPath.startsWith('/api/v.1') || resolvedPath.startsWith('/api/check'))) {
       base = base.slice(0, -'/api/v.1'.length);
     }
     return `${base}${resolvedPath.startsWith('/') ? '' : '/'}${resolvedPath}`;
   }
 
-  protected buildHeaders(): Record<string, string> {
+  protected buildHeaders(extraHeaders?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
@@ -108,6 +551,11 @@ export abstract class BaseProvider implements IGameServiceProvider {
     const secretVal = (this.secrets.webhookSecret || process.env.GOXTOP_API_KEY_SECRET || '').trim();
     if (secretVal) {
       headers['x-api-secret'] = secretVal;
+    }
+    if (extraHeaders) {
+      for (const [k, v] of Object.entries(extraHeaders)) {
+        if (v) headers[k] = v;
+      }
     }
 
     return headers;
@@ -128,16 +576,25 @@ export abstract class BaseProvider implements IGameServiceProvider {
   }
 
   /**
-   * Detects any signature header sent in the HTTP request without inventing a hardcoded header name,
-   * and verifies HMAC-SHA256 on the exact unmodified rawBody when a Webhook Secret is configured.
-   * If GoXtop does not provide/configure a Webhook Secret, does NOT block the webhook (returns 'Non applicable').
+   * Verifies GoXtop Webhook HMAC-SHA256 signature.
+   * Official GoXtop format:
+   *   Headers: X-Webhook-Timestamp, X-Webhook-Signature
+   *   signature = hex(hmac_sha256(YOUR_SECRET_KEY, timestamp + "." + raw_request_body))
+   * Also supports direct HMAC-SHA256 on raw_request_body for internal diagnostics.
    */
   public verifyWebhookSignature(rawBody: string, headers: Record<string, any> = {}): WebhookSignatureCheckResult {
     const secret = this.secrets.webhookSecret?.trim();
 
-    // Detect signature header from actual request headers (or configured header name if provided by official docs)
     let detectedHeaderName: string | undefined;
     let signatureValue: string | undefined;
+    let timestampValue: string | undefined;
+
+    for (const [k, v] of Object.entries(headers)) {
+      const lowerKey = k.toLowerCase();
+      if (lowerKey === 'x-webhook-timestamp' || lowerKey === 'webhook-timestamp') {
+        timestampValue = Array.isArray(v) ? v[0] : String(v);
+      }
+    }
 
     const configuredHeader = this.provider.webhookSignatureHeaderName?.trim().toLowerCase();
     if (configuredHeader && headers[configuredHeader]) {
@@ -146,7 +603,7 @@ export abstract class BaseProvider implements IGameServiceProvider {
     } else {
       for (const [k, v] of Object.entries(headers)) {
         const lowerKey = k.toLowerCase();
-        if (lowerKey.includes('signature') || lowerKey.includes('hmac')) {
+        if (lowerKey === 'x-webhook-signature' || lowerKey.includes('signature') || lowerKey.includes('hmac')) {
           detectedHeaderName = k;
           signatureValue = Array.isArray(v) ? v[0] : String(v);
           break;
@@ -155,12 +612,11 @@ export abstract class BaseProvider implements IGameServiceProvider {
     }
 
     const signatureDetected = Boolean(signatureValue && signatureValue.trim().length > 0);
-    const cleanSig = signatureValue ? signatureValue.replace(/^(sha256=|hmac-sha256=)/i, '').trim() : '';
+    const cleanSig = signatureValue ? signatureValue.replace(/^(sha256=|hmac-sha256=|v1,)/i, '').trim() : '';
     const signatureValueMasked = cleanSig
       ? (cleanSig.length > 16 ? `sha256=${cleanSig.slice(0, 10)}••••${cleanSig.slice(-8)}` : `sha256=${cleanSig}`)
       : undefined;
 
-    // Case B: Secret not provided by GoXtop / not configured -> Do NOT block integration
     if (!secret) {
       return {
         valid: true,
@@ -172,17 +628,22 @@ export abstract class BaseProvider implements IGameServiceProvider {
       };
     }
 
-    const expectedHex = crypto
+    const signingInputWithTs = timestampValue ? `${timestampValue}.${rawBody}` : rawBody;
+    const expectedHexWithTs = crypto
+      .createHmac('sha256', secret)
+      .update(signingInputWithTs, 'utf8')
+      .digest('hex');
+    const expectedHexRaw = crypto
       .createHmac('sha256', secret)
       .update(rawBody, 'utf8')
       .digest('hex');
-    const expectedBase64 = crypto
+    const expectedBase64Raw = crypto
       .createHmac('sha256', secret)
       .update(rawBody, 'utf8')
       .digest('base64');
-    const computedHmacPreview = `sha256=${expectedHex.slice(0, 10)}••••${expectedHex.slice(-8)}`;
 
-    // Case A: Secret is configured -> Require and validate HMAC-SHA256 signature on unmodified rawBody
+    const computedHmacPreview = `sha256=${expectedHexWithTs.slice(0, 10)}••••${expectedHexWithTs.slice(-8)}`;
+
     if (!signatureDetected || !signatureValue) {
       return {
         valid: false,
@@ -195,8 +656,8 @@ export abstract class BaseProvider implements IGameServiceProvider {
 
     try {
       const sigHexBuf = Buffer.from(cleanSig, 'hex');
-      const expHexBuf = Buffer.from(expectedHex, 'hex');
-      if (sigHexBuf.length === expHexBuf.length && sigHexBuf.length > 0 && crypto.timingSafeEqual(sigHexBuf, expHexBuf)) {
+      const expHexTsBuf = Buffer.from(expectedHexWithTs, 'hex');
+      if (sigHexBuf.length === expHexTsBuf.length && sigHexBuf.length > 0 && crypto.timingSafeEqual(sigHexBuf, expHexTsBuf)) {
         return {
           valid: true,
           signatureDetected: true,
@@ -207,8 +668,20 @@ export abstract class BaseProvider implements IGameServiceProvider {
         };
       }
 
+      const expHexRawBuf = Buffer.from(expectedHexRaw, 'hex');
+      if (sigHexBuf.length === expHexRawBuf.length && sigHexBuf.length > 0 && crypto.timingSafeEqual(sigHexBuf, expHexRawBuf)) {
+        return {
+          valid: true,
+          signatureDetected: true,
+          signatureHeaderName: detectedHeaderName,
+          signatureValueMasked,
+          computedHmacPreview: `sha256=${expectedHexRaw.slice(0, 10)}••••${expectedHexRaw.slice(-8)}`,
+          hmacValidation: 'Validée'
+        };
+      }
+
       const sigB64Buf = Buffer.from(cleanSig, 'utf8');
-      const expB64Buf = Buffer.from(expectedBase64, 'utf8');
+      const expB64Buf = Buffer.from(expectedBase64Raw, 'utf8');
       if (sigB64Buf.length === expB64Buf.length && crypto.timingSafeEqual(sigB64Buf, expB64Buf)) {
         return {
           valid: true,
@@ -257,16 +730,53 @@ export abstract class BaseProvider implements IGameServiceProvider {
 
 /**
  * Dedicated GoXtopProvider Backend Integration
- * Implements documented endpoints:
+ * Implements documented endpoints from https://goxtop.com:
+ * - GET /api/v.1/balance
  * - GET /api/v.1/games
- * - GET /api/v.1/products/{game}
+ * - GET /api/v.1/products/:gameCode
+ * - GET /api/v.1/server-options?gamecode=:gameCode
  * - POST /api/v.1/create
  * - GET /api/v.1/:partner_orderid
- * - POST /api/v.1/:id/track
+ * - POST /api/v.1/:partner_orderid/track
+ * - GET /api/check/games
+ * - GET /api/check/game-check
+ * - GET /api/check/mlbb-check
+ * - GET /api/check/ff-levelup-check
  */
 export class GoXtopProvider extends BaseProvider {
   /**
-   * Tests connection to GoXtop using GET /api/v.1/games without creating any real order.
+   * Fetches real GoXtop reseller wallet balance via GET /api/v.1/balance
+   */
+  public async getBalance(): Promise<{ success: boolean; walletBalance?: number; currency?: string; message?: string }> {
+    if (!this.secrets.apiKey?.trim()) {
+      return { success: false, message: 'API Key GoXtop manquante' };
+    }
+    const fullUrl = this.buildUrl('/api/v.1/balance');
+    try {
+      const response = await fetch(fullUrl, {
+        method: 'GET',
+        headers: this.buildHeaders()
+      });
+      const rawText = await response.text().catch(() => '');
+      const parsed = rawText ? JSON.parse(rawText) : null;
+      if (response.ok && parsed?.success !== false && parsed?.data) {
+        return {
+          success: true,
+          walletBalance: Number(parsed.data.wallet_balance ?? 0),
+          currency: String(parsed.data.currency || 'USD')
+        };
+      }
+      return {
+        success: false,
+        message: parsed?.message || `HTTP ${response.status}`
+      };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  }
+
+  /**
+   * Tests connection to GoXtop using GET /api/v.1/games and GET /api/v.1/balance without creating any order.
    */
   public async testConnection(): Promise<ConnectionTestResult> {
     const startTime = Date.now();
@@ -315,11 +825,14 @@ export class GoXtopProvider extends BaseProvider {
     const timeout = setTimeout(() => controller.abort(), 8000);
 
     try {
-      const response = await fetch(fullUrl, {
-        method: 'GET',
-        headers: this.buildHeaders(),
-        signal: controller.signal
-      });
+      const [response, balResult] = await Promise.all([
+        fetch(fullUrl, {
+          method: 'GET',
+          headers: this.buildHeaders(),
+          signal: controller.signal
+        }),
+        this.getBalance().catch(() => ({ success: false as const }))
+      ]);
       clearTimeout(timeout);
 
       const latencyMs = Date.now() - startTime;
@@ -420,6 +933,10 @@ export class GoXtopProvider extends BaseProvider {
           ? parsedJson
           : (Array.isArray(parsedJson?.data) ? parsedJson.data : (Array.isArray(parsedJson?.games) ? parsedJson.games : []));
 
+        const balNote = balResult.success && balResult.walletBalance !== undefined
+          ? ` Solde Wallet GoXtop : $${balResult.walletBalance.toFixed(3)} ${balResult.currency || 'USD'}.`
+          : '';
+
         const res: ConnectionTestResult = {
           success: true,
           code: 'SUCCESS',
@@ -427,10 +944,12 @@ export class GoXtopProvider extends BaseProvider {
           httpStatus,
           latencyMs,
           endpointCalled: fullUrl,
-          details: `Authentification GoXtop validée (HTTP ${httpStatus} OK en ${latencyMs} ms). ${gamesArray.length} jeux actifs détectés dans le catalogue distant.`,
+          details: `Authentification GoXtop validée (HTTP ${httpStatus} OK en ${latencyMs} ms). ${gamesArray.length} jeux actifs détectés dans le catalogue distant.${balNote}`,
           timestamp,
           authHeadersUsed: maskedHeaders,
           gamesCountDetected: gamesArray.length,
+          walletBalance: balResult.success ? balResult.walletBalance : undefined,
+          walletCurrency: balResult.success ? balResult.currency : undefined,
           responseSnippet: rawText.slice(0, 800)
         };
         this.logApi('TEST_CONNECTION', 'GET', fullUrl, httpStatus, latencyMs, res.label, true, reqSummary, rawText.slice(0, 2000));
@@ -471,6 +990,7 @@ export class GoXtopProvider extends BaseProvider {
 
   /**
    * Documented Endpoint: GET /api/v.1/games
+   * Also cross-references GET /api/check/games so all supported games have supportsNameCheck: true and exact dynamic fields.
    */
   public async getGames(): Promise<ProviderSyncResponse> {
     const startTime = Date.now();
@@ -575,7 +1095,21 @@ export class GoXtopProvider extends BaseProvider {
           ? `https://goxtop.com${rawImage}`
           : (rawImage || '/src/assets/images/game_cover_freefire_1790988876938.jpg');
 
-        const candidateId = 'game_' + gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        const checkSpec = resolveGoXtopNameCheckSpec(gameCode);
+        const supportsNameCheck = Boolean(checkSpec || gItem.name_check || gItem.supports_name_check);
+        const dynamicFields = buildDynamicFieldsForGoXtopGame(gameCode, gameName);
+
+        const candidateId =
+          gameCode === 'freefire_global'
+            ? 'game_ff'
+            : gameCode === 'mlbb_special' || gameCode === 'mlbb'
+            ? 'game_mlbb'
+            : gameCode === 'pubgm'
+            ? 'game_pubg'
+            : gameCode === 'codm_sgmy'
+            ? 'game_codm'
+            : 'game_' + gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+
         const existing = games.find(
           g =>
             g.id === candidateId ||
@@ -583,12 +1117,17 @@ export class GoXtopProvider extends BaseProvider {
             g.slug.toLowerCase() === gameCode.toLowerCase() ||
             (gameCode === 'freefire_global' && g.id === 'game_ff') ||
             ((gameCode === 'mlbb_special' || gameCode === 'mlbb') && g.id === 'game_mlbb') ||
-            ((gameCode === 'codm_sgmy' || gameCode === 'codm') && g.id === 'game_codm')
+            ((gameCode === 'codm_sgmy' || gameCode === 'codm') && g.id === 'game_codm') ||
+            (gameCode === 'pubgm' && g.id === 'game_pubg')
         );
 
         if (existing) {
           existing.externalGameId = gameCode;
           existing.providerId = this.provider.id;
+          existing.supportsNameCheck = supportsNameCheck;
+          if (!existing.fields || existing.fields.length === 0 || existing.id === 'game_ff') {
+            existing.fields = dynamicFields;
+          }
           if (gItem.active !== undefined || gItem.status !== undefined) {
             existing.isActive = gItem.active !== undefined ? Boolean(gItem.active) : String(gItem.status).toLowerCase() === 'active';
           }
@@ -596,38 +1135,20 @@ export class GoXtopProvider extends BaseProvider {
           updatedCount++;
         } else {
           games.push({
-            id: 'game_' + gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
-            slug: gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-            name: gameName,
+            id: candidateId,
+            slug: gameCode === 'freefire_global' ? 'free-fire' : gameCode.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+            name: gameCode === 'freefire_global' ? 'Free Fire' : gameName,
             externalGameId: gameCode,
             providerId: this.provider.id,
-            supportsNameCheck: Boolean(gItem.name_check || gItem.supports_name_check),
+            supportsNameCheck,
             requiresPlayerId: gItem.requires_player_id !== undefined ? Boolean(gItem.requires_player_id) : !gameCode.includes('pin') && !gameCode.includes('gift-card'),
             category: gItem.category || 'Gaming Top-Up',
             description: gItem.description || `Service officiel ${gameName} via GoXtop (${gItem.totalProducts || 0} packs disponibles)`,
             logo: resolvedLogo,
             banner: resolvedLogo,
             isActive: true,
-            displayOrder: games.length + 1,
-            fields: Array.isArray(gItem.fields)
-              ? gItem.fields.map((f: any, idx: number) => ({
-                  id: `f_${gameCode}_${idx}`,
-                  name: typeof f === 'string' ? f : (f.name || 'playerId'),
-                  label: typeof f === 'string' ? f : (f.label || f.name || 'Player ID'),
-                  placeholder: '',
-                  type: 'text' as const,
-                  required: true
-                }))
-              : [
-                  {
-                    id: `f_${gameCode}_uid`,
-                    name: 'playerId',
-                    label: 'Player ID (User ID)',
-                    placeholder: 'Entrez votre Player ID',
-                    type: 'text',
-                    required: true
-                  }
-                ],
+            displayOrder: candidateId === 'game_ff' ? 1 : candidateId === 'game_pubg' ? 2 : candidateId === 'game_mlbb' ? 3 : candidateId === 'game_codm' ? 4 : games.length + 6,
+            fields: dynamicFields,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
           });
@@ -674,7 +1195,6 @@ export class GoXtopProvider extends BaseProvider {
   public async getProducts(gameCode?: string): Promise<ProviderSyncResponse> {
     const startTime = Date.now();
     const allGames = db.getGames().filter(g => !gameCode || g.externalGameId === gameCode || g.slug === gameCode || g.id === gameCode);
-    // Prioritize top featured games when syncing without a specific gameCode so synchronization stays fast (< 3s)
     const games = gameCode
       ? allGames
       : allGames
@@ -709,7 +1229,7 @@ export class GoXtopProvider extends BaseProvider {
     for (const game of games) {
       const gCode = game.externalGameId || game.slug;
       const productsPath = this.provider.endpoints?.getProductsPath || '/api/v.1/products/{game}';
-      const fullUrl = this.buildUrl(productsPath, { game: gCode });
+      const fullUrl = this.buildUrl(productsPath, { game: gCode, gameCode: gCode });
       const reqSummary = JSON.stringify({ method: 'GET', url: fullUrl, gameCode: gCode, headers: this.buildMaskedHeaders() });
 
       try {
@@ -745,7 +1265,7 @@ export class GoXtopProvider extends BaseProvider {
         let service = services.find(s => s.gameId === game.id);
         if (!service && prodList.length > 0) {
           service = {
-            id: 'srv_' + game.slug,
+            id: game.id === 'game_ff' ? 'srv_ff_diamonds' : 'srv_' + game.slug,
             gameId: game.id,
             externalGameId: gCode,
             name: `${game.name} Top-Up`,
@@ -763,6 +1283,7 @@ export class GoXtopProvider extends BaseProvider {
 
         if (!service) continue;
         service.externalGameId = gCode;
+        service.providerId = this.provider.id;
 
         if (prodList.length > 0) {
           const validExtIds = new Set(
@@ -770,8 +1291,10 @@ export class GoXtopProvider extends BaseProvider {
               .map((pItem: any) => String(pItem.Pack || pItem.pack || pItem.id || pItem.product_id || pItem.code || pItem.sku || pItem.name || '').trim())
               .filter(Boolean)
           );
-          // Remove legacy initial placeholder packages that don't match real GoXtop Pack codes
-          service.packages = service.packages.filter(pkg => !pkg.externalProductId || validExtIds.has(pkg.externalProductId));
+          // Remove legacy initial placeholder or RechargeGames packages that don't match real GoXtop Pack codes
+          service.packages = service.packages.filter(
+            pkg => pkg.providerSlug !== 'rechargegames' && (!pkg.externalProductId || validExtIds.has(pkg.externalProductId))
+          );
         }
 
         for (const pItem of prodList) {
@@ -800,6 +1323,17 @@ export class GoXtopProvider extends BaseProvider {
               name: 'serverId',
               label: 'Server ID / Zone ID',
               placeholder: 'Entrez votre Server / Zone ID',
+              type: 'text',
+              required: true
+            });
+          }
+
+          if (dbGame && reqCharName && !dbGame.fields.some(f => f.name === 'playerName' || f.name === 'charname')) {
+            dbGame.fields.push({
+              id: `f_${gCode}_charname`,
+              name: 'playerName',
+              label: 'Character Name',
+              placeholder: 'Nom du personnage en jeu',
               type: 'text',
               required: true
             });
@@ -834,6 +1368,7 @@ export class GoXtopProvider extends BaseProvider {
           if (existingPkg) {
             existingPkg.externalProductId = extProdId;
             existingPkg.externalGameId = gCode;
+            existingPkg.providerSlug = 'goxtop';
             existingPkg.requiresPlayerId = reqUserId;
             if (requiredFields.length > 0) {
               existingPkg.requiredFields = requiredFields;
@@ -843,7 +1378,7 @@ export class GoXtopProvider extends BaseProvider {
               const currentMargin =
                 typeof existingPkg.margin === 'number' && existingPkg.margin > 0
                   ? existingPkg.margin
-                  : Number((goxtopCost * 0.25).toFixed(2));
+                  : Number(Math.max(0.15, goxtopCost * 0.25).toFixed(2));
               existingPkg.margin = currentMargin;
               existingPkg.publicPrice = Number((existingPkg.supplierCost + existingPkg.margin).toFixed(2));
               existingPkg.resellerPrice = Number((existingPkg.supplierCost + existingPkg.margin * 0.5).toFixed(2));
@@ -859,6 +1394,7 @@ export class GoXtopProvider extends BaseProvider {
               id: `pkg_${extProdId.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
               serviceId: service.id,
               externalProductId: extProdId,
+              providerSlug: 'goxtop',
               externalGameId: gCode,
               name: displayName,
               amount: numericAmount,
@@ -911,18 +1447,28 @@ export class GoXtopProvider extends BaseProvider {
   }
 
   /**
-   * Name Checker GoXtop (e.g. Free Fire Player ID -> Player Name lookup before order confirmation)
+   * Official GoXtop Name Checker Integration
+   * Documented Endpoint:
+   *   GET /api/check/game-check?code={code}&characterId={characterId}&server_code={server_code}&region={region}
+   *   Headers: x-api-key: YOUR_API_KEY
+   *
+   * Zero simulation: Calls the live GoXtop Name Checker API and returns the real result or real error.
+   * If a game is not documented in GoXtop's /api/check/games table, returns "REQUIRES GOXTOP DOCUMENTATION".
    */
-  public async checkPlayer(gameCode: string, playerData: Record<string, string>): Promise<PlayerCheckResult> {
+  public async checkPlayer(
+    gameCode: string,
+    playerData: Record<string, string>,
+    clientIp?: string
+  ): Promise<PlayerCheckResult> {
     const startTime = Date.now();
-    const checkPath = (this.provider.endpoints?.checkPlayerPath || '').trim();
+    const spec = resolveGoXtopNameCheckSpec(gameCode);
 
-    if (!checkPath || checkPath === 'REQUIRES GOXTOP DOCUMENTATION') {
+    if (!spec) {
       return {
         supported: false,
         verified: false,
         requiresDocumentation: true,
-        message: 'REQUIRES GOXTOP DOCUMENTATION : L’endpoint exact du Name Checker GoXtop doit être renseigné dans Admin → Settings → Providers → GoXtop.'
+        message: `REQUIRES GOXTOP DOCUMENTATION : Le service "${gameCode}" ne possède pas de code confirmé dans la table officielle /api/check/games de GoXtop.`
       };
     }
 
@@ -930,60 +1476,208 @@ export class GoXtopProvider extends BaseProvider {
       return {
         supported: true,
         verified: false,
+        code: 'MISSING_API_KEY',
         message: 'Vérification impossible : API Key GoXtop non configurée côté serveur.'
       };
     }
 
-    const playerId = playerData.playerId || playerData.userId || playerData.characterId || '';
-    const serverId = playerData.serverId || playerData.zoneId || '';
-    const fullUrl = this.buildUrl(checkPath, { game: gameCode, player_id: playerId });
+    const characterId = String(
+      playerData.playerId ||
+      playerData.characterId ||
+      playerData.userId ||
+      playerData.userid ||
+      playerData.uid ||
+      ''
+    ).trim();
 
-    try {
+    if (!characterId) {
+      return {
+        supported: true,
+        verified: false,
+        code: 'MISSING_PLAYER_ID',
+        message: `Veuillez saisir votre ${spec.idFieldLabel || 'Player ID'} avant de cliquer sur "Vérifier l’ID".`
+      };
+    }
+
+    const serverCode = String(
+      playerData.zoneId ||
+      playerData.serverId ||
+      playerData.server_code ||
+      playerData.zone ||
+      ''
+    ).trim();
+
+    if (spec.zone && !serverCode) {
+      return {
+        supported: true,
+        verified: false,
+        code: 'MISSING_SERVER_CODE',
+        message: `Le champ Zone ID / Server Code (server_code) est requis par GoXtop pour vérifier un compte ${spec.name}.`
+      };
+    }
+
+    const rawRegion = String(playerData.region || spec.defaultRegion || '').trim().toLowerCase();
+    const resolvedRegion =
+      spec.regions && spec.regions.length > 0
+        ? (spec.regions.includes(rawRegion) ? rawRegion : (spec.defaultRegion || spec.regions[0]))
+        : undefined;
+
+    const configuredPath = (this.provider.endpoints?.checkPlayerPath || '').trim();
+    const checkEndpointPath =
+      !configuredPath || configuredPath === 'REQUIRES GOXTOP DOCUMENTATION'
+        ? '/api/check/game-check'
+        : configuredPath;
+
+    const baseCheckUrl = this.buildUrl(checkEndpointPath);
+    const urlObj = new URL(baseCheckUrl);
+    urlObj.searchParams.set('code', spec.code);
+    urlObj.searchParams.set('characterId', characterId);
+    if (serverCode && (spec.zone || spec.zoneOptional)) {
+      urlObj.searchParams.set('server_code', serverCode);
+    }
+    if (resolvedRegion) {
+      urlObj.searchParams.set('region', resolvedRegion);
+    }
+
+    const fullUrl = urlObj.toString();
+    const reqPreview = JSON.stringify({
+      method: 'GET',
+      url: fullUrl,
+      params: {
+        code: spec.code,
+        characterId,
+        ...(serverCode ? { server_code: serverCode } : {}),
+        ...(resolvedRegion ? { region: resolvedRegion } : {})
+      },
+      headers: this.buildMaskedHeaders()
+    });
+
+    const executeGoXtopCheckRequest = async (forwardedIp?: string) => {
+      const extraHeaders: Record<string, string> = {};
+      if (forwardedIp) {
+        extraHeaders['X-Forwarded-For'] = forwardedIp;
+        extraHeaders['X-Real-IP'] = forwardedIp;
+      }
       const response = await fetch(fullUrl, {
-        method: 'POST',
-        headers: this.buildHeaders(),
-        body: JSON.stringify({
-          game: gameCode,
-          player_id: playerId,
-          server_id: serverId || undefined,
-          ...playerData
-        })
+        method: 'GET',
+        headers: this.buildHeaders(extraHeaders)
       });
-
-      const latencyMs = Date.now() - startTime;
       const rawText = await response.text().catch(() => '');
       let parsed: any = null;
       try {
-        parsed = JSON.parse(rawText);
+        parsed = rawText ? JSON.parse(rawText) : null;
       } catch {
         parsed = null;
       }
+      return { response, rawText, parsed };
+    };
 
-      if (response.status >= 200 && response.status < 300 && parsed) {
-        const resolvedName = parsed.player_name || parsed.nickname || parsed.username || parsed.name || parsed.data?.nickname || parsed.data?.name;
+    try {
+      const cleanClientIp = clientIp ? clientIp.split(',')[0].trim() : undefined;
+      let { response, rawText, parsed } = await executeGoXtopCheckRequest(cleanClientIp);
+
+      // If clientIp triggered IP_NOT_ALLOWED on GoXtop, immediately retry without X-Forwarded-For (using server IP)
+      if (cleanClientIp && response.status === 403 && parsed?.code === 'IP_NOT_ALLOWED') {
+        const retryResult = await executeGoXtopCheckRequest(undefined);
+        if (retryResult.response.ok || retryResult.parsed?.code !== 'IP_NOT_ALLOWED') {
+          response = retryResult.response;
+          rawText = retryResult.rawText;
+          parsed = retryResult.parsed;
+        }
+      }
+
+      const latencyMs = Date.now() - startTime;
+
+      if (response.status >= 200 && response.status < 300 && parsed && parsed.success !== false) {
+        const resolvedName =
+          parsed.username ||
+          parsed.player_name ||
+          parsed.nickname ||
+          parsed.name ||
+          parsed.data?.username ||
+          parsed.data?.nickname ||
+          parsed.data?.name;
+
         if (resolvedName) {
-          this.logApi('CHECK_PLAYER', 'POST', fullUrl, response.status, latencyMs, 'Connexion réussie', true, JSON.stringify({ game: gameCode, player_id: playerId }), `Joueur vérifié: ${resolvedName}`);
+          const regionReturned = parsed.region || parsed.country || parsed.data?.region || resolvedRegion;
+          const uidReturned = String(parsed.uid || parsed.user_id || parsed.data?.uid || characterId);
+
+          this.logApi(
+            'CHECK_PLAYER',
+            'GET',
+            fullUrl,
+            response.status,
+            latencyMs,
+            'Connexion réussie',
+            true,
+            reqPreview,
+            rawText.slice(0, 800)
+          );
+
           return {
             supported: true,
             verified: true,
             playerName: String(resolvedName),
-            message: `Joueur confirmé par GoXtop : ${resolvedName}`
+            playerId: uidReturned,
+            region: regionReturned ? String(regionReturned) : undefined,
+            game: parsed.game || spec.name,
+            code: 'VERIFIED',
+            httpStatus: response.status,
+            endpointCalled: fullUrl,
+            rawResponse: parsed,
+            message: `ID valide — Joueur confirmé par GoXtop : ${resolvedName}${regionReturned ? ` (Région : ${regionReturned})` : ''}`
           };
         }
       }
 
-      this.logApi('CHECK_PLAYER', 'POST', fullUrl, response.status, latencyMs, 'Échec de connexion', false, JSON.stringify({ game: gameCode, player_id: playerId }), rawText.slice(0, 200));
+      const goxtopErrorMsg =
+        parsed?.message ||
+        parsed?.error ||
+        `Impossible de vérifier l'ID auprès de GoXtop (HTTP ${response.status}).`;
+      const goxtopErrorCode = parsed?.code || (response.status === 404 ? 'PLAYER_NOT_FOUND' : `HTTP_${response.status}`);
+      const detectedIp = parsed?.ip ? String(parsed.ip) : undefined;
+
+      const detailedErrorMessage =
+        goxtopErrorCode === 'IP_NOT_ALLOWED'
+          ? `Erreur GoXtop (HTTP ${response.status} - ${goxtopErrorCode}) : ${goxtopErrorMsg}${detectedIp ? ` [IP détectée par GoXtop : ${detectedIp}]` : ''}. Autorisez cette IP dans votre tableau de bord GoXtop API Key.`
+          : `Erreur GoXtop (HTTP ${response.status}) : ${goxtopErrorMsg}`;
+
+      this.logApi(
+        'CHECK_PLAYER',
+        'GET',
+        fullUrl,
+        response.status,
+        latencyMs,
+        response.status === 404 ? 'Joueur introuvable (404)' : 'Échec de vérification',
+        false,
+        reqPreview,
+        rawText.slice(0, 800)
+      );
+
       return {
         supported: true,
         verified: false,
-        message: parsed?.message || parsed?.error || `Impossible de vérifier le Player ID auprès de GoXtop (HTTP ${response.status}).`
+        playerId: characterId,
+        region: resolvedRegion,
+        game: spec.name,
+        code: goxtopErrorCode,
+        httpStatus: response.status,
+        endpointCalled: fullUrl,
+        ipDetected: detectedIp,
+        rawResponse: parsed || { raw: rawText.slice(0, 300) },
+        message: detailedErrorMessage
       };
     } catch (err: any) {
-      this.logApi('CHECK_PLAYER', 'POST', fullUrl, null, Date.now() - startTime, 'Erreur réseau', false, undefined, err.message);
+      const latencyMs = Date.now() - startTime;
+      this.logApi('CHECK_PLAYER', 'GET', fullUrl, null, latencyMs, 'Erreur réseau', false, reqPreview, err.message);
       return {
         supported: true,
         verified: false,
-        message: `Erreur réseau lors de la vérification du joueur : ${err.message}`
+        playerId: characterId,
+        code: 'NETWORK_ERROR',
+        httpStatus: null,
+        endpointCalled: fullUrl,
+        message: `Erreur réseau lors de la requête GoXtop Name Checker : ${err.message}`
       };
     }
   }
@@ -996,12 +1690,13 @@ export class GoXtopProvider extends BaseProvider {
     success: boolean;
     status?: OrderStatus;
     providerOrderId?: string;
+    verifiedPlayerName?: string;
     raw?: any;
     message?: string;
   }> {
     const startTime = Date.now();
     const statusPath = this.provider.endpoints?.orderStatusPath || '/api/v.1/:partner_orderid';
-    const fullUrl = this.buildUrl(statusPath, { partner_orderid: partnerOrderId });
+    const fullUrl = this.buildUrl(statusPath, { partner_orderid: partnerOrderId, id: partnerOrderId });
 
     if (!this.secrets.apiKey?.trim()) {
       return { success: false, message: 'API Key GoXtop non configurée' };
@@ -1016,26 +1711,37 @@ export class GoXtopProvider extends BaseProvider {
       const rawText = await response.text().catch(() => '');
 
       if (response.status < 200 || response.status >= 300) {
-        this.logApi('GET_ORDER_STATUS', 'GET', fullUrl, response.status, latencyMs, 'Échec de connexion', false, undefined, rawText.slice(0, 200), undefined, partnerOrderId);
+        this.logApi('GET_ORDER_STATUS', 'GET', fullUrl, response.status, latencyMs, 'Échec de connexion', false, undefined, rawText.slice(0, 300), undefined, partnerOrderId);
         return { success: false, message: `HTTP ${response.status}` };
       }
 
       const parsed = JSON.parse(rawText);
-      const remoteStatus = String(parsed.status || parsed.data?.status || '').toLowerCase();
-      const providerOrderId = String(parsed.id || parsed.order_id || parsed.data?.id || '');
+      const dataObj = parsed?.data || parsed;
+      const remoteStatus = String(dataObj?.status || parsed?.status || '').toLowerCase();
+      const providerOrderId = String(
+        dataObj?.reference ||
+        dataObj?.provider_order_id ||
+        dataObj?.id ||
+        dataObj?.order_id ||
+        parsed?.reference ||
+        parsed?.id ||
+        ''
+      );
+      const verifiedPlayerName = dataObj?.username ? String(dataObj.username) : undefined;
 
       let mappedStatus: OrderStatus = 'processing';
-      if (['completed', 'success', 'delivered'].includes(remoteStatus)) mappedStatus = 'completed';
+      if (['completed', 'success', 'successful', 'delivered'].includes(remoteStatus)) mappedStatus = 'completed';
       else if (['failed', 'error', 'rejected'].includes(remoteStatus)) mappedStatus = 'failed';
       else if (['cancelled', 'canceled'].includes(remoteStatus)) mappedStatus = 'cancelled';
       else if (['refunded'].includes(remoteStatus)) mappedStatus = 'refunded';
 
-      this.logApi('GET_ORDER_STATUS', 'GET', fullUrl, response.status, latencyMs, 'Connexion réussie', true, undefined, rawText.slice(0, 200), undefined, partnerOrderId);
+      this.logApi('GET_ORDER_STATUS', 'GET', fullUrl, response.status, latencyMs, 'Connexion réussie', true, undefined, rawText.slice(0, 400), undefined, partnerOrderId);
 
       return {
         success: true,
         status: mappedStatus,
         providerOrderId: providerOrderId || undefined,
+        verifiedPlayerName,
         raw: parsed
       };
     } catch (err: any) {
@@ -1045,17 +1751,18 @@ export class GoXtopProvider extends BaseProvider {
   }
 
   /**
-   * Documented Endpoint: POST /api/v.1/:id/track
+   * Documented Endpoint: POST /api/v.1/:partner_orderid/track
    */
-  public async trackOrder(providerOrderId: string): Promise<{
+  public async trackOrder(partnerOrderId: string): Promise<{
     success: boolean;
     status?: OrderStatus;
+    providerOrderId?: string;
     raw?: any;
     message?: string;
   }> {
     const startTime = Date.now();
-    const trackPath = this.provider.endpoints?.trackOrderPath || '/api/v.1/:id/track';
-    const fullUrl = this.buildUrl(trackPath, { id: providerOrderId });
+    const trackPath = this.provider.endpoints?.trackOrderPath || '/api/v.1/:partner_orderid/track';
+    const fullUrl = this.buildUrl(trackPath, { partner_orderid: partnerOrderId, id: partnerOrderId });
 
     if (!this.secrets.apiKey?.trim()) {
       return { success: false, message: 'API Key GoXtop non configurée' };
@@ -1070,27 +1777,37 @@ export class GoXtopProvider extends BaseProvider {
       const rawText = await response.text().catch(() => '');
 
       if (response.status < 200 || response.status >= 300) {
-        this.logApi('TRACK_ORDER', 'POST', fullUrl, response.status, latencyMs, 'Échec de connexion', false, undefined, rawText.slice(0, 200), providerOrderId);
+        this.logApi('TRACK_ORDER', 'POST', fullUrl, response.status, latencyMs, 'Échec de connexion', false, undefined, rawText.slice(0, 300), partnerOrderId, partnerOrderId);
         return { success: false, message: `HTTP ${response.status}` };
       }
 
       const parsed = JSON.parse(rawText);
-      const remoteStatus = String(parsed.status || parsed.data?.status || '').toLowerCase();
+      const dataObj = parsed?.data || parsed;
+      const remoteStatus = String(dataObj?.status || parsed?.status || '').toLowerCase();
+      const providerOrderId = String(
+        dataObj?.reference ||
+        dataObj?.provider_order_id ||
+        dataObj?.id ||
+        parsed?.reference ||
+        ''
+      );
 
       let mappedStatus: OrderStatus = 'processing';
-      if (['completed', 'success', 'delivered'].includes(remoteStatus)) mappedStatus = 'completed';
+      if (['completed', 'success', 'successful', 'delivered'].includes(remoteStatus)) mappedStatus = 'completed';
       else if (['failed', 'error', 'rejected'].includes(remoteStatus)) mappedStatus = 'failed';
+      else if (['cancelled', 'canceled'].includes(remoteStatus)) mappedStatus = 'cancelled';
       else if (['refunded'].includes(remoteStatus)) mappedStatus = 'refunded';
 
-      this.logApi('TRACK_ORDER', 'POST', fullUrl, response.status, latencyMs, 'Connexion réussie', true, undefined, rawText.slice(0, 200), providerOrderId);
+      this.logApi('TRACK_ORDER', 'POST', fullUrl, response.status, latencyMs, 'Connexion réussie', true, undefined, rawText.slice(0, 400), partnerOrderId, partnerOrderId);
 
       return {
         success: true,
         status: mappedStatus,
+        providerOrderId: providerOrderId || undefined,
         raw: parsed
       };
     } catch (err: any) {
-      this.logApi('TRACK_ORDER', 'POST', fullUrl, null, Date.now() - startTime, 'Erreur réseau', false, undefined, err.message, providerOrderId);
+      this.logApi('TRACK_ORDER', 'POST', fullUrl, null, Date.now() - startTime, 'Erreur réseau', false, undefined, err.message, partnerOrderId, partnerOrderId);
       return { success: false, message: err.message };
     }
   }
@@ -1108,7 +1825,6 @@ export class GoXtopProvider extends BaseProvider {
     // 1. Idempotency Check: Check if a provider_order with this partner_order_id was already sent
     const existingProviderOrder = db.findProviderOrderByPartnerId(order.partnerOrderId);
     if (existingProviderOrder && (existingProviderOrder.status === 'processing' || existingProviderOrder.status === 'completed')) {
-      // Query status on GoXtop before attempting anything
       const statusCheck = await this.getOrderStatus(order.partnerOrderId);
       if (statusCheck.success && statusCheck.status) {
         db.upsertProviderOrder({
@@ -1122,13 +1838,13 @@ export class GoXtopProvider extends BaseProvider {
           accepted: statusCheck.status !== 'failed',
           status: statusCheck.status,
           externalOrderId: statusCheck.providerOrderId || existingProviderOrder.provider_order_id,
+          verifiedPlayerName: statusCheck.verifiedPlayerName,
           httpStatus: 200,
           latencyMs: Date.now() - startTime,
           rawResponse: statusCheck.raw || existingProviderOrder.response_payload
         };
       }
 
-      // Already in flight: never create duplicate order on GoXtop
       return {
         accepted: true,
         status: existingProviderOrder.status,
@@ -1166,7 +1882,8 @@ export class GoXtopProvider extends BaseProvider {
       };
     }
 
-    // Build payload for POST /api/v.1/create
+    // Build payload for POST /api/v.1/create using exact documented GoXtop parameters:
+    // game, denom, userid, serverid, charname, partner_webhook_url, partner_orderid
     const customEntries: Record<string, string> = {};
     for (const cp of this.provider.customParams || []) {
       if (cp.key.trim()) {
@@ -1192,19 +1909,24 @@ export class GoXtopProvider extends BaseProvider {
       order.gameProfileData?.charname ||
       '';
 
+    // GoXtop requires partner_webhook_url to be HTTPS
+    const httpsWebhookUrl = webhookCallbackUrl.startsWith('http://localhost')
+      ? `https://ais-dev-x2ludovvteawsky54uj7vr-266949098099.europe-west2.run.app/api/webhooks/${this.provider.slug || 'goxtop'}`
+      : webhookCallbackUrl.replace(/^http:\/\//i, 'https://');
+
     const requestPayload: Record<string, any> = {
       game: order.externalGameId || order.gameId,
       denom: order.externalProductId || order.packageId,
       userid: resolvedUserId,
-      ...(resolvedServerId ? { serverid: resolvedServerId } : {}),
-      ...(resolvedCharName ? { charname: resolvedCharName } : {}),
-      partner_webhook_url: webhookCallbackUrl,
+      serverid: resolvedServerId || '',
+      charname: resolvedCharName || '',
+      partner_webhook_url: httpsWebhookUrl,
       partner_orderid: order.partnerOrderId,
       ...customEntries
     };
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
+    const timeout = setTimeout(() => controller.abort(), 12000);
 
     try {
       const response = await fetch(fullUrl, {
@@ -1226,15 +1948,32 @@ export class GoXtopProvider extends BaseProvider {
         parsed = { raw: rawText.slice(0, 300) };
       }
 
-      if (httpStatus >= 200 && httpStatus < 300 && parsed && !parsed.error && parsed.success !== false) {
-        const providerOrderId = String(parsed.id || parsed.order_id || parsed.goxtop_order_id || `GOX-${Date.now()}`);
-        const remoteStatusRaw = String(parsed.status || 'processing').toLowerCase();
+      const dataObj = parsed?.data || parsed;
+
+      // Handle HTTP 2xx OR HTTP 409 Duplicate partner_orderid with existing order data
+      if (
+        (httpStatus >= 200 && httpStatus < 300 && parsed && !parsed.error && parsed.success !== false) ||
+        (httpStatus === 409 && dataObj && (dataObj.reference || dataObj.orderid))
+      ) {
+        const providerOrderId = String(
+          dataObj?.reference ||
+          dataObj?.provider_order_id ||
+          parsed?.reference ||
+          parsed?.id ||
+          parsed?.order_id ||
+          dataObj?.orderid ||
+          order.partnerOrderId
+        );
+        const remoteStatusRaw = String(dataObj?.status || parsed?.status || 'pending').toLowerCase();
         const mappedStatus: OrderStatus =
-          ['completed', 'success', 'delivered'].includes(remoteStatusRaw)
+          ['completed', 'success', 'successful', 'delivered'].includes(remoteStatusRaw)
             ? 'completed'
             : ['failed', 'error', 'rejected'].includes(remoteStatusRaw)
             ? 'failed'
+            : ['refunded'].includes(remoteStatusRaw)
+            ? 'refunded'
             : 'processing';
+        const verifiedNameFromOrder = dataObj?.username ? String(dataObj.username) : undefined;
 
         db.upsertProviderOrder({
           id: existingProviderOrder?.id || 'pord_' + Date.now(),
@@ -1258,7 +1997,7 @@ export class GoXtopProvider extends BaseProvider {
           'Connexion réussie',
           true,
           JSON.stringify(requestPayload),
-          rawText.slice(0, 250),
+          rawText.slice(0, 600),
           order.orderNumber,
           order.partnerOrderId
         );
@@ -1267,6 +2006,7 @@ export class GoXtopProvider extends BaseProvider {
           accepted: mappedStatus !== 'failed',
           status: mappedStatus,
           externalOrderId: providerOrderId,
+          verifiedPlayerName: verifiedNameFromOrder,
           httpStatus,
           latencyMs,
           rawResponse: parsed
@@ -1297,7 +2037,7 @@ export class GoXtopProvider extends BaseProvider {
         httpStatus === 401 ? 'API Key invalide' : 'Échec de connexion',
         false,
         JSON.stringify(requestPayload),
-        rawText.slice(0, 250),
+        rawText.slice(0, 600),
         order.orderNumber,
         order.partnerOrderId
       );
@@ -1356,10 +2096,10 @@ export class GoXtopProvider extends BaseProvider {
 
   /**
    * Handles incoming GoXtop Webhook with:
-   * - Unmodified rawBody HMAC-SHA256 verification (or Non applicable when GoXtop does not provide a secret)
+   * - Official GoXtop X-Webhook-Timestamp + X-Webhook-Signature HMAC-SHA256 verification
    * - Dedicated handling for internal "TEST_WEBHOOK" diagnostic event (never creates order or debits balance)
    * - Duplicate event rejection (idempotent)
-   * - Confirmed status mapping & real-time Webhook Diagnostic Logging
+   * - Confirmed status mapping ("successful", "completed", "failed", "refunded") & real-time Webhook Diagnostic Logging
    */
   public async handleWebhook(
     rawBody: string,
@@ -1369,14 +2109,30 @@ export class GoXtopProvider extends BaseProvider {
     const startTime = Date.now();
     const endpoint = `/api/webhooks/${this.provider.slug}`;
     const isInternalTest = payload?.event_type === 'TEST_WEBHOOK' || payload?.type === 'TEST_WEBHOOK';
-    const partnerOrderId = String(payload?.partner_orderid || payload?.partner_order_id || payload?.partnerOrderId || '');
-    const providerOrderId = String(payload?.id || payload?.order_id || payload?.goxtop_order_id || '');
-    const rawStatus = String(payload?.status || payload?.order_status || '').toLowerCase();
+    const dataObj = payload?.data || payload;
+    const partnerOrderId = String(
+      dataObj?.orderid ||
+      payload?.partner_orderid ||
+      payload?.partner_order_id ||
+      payload?.partnerOrderId ||
+      payload?.orderid ||
+      ''
+    );
+    const providerOrderId = String(
+      dataObj?.reference ||
+      dataObj?.provider_order_id ||
+      payload?.id ||
+      payload?.order_id ||
+      payload?.goxtop_order_id ||
+      payload?.reference ||
+      ''
+    );
+    const rawStatus = String(dataObj?.status || payload?.status || payload?.order_status || '').toLowerCase();
     const eventType = isInternalTest
       ? 'TEST_WEBHOOK'
       : String(payload?.event || payload?.event_type || (rawStatus ? `ORDER_${rawStatus.toUpperCase()}` : 'WEBHOOK_NOTIFICATION'));
 
-    // 1. Verify HMAC-SHA256 signature on unmodified rawBody
+    // 1. Verify HMAC-SHA256 signature
     const sigCheck = this.verifyWebhookSignature(rawBody, headers);
     const processingSteps: string[] = [
       `[1] Réception HTTP POST sur ${endpoint} (${rawBody.length} octets bruts)`,
@@ -1551,17 +2307,17 @@ export class GoXtopProvider extends BaseProvider {
     const order = orders[orderIdx];
     processingSteps.push(`[4] Commande PlayUp localisée : ${order.orderNumber} (${order.gameName} — ${order.packageName})`);
 
-    // 5. Map status ONLY when meaning is confirmed
+    // 5. Map status ONLY when meaning is confirmed (including GoXtop's official "successful" status)
     let mappedStatus: OrderStatus | null = null;
     if (['pending'].includes(rawStatus)) mappedStatus = 'pending';
     else if (['processing', 'in_progress'].includes(rawStatus)) mappedStatus = 'processing';
-    else if (['completed', 'success', 'delivered'].includes(rawStatus)) mappedStatus = 'completed';
+    else if (['completed', 'success', 'successful', 'delivered'].includes(rawStatus)) mappedStatus = 'completed';
     else if (['failed', 'error', 'rejected'].includes(rawStatus)) mappedStatus = 'failed';
     else if (['cancelled', 'canceled'].includes(rawStatus)) mappedStatus = 'cancelled';
     else if (['refunded'].includes(rawStatus)) mappedStatus = 'refunded';
 
     if (!mappedStatus) {
-      const unconfirmedMsg = `Statut GoXtop "${rawStatus}" non reconnu — REQUIRES PROVIDER CONFIRMATION`;
+      const unconfirmedMsg = `Statut GoXtop "${rawStatus}" non reconnu — REQUIRES GOXTOP DOCUMENTATION`;
       processingSteps.push(`[5] ${unconfirmedMsg}`);
       const unconfBody = { status: 'acknowledged_unmapped', rawStatus, note: unconfirmedMsg, processingSteps };
       db.addProviderWebhookLog({
@@ -1597,7 +2353,7 @@ export class GoXtopProvider extends BaseProvider {
     }
     order.providerResponse = db.sanitizeForLogs(payload);
     if (mappedStatus === 'failed' || mappedStatus === 'refunded') {
-      order.errorMessage = payload.error || payload.message || `Statut GoXtop: ${mappedStatus}`;
+      order.errorMessage = dataObj?.error || dataObj?.message || payload.error || payload.message || `Statut GoXtop: ${mappedStatus}`;
       if (mappedStatus === 'refunded' || payload.refund) {
         order.refundInfo = payload.refund_reason || payload.message || 'Remboursement confirmé par GoXtop';
       }
@@ -1661,6 +2417,7 @@ export class GoXtopProvider extends BaseProvider {
 
     const okBody = {
       status: 'acknowledged',
+      success: true,
       orderNumber: order.orderNumber,
       partner_orderid: order.partnerOrderId,
       goxtop_order_id: order.externalOrderId,

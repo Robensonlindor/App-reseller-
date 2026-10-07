@@ -369,7 +369,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setSelectedService(gameServices[0] || null);
     // Determine default region for this game from RechargeGames catalog
     const gameRgProducts = rgCatalog.filter(
-      p => p.game.toLowerCase() === game.name.toLowerCase() || p.game_slug === game.slug
+      p => (p.game || '').toLowerCase() === (game.name || '').toLowerCase() || p.game_slug === game.slug
     );
     const availableRegs = Array.from(new Set(gameRgProducts.map(p => p.region)));
     if (availableRegs.includes('Brazil')) {
@@ -403,27 +403,59 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     }
   };
 
-  // Verify Player Name via GoXtop Name Checker (e.g. Free Fire)
-  const handleVerifyPlayer = async () => {
-    if (!selectedGame) return;
+  // Verify Player ID via RechargeGames official /v1/region-check (e.g. Free Fire 16777227705)
+  const handleVerifyPlayer = async (): Promise<PlayerCheckResult | null> => {
+    if (!selectedGame) return null;
     setIsCheckingPlayer(true);
     setOrderError(null);
     try {
-      const res = await apiClient.checkPlayer(selectedGame.id, gameProfileInputs);
+      const res = await apiClient.checkPlayer(
+        selectedGame.id,
+        gameProfileInputs,
+        selectedPackage?.region || selectedRegion
+      );
       setPlayerCheckResult(res);
+
+      // If RechargeGames confirmed the player and returned their official region (e.g. LATAM for 16777227705),
+      // automatically sync the selected region & package to match the player's account region
+      const officialRegion = res.detectedRegion || res.region;
+      if (res.verified && officialRegion && selectedService) {
+        const regionPkgs = selectedService.packages.filter(
+          p => p.isActive && (p.region || '').toLowerCase() === officialRegion.toLowerCase()
+        );
+        if (regionPkgs.length > 0) {
+          const canonicalReg = regionPkgs[0].region || officialRegion;
+          if (selectedRegion.toLowerCase() !== canonicalReg.toLowerCase()) {
+            setSelectedRegion(canonicalReg);
+          }
+          if (!selectedPackage || (selectedPackage.region || '').toLowerCase() !== canonicalReg.toLowerCase()) {
+            const matchingAmountPkg =
+              (selectedPackage && regionPkgs.find(p => p.amount === selectedPackage.amount)) || regionPkgs[0];
+            setSelectedPackage(matchingAmountPkg);
+          }
+        }
+      }
+
+      if (res.supported && !res.verified) {
+        setOrderError(res.message || 'Player ID invalide ou introuvable sur RechargeGames.');
+      }
+      return res;
     } catch (err: any) {
-      setPlayerCheckResult({
+      const fallbackErr: PlayerCheckResult = {
         supported: true,
         verified: false,
         message: err.message || 'Erreur lors de la vérification du joueur'
-      });
+      };
+      setPlayerCheckResult(fallbackErr);
+      setOrderError(fallbackErr.message);
+      return fallbackErr;
     } finally {
       setIsCheckingPlayer(false);
     }
   };
 
-  // Proceed to confirmation & payment step
-  const handleProceedToPayment = () => {
+  // Proceed to confirmation & payment step (Enforces real provider Player ID check when supported)
+  const handleProceedToPayment = async () => {
     if (!selectedGame || !selectedService || !selectedPackage) return;
 
     const requiresPlayer = selectedPackage.requiresPlayerId !== false && selectedGame.requiresPlayerId !== false;
@@ -443,6 +475,16 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
             return;
           }
         }
+      }
+
+      // Perform real RechargeGames Player ID validation if not yet verified for current input
+      let checkRes = playerCheckResult;
+      if (!checkRes) {
+        checkRes = await handleVerifyPlayer();
+      }
+      if (checkRes && checkRes.supported && !checkRes.verified) {
+        setOrderError(checkRes.message || 'Player ID invalide refusé par RechargeGames. Commande bloquée.');
+        return;
       }
     }
 
@@ -1147,9 +1189,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
               {(() => {
                 const gameRgProducts = rgCatalog.filter(
                   p =>
-                    p.game.toLowerCase() === selectedGame.name.toLowerCase() ||
+                    (p.game || '').toLowerCase() === (selectedGame.name || '').toLowerCase() ||
                     p.game_slug === selectedGame.slug ||
-                    (selectedGame.slug === 'roblox' && p.game.toLowerCase().includes('roblox'))
+                    (selectedGame.slug === 'roblox' && (p.game || '').toLowerCase().includes('roblox'))
                 );
                 const regionsForGame = Array.from(
                   new Set(gameRgProducts.map(p => p.region).filter(Boolean))
@@ -1157,7 +1199,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 const regionList = regionsForGame.length > 0 ? regionsForGame : ['Brazil', 'USA', 'Global'];
 
                 const formatRegionChip = (reg: string) => {
-                  const r = reg.toLowerCase();
+                  const r = (reg || '').toLowerCase();
                   if (r === 'brazil') return 'Brazil 🇧🇷';
                   if (r === 'usa') return 'USA 🇺🇸';
                   if (r === 'global') return 'Global 🌐';
@@ -1167,7 +1209,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                 const regionalPackages: ServicePackage[] =
                   gameRgProducts.length > 0
                     ? gameRgProducts
-                        .filter(p => p.region.toLowerCase() === selectedRegion.toLowerCase())
+                        .filter(p => (p.region || '').toLowerCase() === (selectedRegion || '').toLowerCase())
                         .map((p, idx) => ({
                           id: `pkg_rg_${p.product_key}`,
                           serviceId: selectedService?.id || `srv_${selectedGame.slug}`,
@@ -1205,7 +1247,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                       </div>
                       <div className="flex flex-wrap gap-2">
                         {regionList.map(reg => {
-                          const isRegActive = selectedRegion.toLowerCase() === reg.toLowerCase();
+                          const isRegActive = (selectedRegion || '').toLowerCase() === (reg || '').toLowerCase();
                           return (
                             <button
                               key={reg}
@@ -1346,46 +1388,65 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                       ))}
                   </div>
 
-                  {/* GoXtop Name Checker for Free Fire & supported games */}
-                  {selectedGame.supportsNameCheck && (
-                    <div className="pt-2 border-t border-slate-100 space-y-2">
-                      <button
-                        type="button"
-                        disabled={isCheckingPlayer || !gameProfileInputs.playerId}
-                        onClick={handleVerifyPlayer}
-                        className="w-full py-2 px-3 bg-orange-50 hover:bg-orange-100 disabled:opacity-50 text-orange-700 border border-orange-200 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
-                      >
-                        {isCheckingPlayer ? (
-                          <>
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                            <span>Vérification GoXtop Name Checker...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Search className="w-3.5 h-3.5" />
-                            <span>Vérifier le Player ID ({selectedGame.name})</span>
-                          </>
-                        )}
-                      </button>
+                  {/* Official RechargeGames Player ID Verification ("Vérifier l'ID") */}
+                  <div className="pt-2 border-t border-slate-100 space-y-2">
+                    <button
+                      type="button"
+                      disabled={
+                        isCheckingPlayer ||
+                        !(
+                          gameProfileInputs.playerId ||
+                          gameProfileInputs.userId ||
+                          gameProfileInputs.characterId ||
+                          Object.values(gameProfileInputs)[0]
+                        )
+                      }
+                      onClick={handleVerifyPlayer}
+                      className="w-full py-2 px-3 bg-orange-50 hover:bg-orange-100 disabled:opacity-50 text-orange-700 border border-orange-200 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
+                    >
+                      {isCheckingPlayer ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Vérification de l’ID sur RechargeGames...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Search className="w-3.5 h-3.5" />
+                          <span>Vérifier l’ID</span>
+                        </>
+                      )}
+                    </button>
 
-                      {playerCheckResult && (
-                        <div className={`p-2.5 rounded-xl border text-[11px] ${
+                    {playerCheckResult && (
+                      <div
+                        className={`p-2.5 rounded-xl border text-[11px] ${
                           playerCheckResult.verified
                             ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                            : 'bg-amber-50 border-amber-200 text-amber-900'
-                        }`}>
-                          {playerCheckResult.verified ? (
+                            : !playerCheckResult.supported
+                            ? 'bg-slate-50 border-slate-200 text-slate-700'
+                            : 'bg-rose-50 border-rose-200 text-rose-900'
+                        }`}
+                      >
+                        {playerCheckResult.verified ? (
+                          <div className="space-y-0.5">
                             <div className="font-bold flex items-center gap-1.5">
                               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                              <span>Nom du joueur confirmé : {playerCheckResult.playerName}</span>
+                              <span>Joueur confirmé : {playerCheckResult.playerName}</span>
                             </div>
-                          ) : (
-                            <div>{playerCheckResult.message}</div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                            {(playerCheckResult.detectedRegion || playerCheckResult.region) && (
+                              <div className="text-[10px] text-emerald-700 pl-5">
+                                Région RechargeGames : <span className="font-semibold">{playerCheckResult.detectedRegion || playerCheckResult.region}</span>
+                              </div>
+                            )}
+                          </div>
+                        ) : !playerCheckResult.supported ? (
+                          <div>{playerCheckResult.message}</div>
+                        ) : (
+                          <div className="font-semibold">{playerCheckResult.message}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="p-3.5 bg-slate-100 border border-slate-200 rounded-2xl text-xs text-slate-600">
@@ -1632,12 +1693,21 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                   </div>
 
                   <button
-                    disabled={!selectedPackage || isOrdering}
+                    disabled={
+                      !selectedPackage ||
+                      isOrdering ||
+                      isCheckingPlayer ||
+                      Boolean(playerCheckResult && playerCheckResult.supported && !playerCheckResult.verified)
+                    }
                     onClick={handleProceedToPayment}
                     className="w-full py-3 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white font-semibold text-xs rounded-xl shadow-md transition-colors flex items-center justify-center gap-2"
                   >
                     <ShieldCheck className="w-4 h-4" />
-                    <span>Vérifier & Passer au paiement</span>
+                    <span>
+                      {selectedPackage
+                        ? `Acheter maintenant — $${selectedPackage.publicPrice.toFixed(2)} ${selectedPackage.currency}`
+                        : 'Sélectionnez un produit'}
+                    </span>
                   </button>
                 </div>
               )}
@@ -1765,7 +1835,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
                   <div className="space-y-2.5">
                     {games
-                      .filter(g => g.name.toLowerCase().includes(gameSearch.toLowerCase()))
+                      .filter(g => (g.name || '').toLowerCase().includes((gameSearch || '').toLowerCase()))
                       .map(game => (
                         <div
                           key={game.id}

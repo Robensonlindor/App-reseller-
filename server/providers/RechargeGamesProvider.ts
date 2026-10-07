@@ -405,6 +405,8 @@ const gatewayOrdersStore = new Map<
     created_at: string;
     updated_at: string;
     delivered_at?: string;
+    refunded_at?: string;
+    refund_reason?: string;
     failure_reason?: string;
   }
 >();
@@ -722,13 +724,15 @@ export class RechargeGamesProvider {
       isActive: true,
       serviceType: 'RechargeGames Official API',
       priority: 1,
+      latencyMs: 0,
+      customParams: [],
       endpoints: {
         getGamesPath: '/v1/products',
         getProductsPath: '/v1/products',
         createOrderPath: '/v1/orders',
         orderStatusPath: '/v1/orders/{order_id}',
         trackOrderPath: '/v1/orders/{order_id}',
-        checkPlayerPath: '/v1/players/verify'
+        checkPlayerPath: '/v1/region-check'
       }
     };
 
@@ -740,30 +744,20 @@ export class RechargeGamesProvider {
   }
 
   public getEffectiveBaseUrl(): string {
-    const port = 3000;
-    // In TEST mode or when pointing to the RechargeGames v1 gateway / default domain with the configured key, route to the mounted v1 gateway
-    if (
-      this.mode === 'TEST' ||
-      this.apiKey === 'rg_test_live_9f8a7b6c5d4e3f2a1b0c' ||
-      !this.baseUrl ||
-      this.baseUrl.includes('rechargegames-v1-gateway') ||
-      this.baseUrl.includes('rechargegames.com') ||
-      this.baseUrl.includes('rechargegame.games')
-    ) {
-      return `http://127.0.0.1:${port}/api/rechargegames-v1-gateway`;
+    const clean = (this.baseUrl || process.env.RECHARGEGAMES_BASE_URL || 'https://api.rechargegame.games').trim().replace(/\/+$/, '');
+    if (!clean || clean.includes('rechargegames-v1-gateway') || clean.includes('127.0.0.1') || clean.includes('localhost')) {
+      return 'https://api.rechargegame.games';
     }
-    return this.baseUrl.replace(/\/+$/, '');
+    return clean;
   }
 
   public buildHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
-      'User-Agent': 'PlayUp-RechargeGames-Client/1.0',
-      'X-RechargeGames-Mode': this.mode
+      'User-Agent': 'PlayUp-RechargeGames-Client/1.0'
     };
     if (this.apiKey) {
-      headers['Authorization'] = `Bearer ${this.apiKey}`;
       headers['X-API-Key'] = this.apiKey;
     }
     return headers;
@@ -869,13 +863,22 @@ export class RechargeGamesProvider {
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
+      const timeout = setTimeout(() => controller.abort(), 15000);
 
-      const res = await fetch(fullUrl, {
+      const pingUrl = `${effectiveBase}/v1/ping`;
+      const pingRes = await fetch(pingUrl, {
         method: 'GET',
         headers: this.buildHeaders(),
         signal: controller.signal
       });
+
+      const res = pingRes.ok
+        ? await fetch(fullUrl, {
+            method: 'GET',
+            headers: this.buildHeaders(),
+            signal: controller.signal
+          })
+        : pingRes;
       clearTimeout(timeout);
 
       const latency = Date.now() - startTime;
@@ -890,9 +893,10 @@ export class RechargeGamesProvider {
       const reqPreview = JSON.stringify({ method: 'GET', url: fullUrl, mode: this.mode, headers: maskedHeaders }, null, 2);
 
       if (res.status === 401) {
-        const errCode = parsed?.error?.code || '';
-        const label = errCode === 'INVALID_API_KEY' ? 'API Key invalide' : "Erreur d'authentification";
-        const code = errCode === 'INVALID_API_KEY' ? 'INVALID_API_KEY' : 'AUTH_ERROR';
+        const errCode = String(parsed?.error?.code || '').toUpperCase();
+        const isInvalidKey = errCode === 'INVALID_API_KEY';
+        const label = isInvalidKey ? 'API Key invalide' : "Erreur d'authentification";
+        const code = isInvalidKey ? 'INVALID_API_KEY' : 'AUTH_ERROR';
         const msg = parsed?.error?.message || `HTTP 401: Authentification refusée par RechargeGames.`;
         this.logApiCall('TEST_CONNECTION', 'GET', fullUrl, res.status, latency, label, false, rawText.slice(0, 1000), undefined, undefined, reqPreview);
         return {
@@ -943,11 +947,17 @@ export class RechargeGamesProvider {
         };
       }
 
-      const productsList = Array.isArray(parsed.products)
+      const gamesOrProductsList = Array.isArray(parsed.products)
         ? parsed.products
+        : Array.isArray(parsed.games)
+        ? parsed.games
+        : Array.isArray(parsed.categories)
+        ? parsed.categories
         : Array.isArray(parsed.data)
         ? parsed.data
         : [];
+
+      const syncedCount = db.getRechargeGamesProducts().length || gamesOrProductsList.length;
 
       this.logApiCall('TEST_CONNECTION', 'GET', fullUrl, res.status, latency, 'Connexion réussie', true, rawText.slice(0, 2000), undefined, undefined, reqPreview);
 
@@ -956,7 +966,7 @@ export class RechargeGamesProvider {
       const idx = providers.findIndex(p => p.id === 'prov_rechargegames');
       if (idx !== -1) {
         providers[idx].lastPingStatus = 'online';
-        providers[idx].lastPingLabel = `Connexion réussie (${productsList.length} produits)`;
+        providers[idx].lastPingLabel = `Connexion réussie (${gamesOrProductsList.length} jeux / ${syncedCount} produits)`;
         providers[idx].latencyMs = latency;
         db.setProviders(providers);
       }
@@ -968,10 +978,10 @@ export class RechargeGamesProvider {
         httpStatus: res.status,
         latencyMs: latency,
         endpointCalled: fullUrl,
-        details: `HTTP ${res.status} OK — Authentification RechargeGames validée en mode ${this.mode}. ${productsList.length} produits détectés.`,
+        details: `HTTP ${res.status} OK — Authentification RechargeGames validée en mode ${this.mode}. ${gamesOrProductsList.length} catégories/jeux détectés sur ${effectiveBase}.`,
         timestamp: new Date().toISOString(),
         authHeadersUsed: maskedHeaders,
-        productsCountDetected: productsList.length,
+        productsCountDetected: syncedCount,
         responseSnippet: String(db.sanitizeForLogs(rawText)).slice(0, 600)
       };
     } catch (err: any) {
@@ -992,9 +1002,10 @@ export class RechargeGamesProvider {
   }
 
   /**
-   * 4. SYNCHRONISATION DU CATALOGUE
-   * Fetches products from GET /v1/products, calculates PlayUp prices with server-side margins,
-   * stores in the `products` table, and updates PlayUp's `services` catalog.
+   * 4. SYNCHRONISATION DU CATALOGUE RECHARGEGAMES RÉEL (GET /v1/products?game=<slug>)
+   * Fetches live regional products from https://api.rechargegame.games/v1/products,
+   * calculates PlayUp prices with server-side margins, stores in the `products` table,
+   * and updates PlayUp's `services` catalog.
    */
   public async syncCatalog(): Promise<{
     success: boolean;
@@ -1009,22 +1020,39 @@ export class RechargeGamesProvider {
     const reqPreview = JSON.stringify({ method: 'GET', url: fullUrl, mode: this.mode, headers: maskedHeaders }, null, 2);
 
     try {
-      const res = await fetch(fullUrl, {
-        method: 'GET',
-        headers: this.buildHeaders()
-      });
-      const latency = Date.now() - startTime;
-      const rawText = await res.text();
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch {
-        parsed = null;
-      }
+      const targetSlugs = [
+        { rgSlug: 'free-fire', playupSlug: 'free-fire', displayGame: 'Free Fire', defaultUnit: 'Diamonds' },
+        { rgSlug: 'pubg-mobile', playupSlug: 'pubg-mobile', displayGame: 'PUBG Mobile', defaultUnit: 'UC' },
+        { rgSlug: 'mobile-legends', playupSlug: 'mobile-legends', displayGame: 'Mobile Legends', defaultUnit: 'Diamonds' },
+        { rgSlug: 'roblox', playupSlug: 'roblox', displayGame: 'Roblox (Codes Digitaux / Vouchers)', defaultUnit: 'Robux' },
+        { rgSlug: 'genshin-impact', playupSlug: 'genshin-impact', displayGame: 'Genshin Impact', defaultUnit: 'Genesis Crystals' },
+        { rgSlug: 'valorant-points', playupSlug: 'valorant', displayGame: 'Valorant', defaultUnit: 'VP' },
+        { rgSlug: '8-ball-pool', playupSlug: '8-ball-pool', displayGame: '8 Ball Pool', defaultUnit: 'Coins' }
+      ];
 
-      if (!res.ok || !parsed) {
-        const errMsg = parsed?.error?.message || `HTTP ${res.status}: Échec de récupération du catalogue RechargeGames`;
-        this.logApiCall('GET_PRODUCTS', 'GET', fullUrl, res.status, latency, 'Erreur synchronisation', false, rawText.slice(0, 1500), undefined, undefined, reqPreview);
+      const responses = await Promise.all(
+        targetSlugs.map(async item => {
+          const url = `${effectiveBase}/v1/products?game=${encodeURIComponent(item.rgSlug)}`;
+          const res = await fetch(url, {
+            method: 'GET',
+            headers: this.buildHeaders()
+          });
+          const text = await res.text();
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            parsed = null;
+          }
+          return { item, res, text, parsed };
+        })
+      );
+
+      const latency = Date.now() - startTime;
+      const firstFailed = responses.find(r => !r.res.ok || !r.parsed);
+      if (firstFailed && responses.every(r => !r.res.ok)) {
+        const errMsg = firstFailed.parsed?.error?.message || `HTTP ${firstFailed.res.status}: Échec de récupération du catalogue RechargeGames`;
+        this.logApiCall('GET_PRODUCTS', 'GET', fullUrl, firstFailed.res.status, latency, 'Erreur synchronisation', false, firstFailed.text.slice(0, 1500), undefined, undefined, reqPreview);
         const currentStats = db.getRechargeGamesSyncStats();
         db.updateRechargeGamesSyncStats({
           syncErrors: [
@@ -1040,60 +1068,72 @@ export class RechargeGamesProvider {
         };
       }
 
-      const rawList: any[] = Array.isArray(parsed.products)
-        ? parsed.products
-        : Array.isArray(parsed.data)
-        ? parsed.data
-        : Array.isArray(parsed)
-        ? parsed
-        : [];
-
       const nowIso = new Date().toISOString();
       const mappedProducts: RechargeGamesProduct[] = [];
       const syncErrors: string[] = [];
+      let rawResponseSample = '';
 
-      for (const item of rawList) {
-        const productKey = String(item.product_key || item.productKey || item.id || '').trim();
-        if (!productKey) {
-          syncErrors.push(`Produit ignoré : product_key manquant (${JSON.stringify(item).slice(0, 100)})`);
+      for (const { item, res, text, parsed } of responses) {
+        if (!res.ok || !parsed) {
+          syncErrors.push(`Jeu ${item.rgSlug}: HTTP ${res.status}`);
           continue;
         }
-        const gameName = String(item.game || item.game_name || 'Free Fire').trim();
-        const region = String(item.region || item.country || 'Global').trim();
-        const name = String(item.name || item.title || productKey).trim();
-        const topupValue = String(item.topup_value || item.value || item.amount || name).trim();
-        const providerPrice = Number(item.provider_price ?? item.price ?? item.cost ?? 0);
-        const currency = String(item.currency || 'USD').toUpperCase();
-        const active = item.active !== undefined ? Boolean(item.active) : item.available !== undefined ? Boolean(item.available) : true;
+        if (!rawResponseSample) {
+          rawResponseSample = text.slice(0, 2500);
+        }
 
-        const marginCalc = db.computePlayUpMarginAndPrice(providerPrice, gameName, region, productKey);
+        const categories: any[] = Array.isArray(parsed.categories) ? parsed.categories : [];
+        for (const cat of categories) {
+          const groups: any[] = Array.isArray(cat.groups) ? cat.groups : [];
+          for (const grp of groups) {
+            const regionLabel = String(grp.key || grp.slug || 'Global').trim();
+            const prods: any[] = Array.isArray(grp.products) ? grp.products : [];
+            // Take up to 12 products per region so the catalog stays fast and comprehensive
+            for (const prod of prods.slice(0, 12)) {
+              const productKey = String(prod.product_key || '').trim();
+              if (!productKey) continue;
 
-        mappedProducts.push({
-          id: `rg_prod_${productKey}`,
-          provider: 'rechargegames',
-          product_key: productKey,
-          game: gameName,
-          game_slug: item.game_slug || gameName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-          region,
-          name,
-          topup_value: topupValue,
-          amount: Number(item.amount) || parseInt(topupValue, 10) || 1,
-          unit: item.unit || 'Top-Up',
-          provider_price: providerPrice,
-          currency,
-          playup_price: marginCalc.playupPrice,
-          margin_percent: marginCalc.marginPercent,
-          profit_estimate: marginCalc.profit,
-          active,
-          requires_player_id: item.requires_player_id !== false,
-          last_synced_at: nowIso,
-          raw_metadata: item
-        });
+              const providerPrice = Number(prod.price ?? prod.provider_price ?? 0);
+              if (providerPrice <= 0) continue;
+
+              const gameName = item.displayGame;
+              const name = String(prod.name || productKey).trim();
+              const amount = Number(prod.amount) || parseInt(name, 10) || 1;
+              const unit = String(prod.unit || cat.unit || item.defaultUnit || 'Top-Up');
+              const active = prod.out_of_stock ? false : true;
+              const requiresPlayerId = prod.delivery !== 'code' && cat.kind !== 'giftcard';
+
+              const marginCalc = db.computePlayUpMarginAndPrice(providerPrice, gameName, regionLabel, productKey);
+
+              mappedProducts.push({
+                id: `rg_prod_${productKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+                provider: 'rechargegames',
+                product_key: productKey,
+                game: gameName,
+                game_slug: item.playupSlug,
+                region: regionLabel,
+                name,
+                topup_value: `${amount} ${unit}`,
+                amount,
+                unit,
+                provider_price: providerPrice,
+                currency: 'USD',
+                playup_price: marginCalc.playupPrice,
+                margin_percent: marginCalc.marginPercent,
+                profit_estimate: marginCalc.profit,
+                active,
+                requires_player_id: requiresPlayerId,
+                last_synced_at: nowIso,
+                raw_metadata: prod
+              });
+            }
+          }
+        }
       }
 
       db.setRechargeGamesProducts(mappedProducts);
 
-      // Also synchronize active RechargeGames products into PlayUp's Services packages so all views stay unified
+      // Synchronize active RechargeGames products into PlayUp's Services packages so all views stay unified
       this.syncIntoPlayUpServices(mappedProducts);
 
       db.updateRechargeGamesSyncStats({
@@ -1105,11 +1145,11 @@ export class RechargeGamesProvider {
         'GET_PRODUCTS',
         'GET',
         fullUrl,
-        res.status,
+        200,
         latency,
-        `Catalogue synchronisé (${mappedProducts.length} produits)`,
+        `Catalogue synchronisé (${mappedProducts.length} produits réels)`,
         true,
-        rawText.slice(0, 2500),
+        rawResponseSample,
         undefined,
         undefined,
         reqPreview
@@ -1117,7 +1157,7 @@ export class RechargeGamesProvider {
 
       return {
         success: true,
-        message: `Synchronisation RechargeGames réussie : ${mappedProducts.length} produits synchronisés (${mappedProducts.filter(p => p.active).length} actifs, ${mappedProducts.filter(p => !p.active).length} indisponibles).`,
+        message: `Synchronisation RechargeGames réussie : ${mappedProducts.length} produits réels synchronisés (${mappedProducts.filter(p => p.active).length} actifs, ${mappedProducts.filter(p => !p.active).length} indisponibles).`,
         products: db.getRechargeGamesProducts(),
         stats: db.getRechargeGamesSyncStats()
       };
@@ -1134,6 +1174,191 @@ export class RechargeGamesProvider {
         message: errMsg,
         products: db.getRechargeGamesProducts(),
         stats: db.getRechargeGamesSyncStats()
+      };
+    }
+  }
+
+  /**
+   * 5. VALIDATION OFFICIELLE DU PLAYER ID RECHARGEGAMES (GET /v1/region-check)
+   * Calls GET https://api.rechargegame.games/v1/region-check?game=<slug>&uid=<uid>&region=<region>
+   */
+  public async verifyPlayerId(params: {
+    gameSlug: string;
+    playerId: string;
+    region?: string;
+    strictRegionMatch?: boolean;
+  }): Promise<{
+    supported: boolean;
+    verified: boolean;
+    status: string;
+    playerName?: string;
+    region?: string;
+    detectedRegion?: string;
+    provider: string;
+    rawResponse?: any;
+    message: string;
+  }> {
+    const startTime = Date.now();
+    const effectiveBase = this.getEffectiveBaseUrl();
+    const cleanPlayerId = String(params.playerId || '').trim();
+
+    if (!cleanPlayerId) {
+      return {
+        supported: true,
+        verified: false,
+        status: 'EMPTY_PLAYER_ID',
+        provider: 'RechargeGames',
+        message: 'Veuillez saisir un Player ID valide.'
+      };
+    }
+
+    // Normalize game slug for RechargeGames /v1/region-check
+    let rgGameSlug = String(params.gameSlug || '').toLowerCase().trim();
+    if (rgGameSlug.includes('free') && rgGameSlug.includes('fire')) rgGameSlug = 'free-fire';
+    else if (rgGameSlug.includes('mobile') && rgGameSlug.includes('legend')) rgGameSlug = 'mobile-legends';
+    else if (rgGameSlug.includes('pubg')) rgGameSlug = 'pubg-mobile';
+    else if (rgGameSlug.includes('genshin')) rgGameSlug = 'genshin-impact';
+    else if (rgGameSlug.includes('roblox')) rgGameSlug = 'roblox';
+    else if (rgGameSlug.includes('valorant')) rgGameSlug = 'valorant-points';
+    else if (rgGameSlug.includes('8') && rgGameSlug.includes('ball')) rgGameSlug = '8-ball-pool';
+
+    const cleanRegion = params.region ? String(params.region).trim() : '';
+    const queryParams = new URLSearchParams({
+      game: rgGameSlug,
+      uid: cleanPlayerId
+    });
+    if (cleanRegion) {
+      queryParams.set('region', cleanRegion);
+    }
+
+    const fullUrl = `${effectiveBase}/v1/region-check?${queryParams.toString()}`;
+    const maskedHeaders = this.buildMaskedHeaders();
+    const reqPreview = JSON.stringify({ method: 'GET', url: fullUrl, headers: maskedHeaders }, null, 2);
+
+    try {
+      const res = await fetch(fullUrl, {
+        method: 'GET',
+        headers: this.buildHeaders()
+      });
+      const latency = Date.now() - startTime;
+      const rawText = await res.text();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+
+      if (!res.ok || !parsed) {
+        this.logApiCall('GET_PRODUCTS', 'GET', fullUrl, res.status, latency, 'Erreur vérification Player ID', false, rawText.slice(0, 1000), undefined, undefined, reqPreview);
+        return {
+          supported: true,
+          verified: false,
+          status: 'API_ERROR',
+          provider: 'RechargeGames',
+          rawResponse: parsed,
+          message: parsed?.error?.message || `Erreur RechargeGames lors de la vérification du Player ID (HTTP ${res.status}).`
+        };
+      }
+
+      const status = String(parsed.status || 'UNKNOWN').toUpperCase();
+      const nickname = parsed.nickname ? String(parsed.nickname).trim() : undefined;
+      const detectedRegion = parsed.region ? String(parsed.region).trim() : undefined;
+
+      this.logApiCall(
+        'GET_PRODUCTS',
+        'GET',
+        fullUrl,
+        res.status,
+        latency,
+        `Vérification Player ID: ${status}${nickname ? ` (${nickname})` : ''}`,
+        status === 'OK' || status === 'NO_LOCK' || status === 'EXISTS' || (status === 'WRONG_REGION' && !params.strictRegionMatch),
+        rawText.slice(0, 1000),
+        undefined,
+        undefined,
+        reqPreview
+      );
+
+      if (status === 'UID_NOT_FOUND') {
+        return {
+          supported: true,
+          verified: false,
+          status: 'UID_NOT_FOUND',
+          provider: 'RechargeGames',
+          rawResponse: parsed,
+          message: `Player ID "${cleanPlayerId}" introuvable sur RechargeGames (UID_NOT_FOUND). Veuillez vérifier votre identifiant.`
+        };
+      }
+
+      if (status === 'UNSUPPORTED' || status === 'UNVERIFIED') {
+        return {
+          supported: false,
+          verified: false,
+          status,
+          provider: 'RechargeGames',
+          rawResponse: parsed,
+          message: `La validation préalable du Player ID n'est pas supportée par RechargeGames pour ce service (${status}).`
+        };
+      }
+
+      if (status === 'WRONG_REGION') {
+        if (params.strictRegionMatch) {
+          return {
+            supported: true,
+            verified: false,
+            status: 'WRONG_REGION',
+            playerName: nickname,
+            region: detectedRegion,
+            detectedRegion,
+            provider: 'RechargeGames',
+            rawResponse: parsed,
+            message: `Ce compte joueur (${nickname || cleanPlayerId}) appartient à la région "${detectedRegion}" et ne correspond pas à la région "${cleanRegion}".`
+          };
+        }
+        // When checking Player ID from the UI, if RechargeGames found the player and returned their real region (e.g. LATAM),
+        // confirm the player and return detectedRegion so the UI automatically switches to the player's official region!
+        return {
+          supported: true,
+          verified: true,
+          status: 'OK',
+          playerName: nickname || cleanPlayerId,
+          region: detectedRegion || cleanRegion,
+          detectedRegion: detectedRegion || cleanRegion,
+          provider: 'RechargeGames',
+          rawResponse: parsed,
+          message: `Joueur vérifié sur RechargeGames : ${nickname || cleanPlayerId} (Région du compte : ${detectedRegion || cleanRegion})`
+        };
+      }
+
+      if (status === 'OK' || status === 'NO_LOCK' || status === 'EXISTS') {
+        return {
+          supported: true,
+          verified: true,
+          status,
+          playerName: nickname || cleanPlayerId,
+          region: detectedRegion || cleanRegion,
+          detectedRegion: detectedRegion || cleanRegion,
+          provider: 'RechargeGames',
+          rawResponse: parsed,
+          message: `Joueur vérifié sur RechargeGames : ${nickname || cleanPlayerId}${detectedRegion ? ` (Région : ${detectedRegion})` : ''}`
+        };
+      }
+
+      return {
+        supported: true,
+        verified: false,
+        status,
+        provider: 'RechargeGames',
+        rawResponse: parsed,
+        message: `Réponse RechargeGames : ${status}`
+      };
+    } catch (err: any) {
+      return {
+        supported: true,
+        verified: false,
+        status: 'NETWORK_ERROR',
+        provider: 'RechargeGames',
+        message: `Erreur réseau lors de la vérification du Player ID : ${err?.message || 'Inconnue'}`
       };
     }
   }
@@ -1177,7 +1402,6 @@ export class RechargeGamesProvider {
         displayOrder: idx + 1
       }));
 
-      // Keep existing packages if different or replace with synced regional RechargeGames packages
       srv.packages = rgPackages;
       srv.updatedAt = new Date().toISOString();
     }
@@ -1263,17 +1487,41 @@ export class RechargeGamesProvider {
       };
     }
 
-    // Step 5b: Vérifier les informations du joueur (Player ID)
+    // Step 5b: Vérifier les informations du joueur (Player ID) via format et via RechargeGames /v1/region-check
     const cleanPlayerId = String(params.playerId || '').trim();
+    let verifiedNickname = params.playerName ? String(params.playerName).trim() : undefined;
     if (product.requires_player_id !== false) {
-      if (!cleanPlayerId || cleanPlayerId.length < 5 || !/^[a-zA-Z0-9_-]{5,24}$/.test(cleanPlayerId)) {
+      if (!cleanPlayerId || cleanPlayerId.length < 4 || !/^[a-zA-Z0-9_-]{4,32}$/.test(cleanPlayerId)) {
         return {
           success: false,
           httpStatus: 400,
           errorCode: 'INVALID_PLAYER_ID',
-          userMessage: 'Votre Player ID est invalide. Veuillez vérifier votre identifiant de joueur (5 à 24 caractères alphanumériques).',
+          userMessage: 'Votre Player ID est invalide. Veuillez vérifier votre identifiant de joueur.',
           technicalError: `Invalid player_id "${cleanPlayerId}" for product "${product.product_key}".`
         };
+      }
+
+      // Perform real RechargeGames Player ID & Region validation unless player_id starts with 'fail' (official RechargeGames test-failure trigger)
+      if (!cleanPlayerId.toLowerCase().startsWith('fail')) {
+        const liveCheck = await this.verifyPlayerId({
+          gameSlug: product.game_slug || product.game,
+          playerId: cleanPlayerId,
+          region: product.region,
+          strictRegionMatch: true
+        });
+        if (liveCheck.supported && !liveCheck.verified) {
+          const isWrongRegion = liveCheck.status === 'WRONG_REGION';
+          return {
+            success: false,
+            httpStatus: isWrongRegion ? 422 : 400,
+            errorCode: isWrongRegion ? 'REGION_MISMATCH' : 'INVALID_PLAYER_ID',
+            userMessage: liveCheck.message,
+            technicalError: `RechargeGames /v1/region-check rejected player_id="${cleanPlayerId}" for region="${product.region}": ${liveCheck.status}`
+          };
+        }
+        if (liveCheck.verified && liveCheck.playerName) {
+          verifiedNickname = liveCheck.playerName;
+        }
       }
     }
 
@@ -1337,14 +1585,15 @@ export class RechargeGamesProvider {
     const fullUrl = `${effectiveBase}/v1/orders`;
     const maskedHeaders = this.buildMaskedHeaders();
 
-    const outboundPayload = {
+    const outboundPayload: Record<string, any> = {
+      product: product.name,
       product_key: product.product_key,
-      buyer_ref: buyerRef,
-      player_id: cleanPlayerId || 'VOUCHER_PIN',
-      player_name: params.playerName || undefined,
-      server_id: params.serverId || undefined,
       region: product.region,
-      test_mode: isTestMode
+      quantity: 1,
+      player_id: cleanPlayerId || null,
+      server_id: params.serverId || null,
+      buyer_ref: buyerRef,
+      test: isTestMode
     };
 
     const reqPreview = JSON.stringify(
@@ -1360,7 +1609,7 @@ export class RechargeGamesProvider {
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
+      const timeout = setTimeout(() => controller.abort(), 20000);
 
       const res = await fetch(fullUrl, {
         method: 'POST',
@@ -1379,19 +1628,29 @@ export class RechargeGamesProvider {
         parsed = null;
       }
 
-      if (!res.ok || !parsed || parsed.success === false) {
+      if (!res.ok || !parsed || parsed.success === false || parsed.error) {
         const techErr = parsed?.error?.message || `HTTP ${res.status}: ${rawText.slice(0, 300)}`;
-        const errCode = parsed?.error?.code || (res.status === 409 ? 'DUPLICATE_ORDER' : res.status === 429 ? 'RATE_LIMIT' : 'PROVIDER_ERROR');
+        const rawErrCode = String(parsed?.error?.code || '').toUpperCase();
+        const errCode =
+          rawErrCode ||
+          (res.status === 409
+            ? 'OUT_OF_STOCK'
+            : res.status === 402
+            ? 'INSUFFICIENT_BALANCE'
+            : res.status === 429
+            ? 'RATE_LIMIT'
+            : 'PROVIDER_ERROR');
         this.logApiCall('CREATE_ORDER', 'POST', fullUrl, res.status, latency, `Échec création (${errCode})`, false, rawText.slice(0, 1500), undefined, buyerRef, reqPreview);
 
-        // User-safe message (Never expose sensitive technical error like "Authentication failed" to the customer)
         let safeUserMsg = 'Impossible de traiter la commande pour le moment. Veuillez réessayer.';
         if (errCode === 'DUPLICATE_BUYER_REF' || errCode === 'DUPLICATE_ORDER') {
           safeUserMsg = 'Cette commande a déjà été envoyée (protection anti-duplication).';
         } else if (errCode === 'INVALID_PLAYER_ID') {
           safeUserMsg = 'Le Player ID renseigné a été refusé par le serveur du jeu.';
-        } else if (errCode === 'PRODUCT_UNAVAILABLE') {
-          safeUserMsg = 'Ce produit est momentanément indisponible.';
+        } else if (errCode === 'PRODUCT_UNAVAILABLE' || errCode === 'OUT_OF_STOCK' || errCode === 'UNKNOWN_PRODUCT') {
+          safeUserMsg = 'Ce produit est momentanément indisponible chez RechargeGames.';
+        } else if (errCode === 'INSUFFICIENT_BALANCE') {
+          safeUserMsg = 'Solde revendeur RechargeGames insuffisant en mode PRODUCTION. Activez le mode TEST ou rechargez le compte USDT.';
         }
 
         return {
@@ -1407,6 +1666,7 @@ export class RechargeGamesProvider {
       const providerOrderId = String(parsed.order_id || parsed.id || `rg_${Date.now()}`);
       const playupOrderNumber = `PU-${Math.floor(10000 + Math.random() * 90000)}`;
       const nowIso = new Date().toISOString();
+      const effectivePlayerName = verifiedNickname || params.playerName;
 
       const rgOrderRecord: RechargeGamesOrderRecord = {
         id: playupOrderNumber,
@@ -1419,14 +1679,14 @@ export class RechargeGamesProvider {
         game: product.game,
         region: product.region,
         player_id: cleanPlayerId || 'VOUCHER_PIN',
-        player_name: params.playerName,
+        player_name: effectivePlayerName,
         server_id: params.serverId,
         provider_price: providerPrice,
         customer_price: customerPrice,
         profit,
         currency: product.currency,
         status: 'pending', // Strictly pending until confirmed by webhook or GET /v1/orders/{order_id}
-        test_mode: isTestMode,
+        test_mode: Boolean(parsed.test ?? isTestMode),
         payment_method: params.paymentMethod || 'wallet',
         payment_reference: params.paymentReference,
         created_at: nowIso,
@@ -1464,13 +1724,13 @@ export class RechargeGamesProvider {
         externalProductId: product.product_key,
         packageName: `${product.name} [${product.region}]`,
         playerId: cleanPlayerId,
-        verifiedPlayerName: params.playerName,
+        verifiedPlayerName: effectivePlayerName,
         serverId: params.serverId || product.region,
         gameProfileData: {
           playerId: cleanPlayerId,
           region: product.region,
           product_key: product.product_key,
-          ...(params.playerName ? { playerName: params.playerName } : {}),
+          ...(effectivePlayerName ? { playerName: effectivePlayerName } : {}),
           ...(params.serverId ? { serverId: params.serverId } : {})
         },
         publicPrice: customerPrice,
@@ -1660,68 +1920,84 @@ export class RechargeGamesProvider {
     }
     signingPayloads.push(rawBody);
 
-    const primaryComputedHex = crypto
-      .createHmac('sha256', this.webhookSecret)
-      .update(signingPayloads[0], 'utf8')
-      .digest('hex');
+    // Derive both the Standard Webhooks base64 key (from `whsec_<base64>`) and raw secret string key
+    const hmacKeys: (string | Buffer)[] = [];
+    if (this.webhookSecret.startsWith('whsec_')) {
+      try {
+        const b64Key = Buffer.from(this.webhookSecret.slice(6), 'base64');
+        if (b64Key.length > 0) {
+          hmacKeys.push(b64Key);
+        }
+      } catch {
+        // Fallback to raw secret
+      }
+    }
+    hmacKeys.push(this.webhookSecret);
 
-    const computedPreview = `${primaryComputedHex.slice(0, 10)}••••${primaryComputedHex.slice(-8)}`;
+    const primaryComputedBase64 = crypto
+      .createHmac('sha256', hmacKeys[0])
+      .update(signingPayloads[0], 'utf8')
+      .digest('base64');
+
+    const computedPreview = `v1,${primaryComputedBase64.slice(0, 8)}••••${primaryComputedBase64.slice(-6)}`;
 
     for (const payloadToSign of signingPayloads) {
-      const expectedHex = crypto
-        .createHmac('sha256', this.webhookSecret)
-        .update(payloadToSign, 'utf8')
-        .digest('hex');
-      const expectedBase64 = crypto
-        .createHmac('sha256', this.webhookSecret)
-        .update(payloadToSign, 'utf8')
-        .digest('base64');
+      for (const keyToUse of hmacKeys) {
+        const expectedHex = crypto
+          .createHmac('sha256', keyToUse)
+          .update(payloadToSign, 'utf8')
+          .digest('hex');
+        const expectedBase64 = crypto
+          .createHmac('sha256', keyToUse)
+          .update(payloadToSign, 'utf8')
+          .digest('base64');
 
-      for (const candidate of candidateSigs) {
-        // Timing-safe comparison against hex digest
-        if (candidate.length === expectedHex.length) {
-          try {
-            if (
-              crypto.timingSafeEqual(
-                Buffer.from(candidate.toLowerCase(), 'utf8'),
-                Buffer.from(expectedHex.toLowerCase(), 'utf8')
-              )
-            ) {
-              return {
-                valid: true,
-                webhookId,
-                webhookTimestamp,
-                signatureHeader: 'webhook-signature',
-                signatureMasked: maskedSig,
-                computedHmacPreview: computedPreview,
-                reason: 'Signature HMAC-SHA256 authentifiée avec succès.'
-              };
+        for (const candidate of candidateSigs) {
+          // Timing-safe comparison against hex digest
+          if (candidate.length === expectedHex.length) {
+            try {
+              if (
+                crypto.timingSafeEqual(
+                  Buffer.from(candidate.toLowerCase(), 'utf8'),
+                  Buffer.from(expectedHex.toLowerCase(), 'utf8')
+                )
+              ) {
+                return {
+                  valid: true,
+                  webhookId,
+                  webhookTimestamp,
+                  signatureHeader: 'webhook-signature',
+                  signatureMasked: maskedSig,
+                  computedHmacPreview: computedPreview,
+                  reason: 'Signature HMAC-SHA256 authentifiée avec succès.'
+                };
+              }
+            } catch {
+              // Continue checking
             }
-          } catch {
-            // Continue checking
           }
-        }
-        // Timing-safe comparison against base64 digest
-        if (candidate.length === expectedBase64.length) {
-          try {
-            if (
-              crypto.timingSafeEqual(
-                Buffer.from(candidate, 'utf8'),
-                Buffer.from(expectedBase64, 'utf8')
-              )
-            ) {
-              return {
-                valid: true,
-                webhookId,
-                webhookTimestamp,
-                signatureHeader: 'webhook-signature',
-                signatureMasked: maskedSig,
-                computedHmacPreview: computedPreview,
-                reason: 'Signature HMAC-SHA256 (Base64) authentifiée avec succès.'
-              };
+          // Timing-safe comparison against Standard Webhooks base64 digest
+          if (candidate.length === expectedBase64.length) {
+            try {
+              if (
+                crypto.timingSafeEqual(
+                  Buffer.from(candidate, 'utf8'),
+                  Buffer.from(expectedBase64, 'utf8')
+                )
+              ) {
+                return {
+                  valid: true,
+                  webhookId,
+                  webhookTimestamp,
+                  signatureHeader: 'webhook-signature',
+                  signatureMasked: maskedSig,
+                  computedHmacPreview: computedPreview,
+                  reason: 'Signature Standard Webhooks HMAC-SHA256 (Base64) authentifiée avec succès.'
+                };
+              }
+            } catch {
+              // Continue checking
             }
-          } catch {
-            // Continue checking
           }
         }
       }
@@ -1739,15 +2015,18 @@ export class RechargeGamesProvider {
   }
 
   /**
-   * Generates a valid RechargeGames HMAC-SHA256 signature for testing / internal simulation
+   * Generates a valid Standard Webhooks HMAC-SHA256 signature (`v1,<base64>`) using RECHARGEGAMES_WEBHOOK_SECRET
    */
   public signWebhookPayload(rawBody: string, webhookId: string, webhookTimestamp: string): string {
     const canonical = `${webhookId}.${webhookTimestamp}.${rawBody}`;
-    const hex = crypto
-      .createHmac('sha256', this.webhookSecret)
+    const key: string | Buffer = this.webhookSecret.startsWith('whsec_')
+      ? Buffer.from(this.webhookSecret.slice(6), 'base64')
+      : this.webhookSecret;
+    const b64 = crypto
+      .createHmac('sha256', key)
       .update(canonical, 'utf8')
-      .digest('hex');
-    return `v1,${hex}`;
+      .digest('base64');
+    return `v1,${b64}`;
   }
 
   /**
@@ -2133,13 +2412,16 @@ export class RechargeGamesProvider {
 
       // 7. Process order.delivered, order.refunded, or order.failed
       if (eventType === 'order.delivered') {
-        const failureOrPin = payload?.data?.pin_code || payload?.pin_code;
+        const deliveryNoteOrPin =
+          payload?.data?.delivery_note ||
+          payload?.delivery_note ||
+          payload?.data?.pin_code ||
+          payload?.pin_code;
         this.applyOrderStatusTransition(
           targetOrder,
           'delivered',
-          `Top-up livré avec succès. Confirmé par webhook RechargeGames (order.delivered, event_id=${eventId})${failureOrPin ? ` — Code: ${failureOrPin}` : ''}`
+          `Top-up livré avec succès. Confirmé par webhook RechargeGames (order.delivered, event_id=${eventId})${deliveryNoteOrPin ? ` — Note: ${deliveryNoteOrPin}` : ''}`
         );
-        setGatewayOrderStatus(targetOrder.provider_order_id, 'delivered');
         processingSteps.push(`[4] Commande PlayUp #${targetOrder.id} (RechargeGames: ${targetOrder.provider_order_id}) passée à "delivered" — Top-up livré avec succès.`);
       } else if (eventType === 'order.refunded') {
         const refundReason =
@@ -2148,7 +2430,6 @@ export class RechargeGamesProvider {
           payload?.reason ||
           'Remboursement officiel confirmé par RechargeGames (order.refunded)';
         this.applyOrderStatusTransition(targetOrder, 'refunded', String(refundReason));
-        setGatewayOrderStatus(targetOrder.provider_order_id, 'refunded', String(refundReason));
         processingSteps.push(`[4] Commande PlayUp #${targetOrder.id} (RechargeGames: ${targetOrder.provider_order_id}) passée à "refunded" et remboursement PlayUp exécuté ($${targetOrder.customer_price.toFixed(2)} ${targetOrder.currency}).`);
       } else if (eventType === 'order.failed') {
         const reason =
@@ -2157,7 +2438,6 @@ export class RechargeGamesProvider {
           payload?.error ||
           'Échec de livraison signalé par RechargeGames (order.failed)';
         this.applyOrderStatusTransition(targetOrder, 'failed', String(reason));
-        setGatewayOrderStatus(targetOrder.provider_order_id, 'failed', String(reason));
         processingSteps.push(`[4] Commande PlayUp #${targetOrder.id} (RechargeGames: ${targetOrder.provider_order_id}) passée à "failed" (${reason}).`);
       }
 
@@ -2406,8 +2686,7 @@ export class RechargeGamesProvider {
     const providerOrderId = rgOrder ? rgOrder.provider_order_id : orderIdOrProviderOrderId;
 
     const effectiveBase = this.getEffectiveBaseUrl();
-    const querySuffix = options?.autoCompleteInTestMode ? '?auto_complete=true' : '';
-    const fullUrl = `${effectiveBase}/v1/orders/${encodeURIComponent(providerOrderId)}${querySuffix}`;
+    const fullUrl = `${effectiveBase}/v1/orders/${encodeURIComponent(providerOrderId)}`;
     const maskedHeaders = this.buildMaskedHeaders();
     const reqPreview = JSON.stringify({ method: 'GET', url: fullUrl, headers: maskedHeaders }, null, 2);
 
@@ -2440,6 +2719,8 @@ export class RechargeGamesProvider {
       let remoteStatus: RechargeGamesOrderStatus = 'pending';
       if (remoteStatusRaw === 'delivered' || remoteStatusRaw === 'completed' || remoteStatusRaw === 'success') {
         remoteStatus = 'delivered';
+      } else if (remoteStatusRaw === 'refunded') {
+        remoteStatus = 'refunded';
       } else if (remoteStatusRaw === 'failed' || remoteStatusRaw === 'error' || remoteStatusRaw === 'cancelled') {
         remoteStatus = 'failed';
       }
@@ -2447,12 +2728,15 @@ export class RechargeGamesProvider {
       if (rgOrder) {
         rgOrder.poll_attempts = (rgOrder.poll_attempts || 0) + 1;
         rgOrder.last_polled_at = new Date().toISOString();
-        if (remoteStatus !== 'pending' && rgOrder.status === 'pending') {
+        if (remoteStatus !== 'pending' && (rgOrder.status === 'pending' || remoteStatus === 'refunded')) {
+          const deliveryNote = parsed.delivery_note ? ` (Note: ${parsed.delivery_note})` : '';
           this.applyOrderStatusTransition(
             rgOrder,
             remoteStatus,
             remoteStatus === 'delivered'
-              ? `Confirmé via GET /v1/orders/${providerOrderId}`
+              ? `Confirmé via GET /v1/orders/${providerOrderId}${deliveryNote}`
+              : remoteStatus === 'refunded'
+              ? parsed.refund_reason || `Remboursement confirmé via GET /v1/orders/${providerOrderId}`
               : parsed.failure_reason || 'Échec confirmé via GET /v1/orders/{order_id}'
           );
         } else {

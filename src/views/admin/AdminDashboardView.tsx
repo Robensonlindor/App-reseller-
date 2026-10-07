@@ -992,11 +992,11 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                       .filter(
                         o =>
                           !orderSearch ||
-                          o.orderNumber.toLowerCase().includes(orderSearch.toLowerCase()) ||
+                          (o.orderNumber || '').toLowerCase().includes(orderSearch.toLowerCase()) ||
                           (o.partnerOrderId && o.partnerOrderId.toLowerCase().includes(orderSearch.toLowerCase())) ||
                           (o.externalOrderId && o.externalOrderId.toLowerCase().includes(orderSearch.toLowerCase())) ||
                           (o.playerId && o.playerId.toLowerCase().includes(orderSearch.toLowerCase())) ||
-                          o.gameName.toLowerCase().includes(orderSearch.toLowerCase())
+                          (o.gameName || '').toLowerCase().includes(orderSearch.toLowerCase())
                       )
                       .map(o => {
                         const calcMargin = typeof o.margin === 'number' ? o.margin : Number((o.chargedAmount - o.supplierCost).toFixed(2));
@@ -1130,8 +1130,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                       .filter(
                         u =>
                           !userSearch ||
-                          u.name.toLowerCase().includes(userSearch.toLowerCase()) ||
-                          u.email.toLowerCase().includes(userSearch.toLowerCase()) ||
+                          (u.name || '').toLowerCase().includes(userSearch.toLowerCase()) ||
+                          (u.email || '').toLowerCase().includes(userSearch.toLowerCase()) ||
                           (u.phone && u.phone.toLowerCase().includes(userSearch.toLowerCase()))
                       )
                       .map(u => (

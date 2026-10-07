@@ -4,11 +4,8 @@ import { db } from './db';
 import { ProviderEngine } from './providerEngine';
 import { WebhookEngine } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
-import {
-  RechargeGamesProvider,
-  rechargeGamesGatewayRouter,
-  setGatewayOrderStatus
-} from './providers/RechargeGamesProvider';
+import { RechargeGamesProvider } from './providers/RechargeGamesProvider';
+export { RechargeGamesProvider };
 import {
   Game,
   Service,
@@ -21,9 +18,6 @@ import {
 } from '../src/types';
 
 export const apiRouter = Router();
-
-// Mount RechargeGames v1 Gateway for official TEST mode (/api/rechargegames-v1-gateway/v1/*)
-apiRouter.use('/rechargegames-v1-gateway', rechargeGamesGatewayRouter);
 
 // Middleware: Authenticate App User via Session Token
 const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
@@ -70,7 +64,7 @@ const authenticateReseller = (req: Request, res: Response, next: NextFunction) =
 
     const reseller = resellers.find(r => r.id === foundKey.resellerId);
     if (!reseller || reseller.status !== 'active') {
-      return res.status(403).json({
+      return res.status(401).json({
         error: 'Forbidden',
         message: 'Compte revendeur inactif ou suspendu. Contactez le support PlayUp.'
       });
@@ -147,12 +141,17 @@ apiRouter.get('/games', (_req, res) => {
       packages: srv.packages.filter(p => p.isActive).map(p => ({
         id: p.id,
         serviceId: p.serviceId,
+        externalProductId: p.externalProductId,
+        externalGameId: p.externalGameId,
+        providerSlug: p.providerSlug,
         name: p.name,
         amount: p.amount,
         unit: p.unit,
         publicPrice: p.publicPrice,
         currency: p.currency,
         isActive: p.isActive,
+        requiresPlayerId: p.requiresPlayerId,
+        requiredFields: p.requiredFields,
         displayOrder: p.displayOrder
       }))
     }));
@@ -259,7 +258,7 @@ apiRouter.post('/auth/login', (req, res) => {
     }
 
     if (user.status === 'suspended') {
-      return res.status(403).json({ error: 'Ce compte utilisateur a été suspendu par un administrateur.' });
+      return res.status(401).json({ error: 'Ce compte utilisateur a été suspendu par un administrateur.' });
     }
 
     const isValid = db.verifyPassword(String(password), user.id);
@@ -300,7 +299,7 @@ apiRouter.post('/auth/social', (req, res) => {
 
     if (user) {
       if (user.status === 'suspended') {
-        return res.status(403).json({ error: 'Ce compte utilisateur est suspendu.' });
+        return res.status(401).json({ error: 'Ce compte utilisateur est suspendu.' });
       }
       user.lastLoginAt = nowIso;
       if (uid && !user.uid) user.uid = uid;
@@ -621,37 +620,78 @@ apiRouter.post('/payments/process', async (req, res) => {
 // 2. PLAYUP MOBILE APP ENDPOINTS
 // ==========================================
 
-// Name Checker GoXtop (e.g. Free Fire Player ID verification before order confirmation)
+// Official Player ID Verification (RechargeGames GET /v1/region-check)
 apiRouter.post('/app/check-player', async (req, res) => {
   try {
-    const { gameId, gameProfileData } = req.body;
-    const game = db.getGames().find(g => g.id === gameId || g.slug === gameId || g.externalGameId === gameId);
-    if (!game) {
-      return res.status(404).json({ supported: false, verified: false, message: 'Jeu introuvable.' });
+    const { gameId, game, gameProfileData, playerId: rawPlayerId, region } = req.body || {};
+    const targetKey = String(gameId || game || 'free-fire').trim();
+    const matchedGame = db
+      .getGames()
+      .find(
+        g =>
+          g.id === targetKey ||
+          g.slug === targetKey ||
+          g.externalGameId === targetKey ||
+          g.name.toLowerCase() === targetKey.toLowerCase()
+      );
+
+    const playerId = String(
+      rawPlayerId ||
+      gameProfileData?.playerId ||
+      gameProfileData?.userId ||
+      gameProfileData?.characterId ||
+      (gameProfileData ? Object.values(gameProfileData)[0] : '') ||
+      ''
+    ).trim();
+
+    // 1. Primary: Official RechargeGames Player ID & Region Check (GET https://api.rechargegame.games/v1/region-check)
+    const rg = new RechargeGamesProvider();
+    const rgCheck = await rg.verifyPlayerId({
+      gameSlug: matchedGame ? matchedGame.slug || matchedGame.name : targetKey,
+      playerId,
+      region: region ? String(region) : undefined,
+      strictRegionMatch: false
+    });
+
+    if (rgCheck.supported) {
+      return res.json(rgCheck);
     }
 
-    if (!game.supportsNameCheck) {
-      return res.json({
-        supported: false,
-        verified: false,
-        message: `La vérification de joueur (Name Checker) n'est pas requise pour ${game.name}.`
-      });
-    }
-
-    const providerId = game.providerId || 'prov_goxtop';
-    const adapter = ProviderFactory.getProviderInstance(providerId);
-    if (!adapter) {
-      return res.status(500).json({ supported: true, verified: false, message: 'Adaptateur GoXtop indisponible.' });
-    }
-
-    const gameCode = game.externalGameId || game.slug;
-    const checkResult = await adapter.checkPlayer(gameCode, gameProfileData || {});
-    return res.json(checkResult);
+    // 2. If RechargeGames returns UNSUPPORTED for this game, return clear UNSUPPORTED status without simulating verification
+    return res.json({
+      supported: false,
+      verified: false,
+      status: rgCheck.status || 'UNSUPPORTED',
+      provider: 'RechargeGames',
+      rawResponse: rgCheck.rawResponse,
+      message: rgCheck.message
+    });
   } catch (err: any) {
     return res.status(500).json({
       supported: true,
       verified: false,
       message: `Erreur lors de la vérification du joueur : ${err.message}`
+    });
+  }
+});
+
+// Direct RechargeGames Player ID verification endpoint
+apiRouter.post('/rechargegames/check-player', async (req, res) => {
+  try {
+    const { game, player_id, region, strictRegionMatch } = req.body || {};
+    const rg = new RechargeGamesProvider();
+    const result = await rg.verifyPlayerId({
+      gameSlug: String(game || 'free-fire'),
+      playerId: String(player_id || ''),
+      region: region ? String(region) : undefined,
+      strictRegionMatch: Boolean(strictRegionMatch)
+    });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({
+      supported: true,
+      verified: false,
+      message: err?.message || 'Erreur lors de la vérification RechargeGames'
     });
   }
 });
@@ -737,12 +777,37 @@ apiRouter.post('/app/orders', async (req, res) => {
       return res.status(200).json(existingDuplicate);
     }
 
+    const playerId = profileData.playerId || profileData.userId || profileData.username || Object.values(profileData)[0] || '';
+    const serverId = profileData.serverId || profileData.zoneId || '';
+
+    // If this package belongs to RechargeGames, execute the 10-step RechargeGames order creation
+    if (pkg.providerSlug === 'rechargegames' || pkg.productKey || db.getRechargeGamesProductByKey(pkg.externalProductId || '')) {
+      const rg = new RechargeGamesProvider();
+      const rgRes = await rg.createOrder({
+        userId: req.body.userId || 'usr_player_01',
+        productKey: pkg.productKey || pkg.externalProductId || '',
+        region: pkg.region,
+        playerId: String(playerId || ''),
+        playerName: verifiedPlayerName ? String(verifiedPlayerName) : undefined,
+        serverId: serverId ? String(serverId) : undefined,
+        buyerRef: clientPartnerId ? String(clientPartnerId) : undefined,
+        paymentConfirmed: Boolean(paymentConfirmed),
+        paymentMethod: req.body.paymentMethod || 'wallet',
+        paymentReference: req.body.paymentReference
+      });
+      if (!rgRes.success || !rgRes.playupOrder) {
+        return res.status(rgRes.httpStatus || 400).json({
+          error: rgRes.errorCode || 'Order Error',
+          message: rgRes.userMessage
+        });
+      }
+      return res.status(201).json(rgRes.playupOrder);
+    }
+
     const providers = db.getProviders();
     const provider = providers.find(p => p.id === service.providerId) || providers.find(p => p.id === 'prov_goxtop') || providers[0];
 
     const orderNumber = `PLUP-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`;
-    const playerId = profileData.playerId || profileData.userId || profileData.username || Object.values(profileData)[0] || '';
-    const serverId = profileData.serverId || profileData.zoneId || '';
     const margin = Number((pkg.publicPrice - pkg.supplierCost).toFixed(2));
     const initialStatus = paymentConfirmed ? 'paid' : 'pending';
     const nowIso = new Date().toISOString();
@@ -812,24 +877,92 @@ apiRouter.post('/app/orders', async (req, res) => {
 
     db.addSystemLog('info', 'order', `New mobile order ${orderNumber} (Partner ID: ${partnerOrderId}) created for ${game.name} - ${pkg.name}`);
 
-    // Dispatch order to selected provider (e.g. GoXtop) asynchronously
-    setTimeout(() => {
-      ProviderEngine.processOrder(newOrder.id).catch(console.error);
-    }, 800);
+    // Dispatch order to selected provider (GoXtop) immediately and persist real status in database
+    const processedOrder = await ProviderEngine.processOrder(newOrder.id).catch(err => {
+      console.error('Immediate GoXtop order dispatch error:', err);
+      return null;
+    });
 
-    return res.status(201).json(newOrder);
+    return res.status(201).json(processedOrder || newOrder);
   } catch (err: any) {
     db.addSystemLog('error', 'order', `Order creation error: ${err.message}`);
     return res.status(500).json({ error: 'Internal Server Error', message: err.message });
   }
 });
 
-apiRouter.get('/app/orders/:orderId', (req, res) => {
+apiRouter.get('/app/orders/:orderId', async (req, res) => {
   const { orderId } = req.params;
-  const order = db.getOrders().find(o => o.id === orderId || o.orderNumber === orderId || o.partnerOrderId === orderId);
-  if (!order) {
+  const orders = db.getOrders();
+  const orderIdx = orders.findIndex(o => o.id === orderId || o.orderNumber === orderId || o.partnerOrderId === orderId);
+  if (orderIdx === -1) {
     return res.status(404).json({ error: 'Commande introuvable' });
   }
+
+  const order = orders[orderIdx];
+
+  // 1. If the order is a RechargeGames order and is currently pending/processing, query live GET /v1/orders/{order_id}
+  if (
+    (order.providerId === 'prov_rechargegames' || order.providerName === 'RechargeGames' || db.findRechargeGamesOrderById(order.id)) &&
+    (order.status === 'pending' || order.status === 'processing' || order.status === 'paid')
+  ) {
+    try {
+      const rg = new RechargeGamesProvider();
+      await rg.checkOrderStatus(order.id);
+      const refreshedOrders = db.getOrders();
+      const updated = refreshedOrders.find(o => o.id === order.id || o.orderNumber === order.orderNumber);
+      if (updated) {
+        return res.json(updated);
+      }
+    } catch {
+      // Return last stored DB state if network check fails
+    }
+  }
+
+  // 2. If the order is currently processing on GoXtop, query live GoXtop GET /api/v.1/:partner_orderid status
+  if ((order.status === 'processing' || order.status === 'paid') && order.partnerOrderId) {
+    const adapter = ProviderFactory.getProviderInstance(order.providerId || 'prov_goxtop');
+    if (adapter) {
+      try {
+        const liveStatus = await adapter.getOrderStatus(order.partnerOrderId);
+        if (liveStatus.success && liveStatus.status) {
+          const prevStatus = order.status;
+          order.status = liveStatus.status;
+          if (liveStatus.providerOrderId) {
+            order.externalOrderId = liveStatus.providerOrderId;
+            order.providerReference = liveStatus.providerOrderId;
+          }
+          if (liveStatus.verifiedPlayerName && !order.verifiedPlayerName) {
+            order.verifiedPlayerName = liveStatus.verifiedPlayerName;
+          }
+          if (liveStatus.raw) {
+            order.providerResponse = liveStatus.raw;
+          }
+          if (prevStatus !== liveStatus.status) {
+            order.updatedAt = new Date().toISOString();
+            order.statusHistory.push({
+              status: liveStatus.status,
+              timestamp: order.updatedAt,
+              note: `Statut temps réel GoXtop synchronisé : ${liveStatus.status.toUpperCase()}${liveStatus.providerOrderId ? ` (Réf: ${liveStatus.providerOrderId})` : ''}`
+            });
+            const existingPord = db.findProviderOrderByPartnerId(order.partnerOrderId);
+            if (existingPord) {
+              db.upsertProviderOrder({
+                ...existingPord,
+                status: liveStatus.status,
+                provider_order_id: liveStatus.providerOrderId || existingPord.provider_order_id,
+                response_payload: liveStatus.raw || existingPord.response_payload,
+                updated_at: order.updatedAt
+              });
+            }
+          }
+          db.setOrders(orders);
+        }
+      } catch {
+        // Return last stored DB state if network check fails
+      }
+    }
+  }
+
   res.json(order);
 });
 
@@ -1714,7 +1847,7 @@ apiRouter.post('/admin/providers/:id/reveal-secret', authenticateAdmin, (req, re
   if (!provider) return res.status(404).json({ error: 'Fournisseur introuvable' });
 
   if (provider.id === 'prov_rechargegames' || provider.adapterType === 'rechargegames') {
-    return res.status(403).json({
+    return res.status(422).json({
       error: 'Politique de sécurité RechargeGames : les clés secrètes ne sont jamais affichées en clair.'
     });
   }
@@ -1811,6 +1944,9 @@ apiRouter.post('/admin/providers/:id/sync', authenticateAdmin, async (req, res) 
   }
 
   const adapter = ProviderFactory.getProviderInstance(provider.id);
+  if (!adapter) {
+    return res.status(404).json({ error: 'Adaptateur fournisseur introuvable' });
+  }
 
   const syncResult =
     syncType === 'games'
@@ -2421,42 +2557,6 @@ apiRouter.post('/rechargegames/orders', async (req, res) => {
     });
   }
 
-  // In TEST mode, schedule realistic asynchronous delivery via signed webhook after 3.5 seconds so the mobile user sees "Pending -> Delivered" in real time
-  if (result.order && result.order.test_mode && req.body?.skipAutoWebhook !== true) {
-    const createdOrder = result.order;
-    setTimeout(() => {
-      try {
-        const currentOrd = db.findRechargeGamesOrderById(createdOrder.id);
-        if (currentOrd && currentOrd.status === 'pending') {
-          const webhookId = `wh_auto_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-          const webhookTs = String(Math.floor(Date.now() / 1000));
-          const evtPayload = {
-            event: 'order.delivered',
-            event_id: webhookId,
-            order_id: currentOrd.provider_order_id,
-            buyer_ref: currentOrd.buyer_ref,
-            product_key: currentOrd.product_key,
-            region: currentOrd.region,
-            player_id: currentOrd.player_id,
-            status: 'delivered',
-            delivered_at: new Date().toISOString()
-          };
-          const raw = JSON.stringify(evtPayload);
-          const providerInstance = new RechargeGamesProvider();
-          const sig = providerInstance.signWebhookPayload(raw, webhookId, webhookTs);
-          providerInstance.handleWebhook(raw, evtPayload, {
-            'webhook-id': webhookId,
-            'webhook-timestamp': webhookTs,
-            'webhook-signature': sig,
-            'user-agent': 'RechargeGames-Webhook/1.0'
-          });
-        }
-      } catch (e) {
-        console.error('[RechargeGames Auto-Webhook Error]:', e);
-      }
-    }, 3500);
-  }
-
   return res.status(201).json({
     success: true,
     message: result.userMessage,
@@ -2789,33 +2889,48 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     });
   }
 
-  // Test 3: Recherche d'un produit Free Fire Brazil
+  // Test 3: Recherche d'un produit Free Fire Brazil & LATAM + Vérification Player ID réelle
   let ffBrazilProduct = syncedProducts.find(
     p => p.game.toLowerCase().includes('free fire') && p.region.toLowerCase() === 'brazil' && p.active
   );
+  let ffLatamProduct = syncedProducts.find(
+    p => p.game.toLowerCase().includes('free fire') && p.region.toLowerCase() === 'latam' && p.active
+  );
   {
     const t0 = Date.now();
+    const playerCheck = await rg.verifyPlayerId({
+      gameSlug: 'free-fire',
+      playerId: '16777227705',
+      region: 'LATAM',
+      strictRegionMatch: true
+    });
     results.push({
       testNumber: 3,
-      name: 'Test 3 — Recherche d’un produit Free Fire Brazil 🇧🇷',
-      passed: Boolean(ffBrazilProduct && ffBrazilProduct.product_key),
+      name: 'Test 3 — Produits Free Fire (Brazil/LATAM) & Validation Player ID (16777227705)',
+      passed: Boolean(ffBrazilProduct && ffLatamProduct && playerCheck.verified),
       durationMs: Date.now() - t0,
-      details: ffBrazilProduct
-        ? `Produit trouvé : "${ffBrazilProduct.name}" (product_key="${ffBrazilProduct.product_key}", région="${ffBrazilProduct.region}", prix fournisseur=$${ffBrazilProduct.provider_price.toFixed(2)}, prix PlayUp=$${ffBrazilProduct.playup_price.toFixed(2)})`
-        : 'Aucun produit Free Fire Brazil trouvé.',
-      evidence: ffBrazilProduct
-        ? {
-            product_key: ffBrazilProduct.product_key,
-            region: ffBrazilProduct.region,
-            provider_price: ffBrazilProduct.provider_price,
-            playup_price: ffBrazilProduct.playup_price
-          }
-        : undefined
+      details:
+        ffBrazilProduct && ffLatamProduct
+          ? `Produits Free Fire trouvés (Brazil: "${ffBrazilProduct.product_key}" à $${ffBrazilProduct.playup_price.toFixed(2)}, LATAM: "${ffLatamProduct.product_key}" à $${ffLatamProduct.playup_price.toFixed(2)}). Player ID 16777227705 vérifié : "${playerCheck.playerName}" (${playerCheck.region}).`
+          : 'Produit Free Fire introuvable.',
+      evidence: {
+        brazil_product_key: ffBrazilProduct?.product_key,
+        latam_product_key: ffLatamProduct?.product_key,
+        verified_player: playerCheck.playerName,
+        verified_region: playerCheck.region,
+        status: playerCheck.status
+      }
     });
   }
 
-  // Test 4: Recherche d'un produit USA
-  const usaProduct = syncedProducts.find(p => p.region.toLowerCase() === 'usa' && p.active);
+  // Test 4: Recherche d'un produit USA / United States
+  const usaProduct = syncedProducts.find(
+    p =>
+      (p.region.toLowerCase() === 'usa' ||
+        p.region.toLowerCase().includes('united states') ||
+        p.region.toLowerCase() === 'na') &&
+      p.active
+  );
   {
     const t0 = Date.now();
     results.push({
@@ -2837,19 +2952,19 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     });
   }
 
-  // Test 5: Création d'une commande TEST (en statut initial 'pending')
+  // Test 5: Création d'une commande TEST réelle sur RechargeGames (en statut initial 'pending')
   const testBuyerRef1 = db.generateNextBuyerRef();
   let createdTestOrderId = '';
   let createdProviderOrderId = '';
   {
     const t0 = Date.now();
-    const targetProd = ffBrazilProduct || syncedProducts[0];
+    const targetProd = ffLatamProduct || ffBrazilProduct || syncedProducts[0];
     const createRes = await rg.createOrder({
       userId: 'usr_player_01',
       productKey: targetProd.product_key,
       region: targetProd.region,
-      playerId: '987654321',
-      playerName: 'GamerBrazilTest',
+      playerId: '16777227705',
+      playerName: '©∆£MELIOBAS®',
       buyerRef: testBuyerRef1,
       paymentConfirmed: true,
       paymentMethod: 'wallet',
@@ -2881,12 +2996,12 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
   // Test 10: Protection contre les commandes dupliquées (Même buyer_ref réutilisé)
   {
     const t0 = Date.now();
-    const targetProd = ffBrazilProduct || syncedProducts[0];
+    const targetProd = ffLatamProduct || ffBrazilProduct || syncedProducts[0];
     const dupRes = await rg.createOrder({
       userId: 'usr_player_01',
       productKey: targetProd.product_key,
       region: targetProd.region,
-      playerId: '987654321',
+      playerId: '16777227705',
       buyerRef: testBuyerRef1, // Intentionally reusing the exact same buyer_ref!
       paymentConfirmed: true,
       testMode: true
@@ -3091,13 +3206,13 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
   // Test 7: Réception du webhook "order.failed" (sur une 2e commande TEST)
   {
     const t0 = Date.now();
-    const targetProd = usaProduct || syncedProducts[0];
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
     const buyerRef2 = db.generateNextBuyerRef();
     const createRes2 = await rg.createOrder({
       userId: 'usr_player_01',
       productKey: targetProd.product_key,
       region: targetProd.region,
-      playerId: '1122334455',
+      playerId: 'fail_16777227705',
       buyerRef: buyerRef2,
       paymentConfirmed: true,
       testMode: true

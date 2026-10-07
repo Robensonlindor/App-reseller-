@@ -63,7 +63,8 @@ async function getGcpMetadataAccessToken(): Promise<string | null> {
       gcpMetadataStatus = 'unavailable';
       return null;
     }
-    const data: any = await res.json();
+    const rawText = await res.text();
+    const data: any = rawText ? JSON.parse(rawText) : {};
     if (typeof data?.access_token === 'string') {
       gcpMetadataStatus = 'available';
       return data.access_token;
@@ -140,7 +141,8 @@ export async function checkWebhookIdempotencyInFirestore(rawEventId: string): Pr
           signal: controller.signal
         });
         if (res.status === 200) {
-          const docJson: any = await res.json();
+          const rawText = await res.text();
+          const docJson: any = rawText ? JSON.parse(rawText) : {};
           const fields = docJson?.fields || {};
           const syncedRecord: FirestoreWebhookIdempotencyRecord = {
             eventId: fields.eventId?.stringValue || sanitizedEventId,

@@ -5,12 +5,12 @@ export const INITIAL_GAMES: Game[] = [
     id: 'game_ff',
     slug: 'free-fire',
     name: 'Free Fire',
-    externalGameId: 'freefire',
+    externalGameId: 'freefire_global',
     providerId: 'prov_goxtop',
     supportsNameCheck: true,
     requiresPlayerId: true,
     category: 'Battle Royale',
-    description: 'Recharges instantanées de Diamants Free Fire via ID Joueur direct avec vérification du nom de joueur.',
+    description: 'Recharges instantanées de Diamants Free Fire via GoXtop avec vérification réelle du Free Fire ID (Name Checker).',
     logo: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
     banner: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
     isActive: true,
@@ -19,12 +19,12 @@ export const INITIAL_GAMES: Game[] = [
       {
         id: 'f_ff_player_id',
         name: 'playerId',
-        label: 'Player ID (Game ID)',
-        placeholder: 'ex: 123456789',
+        label: 'Free Fire ID',
+        placeholder: '16777227705',
         type: 'text',
         required: true,
-        helperText: 'Votre UID numérique Free Fire (8 à 12 chiffres). Le nom du joueur sera vérifié avant confirmation.',
-        validationRegex: '^[0-9]{8,12}$'
+        helperText: 'Votre Free Fire ID numérique (ex: 16777227705). Cliquez sur "Vérifier l’ID" pour valider votre compte auprès de GoXtop.',
+        validationRegex: '^[0-9]{6,15}$'
       }
     ],
     createdAt: '2026-01-10T10:00:00Z',
@@ -39,7 +39,7 @@ export const INITIAL_GAMES: Game[] = [
     supportsNameCheck: true,
     requiresPlayerId: true,
     category: 'Tactical Shooter',
-    description: 'Créditation instantanée de Unknown Cash (UC) officielle sur serveur Global.',
+    description: 'Créditation instantanée de Unknown Cash (UC) officielle sur serveur Global via GoXtop.',
     logo: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
     banner: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
     isActive: true,
@@ -48,22 +48,12 @@ export const INITIAL_GAMES: Game[] = [
       {
         id: 'f_pubg_character_id',
         name: 'characterId',
-        label: 'Character ID (Player ID)',
+        label: 'Character ID (PUBG ID)',
         placeholder: 'ex: 5123984712',
         type: 'text',
         required: true,
         helperText: 'L’identifiant numérique situé à côté de votre avatar en jeu.',
-        validationRegex: '^[0-9]{8,12}$'
-      },
-      {
-        id: 'f_pubg_server_id',
-        name: 'serverId',
-        label: 'Server ID / Région',
-        placeholder: 'Sélectionnez votre serveur',
-        type: 'select',
-        required: true,
-        options: ['Global', 'Europe', 'North America', 'South America', 'Asia', 'Middle East'],
-        helperText: 'Sélectionnez le serveur sur lequel votre compte est actif.'
+        validationRegex: '^[0-9]{6,15}$'
       }
     ],
     createdAt: '2026-01-12T10:00:00Z',
@@ -73,12 +63,12 @@ export const INITIAL_GAMES: Game[] = [
     id: 'game_mlbb',
     slug: 'mobile-legends',
     name: 'Mobile Legends: Bang Bang',
-    externalGameId: 'mlbb',
+    externalGameId: 'mlbb_special',
     providerId: 'prov_goxtop',
     supportsNameCheck: true,
     requiresPlayerId: true,
     category: 'MOBA',
-    description: 'Recharges ultra-rapides de Diamants MLBB avec Player ID et Zone ID.',
+    description: 'Recharges ultra-rapides de Diamants MLBB via GoXtop avec vérification User ID et Zone ID.',
     logo: '/src/assets/images/game_cover_mobilelegends_1790988897466.jpg',
     banner: '/src/assets/images/game_cover_mobilelegends_1790988897466.jpg',
     isActive: true,
@@ -88,21 +78,21 @@ export const INITIAL_GAMES: Game[] = [
         id: 'f_mlbb_player_id',
         name: 'playerId',
         label: 'Player ID (User ID)',
-        placeholder: 'ex: 12345678',
+        placeholder: 'ex: 2009663813',
         type: 'text',
         required: true,
-        helperText: 'Votre User ID principal à 8 chiffres.',
-        validationRegex: '^[0-9]{6,10}$'
+        helperText: 'Votre User ID principal Mobile Legends.',
+        validationRegex: '^[0-9]{5,15}$'
       },
       {
         id: 'f_mlbb_zone_id',
         name: 'zoneId',
-        label: 'Zone ID (entre parenthèses)',
-        placeholder: 'ex: 2109',
+        label: 'Zone ID (Server Code)',
+        placeholder: 'ex: 6104',
         type: 'text',
         required: true,
         helperText: 'Les 4 ou 5 chiffres entre parenthèses à côté de votre User ID.',
-        validationRegex: '^[0-9]{4,6}$'
+        validationRegex: '^[0-9]{3,8}$'
       }
     ],
     createdAt: '2026-01-15T10:00:00Z',
@@ -112,12 +102,12 @@ export const INITIAL_GAMES: Game[] = [
     id: 'game_codm',
     slug: 'cod-mobile',
     name: 'Call of Duty: Mobile',
-    externalGameId: 'codm',
+    externalGameId: 'codm_sgmy',
     providerId: 'prov_goxtop',
-    supportsNameCheck: false,
+    supportsNameCheck: true,
     requiresPlayerId: true,
     category: 'FPS Mobile',
-    description: 'Packs CP Call of Duty Mobile avec livraison sécurisée.',
+    description: 'Packs CP Call of Duty Mobile via GoXtop avec vérification du Player ID.',
     logo: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
     banner: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
     isActive: true,
@@ -126,7 +116,7 @@ export const INITIAL_GAMES: Game[] = [
       {
         id: 'f_codm_player_id',
         name: 'playerId',
-        label: 'Player ID (OpenID)',
+        label: 'Call of Duty Mobile ID',
         placeholder: 'ex: 68192309123849102',
         type: 'text',
         required: true,
@@ -213,8 +203,8 @@ export const INITIAL_PROVIDERS: Provider[] = [
       getProductsPath: '/api/v.1/products/{game}',
       createOrderPath: '/api/v.1/create',
       orderStatusPath: '/api/v.1/:partner_orderid',
-      trackOrderPath: '/api/v.1/:id/track',
-      checkPlayerPath: 'REQUIRES GOXTOP DOCUMENTATION'
+      trackOrderPath: '/api/v.1/:partner_orderid/track',
+      checkPlayerPath: '/api/check/game-check'
     },
     customParams: [],
     latencyMs: 0,
@@ -242,8 +232,8 @@ export const INITIAL_PROVIDERS: Provider[] = [
       getProductsPath: '/api/v.1/products/{game}',
       createOrderPath: '/api/v.1/create',
       orderStatusPath: '/api/v.1/:partner_orderid',
-      trackOrderPath: '/api/v.1/:id/track',
-      checkPlayerPath: 'REQUIRES GOXTOP DOCUMENTATION'
+      trackOrderPath: '/api/v.1/:partner_orderid/track',
+      checkPlayerPath: '/api/check/game-check'
     },
     customParams: [],
     latencyMs: 0,
@@ -256,19 +246,21 @@ export const INITIAL_SERVICES: Service[] = [
   {
     id: 'srv_ff_diamonds',
     gameId: 'game_ff',
-    externalGameId: 'freefire',
-    name: 'Free Fire Diamonds',
-    description: 'Recharges directes de Diamants Free Fire via GoXtop avec vérification du nom du joueur.',
+    externalGameId: 'freefire_global',
+    name: 'Free Fire Diamonds (Global)',
+    description: 'Recharges directes de Diamants Free Fire via GoXtop avec vérification réelle du nom du joueur.',
     category: 'diamonds',
     providerId: 'prov_goxtop',
     isActive: true,
     displayOrder: 1,
     packages: [
-      { id: 'pkg_ff_100', serviceId: 'srv_ff_diamonds', externalProductId: 'ff_100', externalGameId: 'freefire', name: '100 Diamants', amount: 100, unit: 'Diamonds', supplierCost: 0.82, margin: 0.38, publicPrice: 1.20, resellerPrice: 0.95, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 1 },
-      { id: 'pkg_ff_310', serviceId: 'srv_ff_diamonds', externalProductId: 'ff_310', externalGameId: 'freefire', name: '310 Diamants', amount: 310, unit: 'Diamonds', supplierCost: 2.50, margin: 1.00, publicPrice: 3.50, resellerPrice: 2.85, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 2 },
-      { id: 'pkg_ff_520', serviceId: 'srv_ff_diamonds', externalProductId: 'ff_520', externalGameId: 'freefire', name: '520 Diamants', amount: 520, unit: 'Diamonds', supplierCost: 4.15, margin: 1.60, publicPrice: 5.75, resellerPrice: 4.70, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 3 },
-      { id: 'pkg_ff_1060', serviceId: 'srv_ff_diamonds', externalProductId: 'ff_1060', externalGameId: 'freefire', name: '1060 Diamants', amount: 1060, unit: 'Diamonds', supplierCost: 8.20, margin: 3.00, publicPrice: 11.20, resellerPrice: 9.30, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 4 },
-      { id: 'pkg_ff_2180', serviceId: 'srv_ff_diamonds', externalProductId: 'ff_2180', externalGameId: 'freefire', name: '2180 Diamants', amount: 2180, unit: 'Diamonds', supplierCost: 16.50, margin: 5.50, publicPrice: 22.00, resellerPrice: 18.50, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 5 }
+      { id: 'pkg_freefire_global_110', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_110', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '110 Diamonds', amount: 110, unit: 'Diamonds', supplierCost: 0.778, margin: 0.19, publicPrice: 0.97, resellerPrice: 0.87, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 1 },
+      { id: 'pkg_freefire_global_341', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_341', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '341 Diamonds', amount: 341, unit: 'Diamonds', supplierCost: 2.374, margin: 0.59, publicPrice: 2.96, resellerPrice: 2.67, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 2 },
+      { id: 'pkg_freefire_global_572', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_572', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '572 Diamonds', amount: 572, unit: 'Diamonds', supplierCost: 3.858, margin: 0.96, publicPrice: 4.82, resellerPrice: 4.34, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 3 },
+      { id: 'pkg_freefire_global_1166', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_1166', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '1166 Diamonds', amount: 1166, unit: 'Diamonds', supplierCost: 7.727, margin: 1.93, publicPrice: 9.66, resellerPrice: 8.69, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 4 },
+      { id: 'pkg_freefire_global_2398', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_2398', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '2398 Diamonds', amount: 2398, unit: 'Diamonds', supplierCost: 15.453, margin: 3.86, publicPrice: 19.31, resellerPrice: 17.38, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 5 },
+      { id: 'pkg_freefire_global_weekly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Weekly_Membership', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: 'Weekly Membership', amount: 1, unit: 'Pass', supplierCost: 1.545, margin: 0.39, publicPrice: 1.94, resellerPrice: 1.74, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 6 },
+      { id: 'pkg_freefire_global_monthly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Monthly_Membership', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: 'Monthly Membership', amount: 1, unit: 'Pass', supplierCost: 5.565, margin: 1.39, publicPrice: 6.96, resellerPrice: 6.26, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 7 }
     ],
     createdAt: '2026-01-10T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'

@@ -241,8 +241,8 @@ class PlayUpDatabase {
 
     const envGoxKey = process.env.GOXTOP_API_KEY || '';
     const envGoxSecret = process.env.GOXTOP_API_KEY_SECRET || process.env.GOXTOP_WEBHOOK_SECRET || '';
-    const envRgKey = process.env.RECHARGEGAMES_API_KEY || 'rg_test_live_9f8a7b6c5d4e3f2a1b0c';
-    const envRgSecret = process.env.RECHARGEGAMES_WEBHOOK_SECRET || 'whsec_rg_hmac256_a1b2c3d4e5f60718293a';
+    const envRgKey = process.env.RECHARGEGAMES_API_KEY || '';
+    const envRgSecret = process.env.RECHARGEGAMES_WEBHOOK_SECRET || '';
 
     if (!this.data.providerSecrets) {
       this.data.providerSecrets = {
@@ -264,11 +264,11 @@ class PlayUpDatabase {
         };
         changed = true;
       } else {
-        if (!this.data.providerSecrets.prov_rechargegames.apiKey) {
+        if (envRgKey && this.data.providerSecrets.prov_rechargegames.apiKey !== envRgKey) {
           this.data.providerSecrets.prov_rechargegames.apiKey = envRgKey;
           changed = true;
         }
-        if (!this.data.providerSecrets.prov_rechargegames.webhookSecret) {
+        if (envRgSecret && this.data.providerSecrets.prov_rechargegames.webhookSecret !== envRgSecret) {
           this.data.providerSecrets.prov_rechargegames.webhookSecret = envRgSecret;
           changed = true;
         }
@@ -300,8 +300,8 @@ class PlayUpDatabase {
       this.data.rechargeGamesMode = 'TEST';
       changed = true;
     }
-    if (!this.data.rechargeGamesBaseUrl) {
-      this.data.rechargeGamesBaseUrl = process.env.RECHARGEGAMES_BASE_URL || 'http://127.0.0.1:3000/api/rechargegames-v1-gateway';
+    if (!this.data.rechargeGamesBaseUrl || this.data.rechargeGamesBaseUrl.includes('rechargegames-v1-gateway')) {
+      this.data.rechargeGamesBaseUrl = process.env.RECHARGEGAMES_BASE_URL || 'https://api.rechargegame.games';
       changed = true;
     }
     if (!this.data.rechargeGamesProducts) {
@@ -1095,7 +1095,7 @@ class PlayUpDatabase {
     if (process.env.RECHARGEGAMES_BASE_URL && process.env.RECHARGEGAMES_BASE_URL.trim().length > 0) {
       return process.env.RECHARGEGAMES_BASE_URL.trim().replace(/\/+$/, '');
     }
-    return (this.data.rechargeGamesBaseUrl || 'http://127.0.0.1:3000/api/rechargegames-v1-gateway').replace(/\/+$/, '');
+    return (this.data.rechargeGamesBaseUrl || 'https://api.rechargegame.games').replace(/\/+$/, '');
   }
 
   public setRechargeGamesBaseUrl(url: string) {

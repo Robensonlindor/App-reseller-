@@ -1,16 +1,15 @@
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { apiRouter } from './server/apiRoutes';
-import { RechargeGamesProvider } from './server/providers/RechargeGamesProvider';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isProduction = process.env.NODE_ENV === 'production';
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 process.on('uncaughtException', err => {
   console.error('[PlayUp Engine] Uncaught exception (recovered):', err);
@@ -20,7 +19,26 @@ process.on('unhandledRejection', reason => {
   console.error('[PlayUp Engine] Unhandled rejection (recovered):', reason);
 });
 
+async function loadBackendCore(): Promise<{ apiRouter: express.Router; RechargeGamesProvider: any }> {
+  const builtBundlePath = path.resolve(__dirname, 'dist/apiRoutes.mjs');
+  if (fs.existsSync(builtBundlePath)) {
+    try {
+      // Load via tsx in dev if available so source edits take effect immediately; otherwise use built bundle for native node server.ts
+      if (!isProduction) {
+        const modPath = './server/apiRoutes';
+        return await import(modPath);
+      }
+    } catch {
+      // Fallback to built bundle when running under plain node without tsx
+    }
+    return await import(builtBundlePath);
+  }
+  const modPath = './server/apiRoutes';
+  return await import(modPath);
+}
+
 async function startServer() {
+  const { apiRouter, RechargeGamesProvider } = await loadBackendCore();
   const app = express();
 
   // JSON & URL-encoded body parser (preserving exact rawBody buffer for HMAC-SHA256 webhook verification)

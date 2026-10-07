@@ -425,7 +425,9 @@ export const GoXtopAdminPanel: React.FC<GoXtopAdminPanelProps> = ({
     .filter(s => s.providerId === currentProvider.id)
     .reduce((acc, s) => acc + s.packages.length, 0);
   const provOrdersForCurrent = providerOrders.filter(
-    po => po.provider.toLowerCase() === currentProvider.name.toLowerCase() || currentProvider.slug === 'goxtop'
+    po =>
+      (po?.provider || '').toLowerCase() === (currentProvider?.name || '').toLowerCase() ||
+      currentProvider?.slug === 'goxtop'
   );
   const ordersSentCount = provOrdersForCurrent.length;
   const ordersProcessingCount = provOrdersForCurrent.filter(po => po.status === 'processing' || po.status === 'pending' || po.status === 'paid').length;
@@ -1940,8 +1942,8 @@ export const GoXtopAdminPanel: React.FC<GoXtopAdminPanelProps> = ({
           if (apiLogOnlyErrors && log.success) return false;
           if (apiLogSearch.trim()) {
             const q = apiLogSearch.toLowerCase();
-            const matchEndpoint = log.endpoint.toLowerCase().includes(q);
-            const matchType = log.requestType.toLowerCase().includes(q);
+            const matchEndpoint = (log.endpoint || '').toLowerCase().includes(q);
+            const matchType = (log.requestType || '').toLowerCase().includes(q);
             const matchOrder = (log.orderId || '').toLowerCase().includes(q) || (log.partnerOrderId || '').toLowerCase().includes(q);
             const matchResp = (log.responsePreview || '').toLowerCase().includes(q) || (log.errorMessage || '').toLowerCase().includes(q);
             if (!matchEndpoint && !matchType && !matchOrder && !matchResp) return false;

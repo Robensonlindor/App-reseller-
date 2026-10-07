@@ -9,11 +9,40 @@ import {
 } from '../types';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
 
+function isHtmlPayload(text: string): boolean {
+  const trimmed = text.trim().toLowerCase();
+  return trimmed.startsWith('<!doctype') || trimmed.startsWith('<html') || trimmed.startsWith('<head');
+}
+
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithWarmupRetry(url: string, options?: RequestInit, maxRetries = 2): Promise<{ res: Response; text: string }> {
+  let lastRes: Response | null = null;
+  let lastText = '';
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    lastRes = res;
+    lastText = text;
+
+    // If proxy returned an HTML warmup/gateway page while dev server is starting, retry briefly
+    if ((isHtmlPayload(text) || res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxRetries) {
+      await delay(500 * (attempt + 1));
+      continue;
+    }
+    break;
+  }
+
+  return { res: lastRes!, text: lastText };
+}
+
 async function safeFetchArray<T>(url: string, options?: RequestInit, fallback: T[] = []): Promise<T[]> {
   try {
-    const res = await fetch(url, options);
-    if (!res.ok) return fallback;
-    const text = await res.text();
+    const { res, text } = await fetchWithWarmupRetry(url, options);
+    if (!res.ok || !text || isHtmlPayload(text)) return fallback;
     const data = JSON.parse(text);
     return Array.isArray(data) ? data : fallback;
   } catch {
@@ -21,17 +50,36 @@ async function safeFetchArray<T>(url: string, options?: RequestInit, fallback: T
   }
 }
 
-async function safeJson<T>(res: Response, fallbackErrorMsg: string): Promise<T> {
-  const text = await res.text();
+async function fetchJson<T>(
+  url: string,
+  options?: RequestInit,
+  fallbackErrorMsg = 'Service temporairement indisponible. Veuillez réessayer.'
+): Promise<T> {
+  let res: Response;
+  let text: string;
+  try {
+    const result = await fetchWithWarmupRetry(url, options);
+    res = result.res;
+    text = result.text;
+  } catch {
+    throw new Error(fallbackErrorMsg);
+  }
+
+  if (isHtmlPayload(text)) {
+    throw new Error(fallbackErrorMsg);
+  }
+
   let parsed: any = null;
   try {
     parsed = text ? JSON.parse(text) : {};
   } catch {
     throw new Error(fallbackErrorMsg);
   }
+
   if (!res.ok) {
     throw new Error(parsed?.error || parsed?.message || fallbackErrorMsg);
   }
+
   return parsed as T;
 }
 
@@ -39,11 +87,9 @@ export const apiClient = {
   // Public
   async getSettings(): Promise<AppSettings> {
     try {
-      const res = await fetch('/api/settings');
-      if (!res.ok) return INITIAL_SETTINGS;
-      const data = await res.json();
+      const data = await fetchJson<AppSettings>('/api/settings', undefined, 'Impossible de charger les paramètres');
       if (data && typeof data === 'object' && data.downloadLinks) {
-        return data as AppSettings;
+        return data;
       }
       return INITIAL_SETTINGS;
     } catch {
@@ -56,8 +102,11 @@ export const apiClient = {
   },
 
   async getGame(idOrSlug: string): Promise<Game & { services: Service[] }> {
-    const res = await fetch(`/api/games/${idOrSlug}`);
-    return res.json();
+    return fetchJson<Game & { services: Service[] }>(
+      `/api/games/${encodeURIComponent(idOrSlug)}`,
+      undefined,
+      'Impossible de charger les détails du jeu.'
+    );
   },
 
   async getServices(): Promise<Service[]> {
@@ -72,25 +121,27 @@ export const apiClient = {
     phone?: string;
     preferredCurrency?: 'USD' | 'HTG' | 'EUR';
   }): Promise<{ user: AppUser; token: string }> {
-    const res = await fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Erreur lors de la création du compte');
-    return body;
+    return fetchJson<{ user: AppUser; token: string }>(
+      '/api/auth/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Erreur lors de la création du compte'
+    );
   },
 
   async loginUser(email: string, password: string): Promise<{ user: AppUser; token: string }> {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Email ou mot de passe incorrect');
-    return body;
+    return fetchJson<{ user: AppUser; token: string }>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      },
+      'Email ou mot de passe incorrect'
+    );
   },
 
   async socialLoginUser(data: {
@@ -100,14 +151,15 @@ export const apiClient = {
     name: string;
     avatarUrl?: string;
   }): Promise<{ user: AppUser; token: string }> {
-    const res = await fetch('/api/auth/social', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Erreur de connexion sociale');
-    return body;
+    return fetchJson<{ user: AppUser; token: string }>(
+      '/api/auth/social',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Erreur de connexion sociale'
+    );
   },
 
   async forgotUserPassword(email: string): Promise<{
@@ -117,14 +169,15 @@ export const apiClient = {
     expiresAt: string;
     message: string;
   }> {
-    const res = await fetch('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email })
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Impossible de générer le code de réinitialisation');
-    return body;
+    return fetchJson(
+      '/api/auth/forgot-password',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      },
+      'Impossible de générer le code de réinitialisation'
+    );
   },
 
   async resetUserPassword(data: {
@@ -132,14 +185,15 @@ export const apiClient = {
     resetCode: string;
     newPassword: string;
   }): Promise<{ success: boolean; message: string; user: AppUser; token: string }> {
-    const res = await fetch('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Erreur lors de la réinitialisation du mot de passe');
-    return body;
+    return fetchJson(
+      '/api/auth/reset-password',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Erreur lors de la réinitialisation du mot de passe'
+    );
   },
 
   async getUserProfile(token: string): Promise<{
@@ -147,11 +201,13 @@ export const apiClient = {
     orders: Order[];
     paymentTransactions: PaymentTransaction[];
   }> {
-    const res = await fetch('/api/auth/me', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    if (!res.ok) throw new Error('Session expirée');
-    return res.json();
+    return fetchJson(
+      '/api/auth/me',
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Session expirée'
+    );
   },
 
   async updateUserProfile(
@@ -166,17 +222,18 @@ export const apiClient = {
       newPassword?: string;
     }
   ): Promise<{ user: AppUser; message: string }> {
-    const res = await fetch('/api/auth/profile', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson(
+      '/api/auth/profile',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(data)
       },
-      body: JSON.stringify(data)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Erreur lors de la mise à jour du profil');
-    return body;
+      'Erreur lors de la mise à jour du profil'
+    );
   },
 
   // Payment Gateways
@@ -201,24 +258,28 @@ export const apiClient = {
       otp: string;
     };
   }): Promise<{ success: boolean; transaction: PaymentTransaction; user?: AppUser }> {
-    const res = await fetch('/api/payments/process', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Échec de la transaction de paiement');
-    return body;
+    return fetchJson(
+      '/api/payments/process',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Échec de la transaction de paiement'
+    );
   },
 
   // PlayUp Mobile App
-  async checkPlayer(gameId: string, gameProfileData: Record<string, string>): Promise<PlayerCheckResult> {
-    const res = await fetch('/api/app/check-player', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ gameId, gameProfileData })
-    });
-    return res.json();
+  async checkPlayer(gameId: string, gameProfileData: Record<string, string>, region?: string): Promise<PlayerCheckResult> {
+    return fetchJson(
+      '/api/app/check-player',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gameId, gameProfileData, region })
+      },
+      'Erreur lors de la vérification du joueur'
+    );
   },
 
   async getNotifications(userId?: string): Promise<UserNotification[]> {
@@ -227,7 +288,11 @@ export const apiClient = {
   },
 
   async markNotificationRead(id: string): Promise<void> {
-    await fetch(`/api/app/notifications/${id}/read`, { method: 'POST' });
+    try {
+      await fetch(`/api/app/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' });
+    } catch {
+      // Ignore network hiccup when marking notification read
+    }
   },
 
   async createMobileOrder(data: {
@@ -243,22 +308,23 @@ export const apiClient = {
     userId?: string;
     partnerOrderId?: string;
   }): Promise<Order> {
-    const res = await fetch('/api/app/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || 'Erreur lors de la création de la commande');
-    }
-    return res.json();
+    return fetchJson<Order>(
+      '/api/app/orders',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Erreur lors de la création de la commande'
+    );
   },
 
   async getMobileOrder(orderId: string): Promise<Order> {
-    const res = await fetch(`/api/app/orders/${orderId}`);
-    if (!res.ok) throw new Error('Commande non trouvée');
-    return res.json();
+    return fetchJson<Order>(
+      `/api/app/orders/${encodeURIComponent(orderId)}`,
+      undefined,
+      'Commande non trouvée'
+    );
   },
 
   async getRecentOrders(userId?: string): Promise<Order[]> {
@@ -268,89 +334,111 @@ export const apiClient = {
 
   // Reseller Portal
   async resellerLogin(email: string) {
-    const res = await fetch('/api/v1/auth/reseller-login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email })
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Connexion échouée');
-    }
-    return res.json();
+    return fetchJson<{ reseller: Reseller }>(
+      '/api/v1/auth/reseller-login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      },
+      'Connexion échouée'
+    );
   },
 
   async resellerRegister(data: { name: string; email: string; company?: string }) {
-    const res = await fetch('/api/v1/auth/reseller-register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Inscription échouée');
-    }
-    return res.json();
+    return fetchJson<{ reseller: Reseller }>(
+      '/api/v1/auth/reseller-register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Inscription échouée'
+    );
   },
 
   async getResellerMe(resellerId: string) {
-    const res = await fetch('/api/v1/reseller/me', {
-      headers: { 'x-reseller-id': resellerId }
-    });
-    if (!res.ok) throw new Error('Session revendeur expirée');
-    return res.json();
+    return fetchJson<{
+      reseller: Reseller;
+      stats: any;
+      apiKeys: ApiKey[];
+      recentOrders: Order[];
+      transactions: any[];
+      webhookLogs: any[];
+    }>(
+      '/api/v1/reseller/me',
+      {
+        headers: { 'x-reseller-id': resellerId }
+      },
+      'Session revendeur expirée'
+    );
   },
 
   async createApiKey(resellerId: string, name: string, isTest?: boolean) {
-    const res = await fetch('/api/v1/reseller/api-keys', {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'x-reseller-id': resellerId 
+    return fetchJson<ApiKey>(
+      '/api/v1/reseller/api-keys',
+      {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-reseller-id': resellerId 
+        },
+        body: JSON.stringify({ name, isTest })
       },
-      body: JSON.stringify({ name, isTest })
-    });
-    return res.json();
+      'Erreur lors de la création de la clé API'
+    );
   },
 
   async revokeApiKey(resellerId: string, keyId: string) {
-    const res = await fetch(`/api/v1/reseller/api-keys/${keyId}`, {
-      method: 'DELETE',
-      headers: { 'x-reseller-id': resellerId }
-    });
-    return res.json();
+    return fetchJson(
+      `/api/v1/reseller/api-keys/${encodeURIComponent(keyId)}`,
+      {
+        method: 'DELETE',
+        headers: { 'x-reseller-id': resellerId }
+      },
+      'Erreur lors de la révocation de la clé API'
+    );
   },
 
   async updateWebhook(resellerId: string, webhookUrl: string) {
-    const res = await fetch('/api/v1/reseller/webhook', {
-      method: 'PUT',
-      headers: { 
-        'Content-Type': 'application/json',
-        'x-reseller-id': resellerId 
+    return fetchJson(
+      '/api/v1/reseller/webhook',
+      {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-reseller-id': resellerId 
+        },
+        body: JSON.stringify({ webhookUrl })
       },
-      body: JSON.stringify({ webhookUrl })
-    });
-    return res.json();
+      'Erreur lors de la mise à jour du webhook'
+    );
   },
 
   async testWebhookPing(resellerId: string) {
-    const res = await fetch('/api/v1/reseller/webhook/test-ping', {
-      method: 'POST',
-      headers: { 'x-reseller-id': resellerId }
-    });
-    return res.json();
+    return fetchJson<any>(
+      '/api/v1/reseller/webhook/test-ping',
+      {
+        method: 'POST',
+        headers: { 'x-reseller-id': resellerId }
+      },
+      'Erreur lors du test de ping webhook'
+    );
   },
 
   async depositTestBalance(resellerId: string, amount: number) {
-    const res = await fetch('/api/v1/reseller/deposit-test', {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'x-reseller-id': resellerId 
+    return fetchJson(
+      '/api/v1/reseller/deposit-test',
+      {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-reseller-id': resellerId 
+        },
+        body: JSON.stringify({ amount })
       },
-      body: JSON.stringify({ amount })
-    });
-    return res.json();
+      'Erreur lors du rechargement de solde test'
+    );
   },
 
   // Support
@@ -362,44 +450,46 @@ export const apiClient = {
     message: string;
     orderId?: string;
   }): Promise<SupportTicket> {
-    const res = await fetch('/api/support/tickets', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Erreur lors de l’envoi du ticket');
-    }
-    return res.json();
+    return fetchJson<SupportTicket>(
+      '/api/support/tickets',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      },
+      'Erreur lors de l’envoi du ticket'
+    );
   },
 
   async getTicket(ticketNumber: string): Promise<SupportTicket> {
-    const res = await fetch(`/api/support/tickets/${ticketNumber}`);
-    if (!res.ok) throw new Error('Ticket non trouvé');
-    return res.json();
+    return fetchJson<SupportTicket>(
+      `/api/support/tickets/${encodeURIComponent(ticketNumber)}`,
+      undefined,
+      'Ticket non trouvé'
+    );
   },
 
   // Admin APIs (requires admin token)
   async adminLogin(email: string, password: string) {
-    const res = await fetch('/api/admin/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Connexion administrateur refusée');
-    }
-    return res.json();
+    return fetchJson<{ token: string; admin: any }>(
+      '/api/admin/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      },
+      'Connexion administrateur refusée'
+    );
   },
 
   async getAdminStats(token: string) {
-    const res = await fetch('/api/admin/stats', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    if (!res.ok) throw new Error('Non autorisé');
-    return res.json();
+    return fetchJson<any>(
+      '/api/admin/stats',
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Non autorisé'
+    );
   },
 
   async getAdminGames(token: string): Promise<Game[]> {
@@ -409,25 +499,31 @@ export const apiClient = {
   },
 
   async saveAdminGame(token: string, game: Partial<Game>, isNew = false): Promise<Game> {
-    const url = isNew ? '/api/admin/games' : `/api/admin/games/${game.id}`;
+    const url = isNew ? '/api/admin/games' : `/api/admin/games/${encodeURIComponent(String(game.id || ''))}`;
     const method = isNew ? 'POST' : 'PUT';
-    const res = await fetch(url, {
-      method,
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson<Game>(
+      url,
+      {
+        method,
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify(game)
       },
-      body: JSON.stringify(game)
-    });
-    return res.json();
+      'Erreur lors de la sauvegarde du jeu'
+    );
   },
 
   async deleteAdminGame(token: string, id: string) {
-    const res = await fetch(`/api/admin/games/${id}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return res.json();
+    return fetchJson(
+      `/api/admin/games/${encodeURIComponent(id)}`,
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors de la suppression du jeu'
+    );
   },
 
   async getAdminServices(token: string): Promise<Service[]> {
@@ -437,17 +533,20 @@ export const apiClient = {
   },
 
   async saveAdminService(token: string, service: Partial<Service>, isNew = false): Promise<Service> {
-    const url = isNew ? '/api/admin/services' : `/api/admin/services/${service.id}`;
+    const url = isNew ? '/api/admin/services' : `/api/admin/services/${encodeURIComponent(String(service.id || ''))}`;
     const method = isNew ? 'POST' : 'PUT';
-    const res = await fetch(url, {
-      method,
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson<Service>(
+      url,
+      {
+        method,
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify(service)
       },
-      body: JSON.stringify(service)
-    });
-    return res.json();
+      'Erreur lors de la sauvegarde du service'
+    );
   },
 
   // Providers & GoXtop Configuration
@@ -458,19 +557,18 @@ export const apiClient = {
   },
 
   async createAdminProvider(token: string, data: Partial<Provider> & { apiKey?: string; webhookSecret?: string }): Promise<Provider> {
-    const res = await fetch('/api/admin/providers', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<Provider>(
+      '/api/admin/providers',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(data)
       },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Erreur création fournisseur');
-    }
-    return res.json();
+      'Erreur création fournisseur'
+    );
   },
 
   async updateAdminProvider(
@@ -478,71 +576,80 @@ export const apiClient = {
     providerId: string,
     data: Partial<Provider> & { apiKey?: string; webhookSecret?: string; clearApiKey?: boolean; clearWebhookSecret?: boolean }
   ): Promise<Provider> {
-    const res = await fetch(`/api/admin/providers/${providerId}`, {
-      method: 'PUT',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson<Provider>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}`,
+      {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify(data)
       },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'Erreur mise à jour fournisseur');
-    }
-    return res.json();
+      'Erreur mise à jour fournisseur'
+    );
   },
 
   async revealProviderSecret(token: string, providerId: string, field: 'apiKey' | 'webhookSecret'): Promise<{ value: string }> {
-    const res = await fetch(`/api/admin/providers/${providerId}/reveal-secret`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<{ value: string }>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/reveal-secret`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ field })
       },
-      body: JSON.stringify({ field })
-    });
-    if (!res.ok) throw new Error('Accès refusé');
-    return res.json();
+      'Accès refusé'
+    );
   },
 
   async testProviderConnection(token: string, providerId: string): Promise<{ testResult: ConnectionTestResult; provider: Provider }> {
-    const res = await fetch(`/api/admin/providers/${providerId}/test-connection`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    if (!res.ok) throw new Error('Échec de l’appel test');
-    return res.json();
+    return fetchJson<{ testResult: ConnectionTestResult; provider: Provider }>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/test-connection`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Échec de l’appel test'
+    );
   },
 
   async testProviderPing(token: string, providerId: string) {
-    const res = await fetch(`/api/admin/providers/${providerId}/test-ping`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return res.json();
+    return fetchJson(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/test-ping`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Échec du ping fournisseur'
+    );
   },
 
   async syncProviderCatalog(token: string, providerId: string, syncType: 'games' | 'products' | 'prices') {
-    const res = await fetch(`/api/admin/providers/${providerId}/sync`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<any>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/sync`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ syncType })
       },
-      body: JSON.stringify({ syncType })
-    });
-    return res.json();
+      'Erreur lors de la synchronisation du catalogue'
+    );
   },
 
   async getProviderApiLogs(token: string, providerId = 'all'): Promise<ProviderApiLog[]> {
-    return safeFetchArray<ProviderApiLog>(`/api/admin/providers/${providerId}/logs`, {
+    return safeFetchArray<ProviderApiLog>(`/api/admin/providers/${encodeURIComponent(providerId)}/logs`, {
       headers: { Authorization: `Bearer ${token}` }
     });
   },
 
   async getProviderWebhookLogs(token: string, providerId = 'all'): Promise<ProviderWebhookLog[]> {
-    return safeFetchArray<ProviderWebhookLog>(`/api/admin/providers/${providerId}/webhook-logs`, {
+    return safeFetchArray<ProviderWebhookLog>(`/api/admin/providers/${encodeURIComponent(providerId)}/webhook-logs`, {
       headers: { Authorization: `Bearer ${token}` }
     });
   },
@@ -552,16 +659,18 @@ export const apiClient = {
     providerId: string,
     options?: { simulateInvalidSignature?: boolean }
   ): Promise<{ result: WebhookTestResult; provider: Provider; webhookLogs: ProviderWebhookLog[] }> {
-    const res = await fetch(`/api/admin/providers/${providerId}/test-webhook`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/test-webhook`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(options || {})
       },
-      body: JSON.stringify(options || {})
-    });
-    if (!res.ok) throw new Error('Échec du test webhook');
-    return res.json();
+      'Échec du test webhook'
+    );
   },
 
   async getAdminOrders(token: string, filters?: { status?: string; search?: string }): Promise<Order[]> {
@@ -577,11 +686,14 @@ export const apiClient = {
   },
 
   async retryAdminOrder(token: string, orderId: string): Promise<Order> {
-    const res = await fetch(`/api/admin/orders/${orderId}/retry`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return res.json();
+    return fetchJson<Order>(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/retry`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors de la relance de la commande'
+    );
   },
 
   async getProviderOrders(token: string): Promise<ProviderOrder[]> {
@@ -591,31 +703,40 @@ export const apiClient = {
   },
 
   async checkAdminOrderStatus(token: string, orderId: string): Promise<{ result: any; order: Order }> {
-    const res = await fetch(`/api/admin/orders/${orderId}/status-check`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return res.json();
+    return fetchJson(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/status-check`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors de la vérification du statut de la commande'
+    );
   },
 
   async trackAdminOrder(token: string, orderId: string): Promise<{ result: any; order: Order }> {
-    const res = await fetch(`/api/admin/orders/${orderId}/track`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return res.json();
+    return fetchJson(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/track`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors du suivi de la commande'
+    );
   },
 
   async updateAdminOrderStatus(token: string, orderId: string, status: string, note?: string): Promise<Order> {
-    const res = await fetch(`/api/admin/orders/${orderId}/status`, {
-      method: 'PUT',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson<Order>(
+      `/api/admin/orders/${encodeURIComponent(orderId)}/status`,
+      {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify({ status, note })
       },
-      body: JSON.stringify({ status, note })
-    });
-    return res.json();
+      'Erreur lors de la mise à jour du statut'
+    );
   },
 
   async getAdminResellers(token: string): Promise<Reseller[]> {
@@ -625,27 +746,33 @@ export const apiClient = {
   },
 
   async adjustResellerBalance(token: string, resellerId: string, amount: number, note?: string) {
-    const res = await fetch(`/api/admin/resellers/${resellerId}/balance`, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson(
+      `/api/admin/resellers/${encodeURIComponent(resellerId)}/balance`,
+      {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify({ amount, note })
       },
-      body: JSON.stringify({ amount, note })
-    });
-    return res.json();
+      'Erreur lors de l’ajustement du solde revendeur'
+    );
   },
 
   async updateResellerStatus(token: string, resellerId: string, status: string) {
-    const res = await fetch(`/api/admin/resellers/${resellerId}/status`, {
-      method: 'PUT',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson(
+      `/api/admin/resellers/${encodeURIComponent(resellerId)}/status`,
+      {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify({ status })
       },
-      body: JSON.stringify({ status })
-    });
-    return res.json();
+      'Erreur lors de la mise à jour du statut revendeur'
+    );
   },
 
   async getAdminSupport(token: string): Promise<SupportTicket[]> {
@@ -655,27 +782,33 @@ export const apiClient = {
   },
 
   async replyAdminSupport(token: string, ticketId: string, replyText: string, newStatus?: string) {
-    const res = await fetch(`/api/admin/support/${ticketId}/reply`, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson(
+      `/api/admin/support/${encodeURIComponent(ticketId)}/reply`,
+      {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify({ replyText, newStatus })
       },
-      body: JSON.stringify({ replyText, newStatus })
-    });
-    return res.json();
+      'Erreur lors de l’envoi de la réponse au ticket'
+    );
   },
 
   async updateAdminSettings(token: string, settings: Partial<AppSettings>): Promise<AppSettings> {
-    const res = await fetch('/api/admin/settings', {
-      method: 'PUT',
-      headers: { 
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}` 
+    return fetchJson<AppSettings>(
+      '/api/admin/settings',
+      {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}` 
+        },
+        body: JSON.stringify(settings)
       },
-      body: JSON.stringify(settings)
-    });
-    return res.json();
+      'Erreur lors de la sauvegarde des paramètres'
+    );
   },
 
   async getAdminLogs(token: string): Promise<SystemLog[]> {
@@ -692,41 +825,48 @@ export const apiClient = {
   },
 
   async updateAdminUserStatus(token: string, userId: string, status: 'active' | 'suspended'): Promise<AppUser> {
-    const res = await fetch(`/api/admin/users/${userId}/status`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<AppUser>(
+      `/api/admin/users/${encodeURIComponent(userId)}/status`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ status })
       },
-      body: JSON.stringify({ status })
-    });
-    return res.json();
+      'Erreur lors de la mise à jour du statut utilisateur'
+    );
   },
 
   async adjustAdminUserWallet(token: string, userId: string, amount: number, note?: string): Promise<AppUser> {
-    const res = await fetch(`/api/admin/users/${userId}/wallet`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<AppUser>(
+      `/api/admin/users/${encodeURIComponent(userId)}/wallet`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ amount, note })
       },
-      body: JSON.stringify({ amount, note })
-    });
-    return res.json();
+      'Erreur lors de l’ajustement du portefeuille utilisateur'
+    );
   },
 
   async resetAdminUserPassword(token: string, userId: string, newPassword: string): Promise<{ success: boolean; message: string }> {
-    const res = await fetch(`/api/admin/users/${userId}/reset-password`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<{ success: boolean; message: string }>(
+      `/api/admin/users/${encodeURIComponent(userId)}/reset-password`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ newPassword })
       },
-      body: JSON.stringify({ newPassword })
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || 'Erreur réinitialisation mot de passe');
-    return body;
+      'Erreur réinitialisation mot de passe'
+    );
   },
 
   // Admin API Keys
@@ -737,27 +877,33 @@ export const apiClient = {
   },
 
   async createAdminResellerApiKey(token: string, resellerId: string, name: string): Promise<ApiKey> {
-    const res = await fetch(`/api/admin/resellers/${resellerId}/api-keys`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<ApiKey>(
+      `/api/admin/resellers/${encodeURIComponent(resellerId)}/api-keys`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ name })
       },
-      body: JSON.stringify({ name })
-    });
-    return res.json();
+      'Erreur lors de la création de la clé API revendeur'
+    );
   },
 
   async updateAdminApiKeyStatus(token: string, keyId: string, status: 'active' | 'revoked'): Promise<ApiKey> {
-    const res = await fetch(`/api/admin/api-keys/${keyId}/status`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<ApiKey>(
+      `/api/admin/api-keys/${encodeURIComponent(keyId)}/status`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ status })
       },
-      body: JSON.stringify({ status })
-    });
-    return res.json();
+      'Erreur lors de la mise à jour du statut de la clé API'
+    );
   },
 
   // Admin Payment Gateways & Transactions
@@ -772,15 +918,18 @@ export const apiClient = {
     gatewayId: string,
     data: Partial<PaymentGatewayConfig> & { apiKey?: string; clientSecret?: string; webhookSecret?: string }
   ): Promise<PaymentGatewayConfig> {
-    const res = await fetch(`/api/admin/payment-gateways/${gatewayId}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson<PaymentGatewayConfig>(
+      `/api/admin/payment-gateways/${encodeURIComponent(gatewayId)}`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(data)
       },
-      body: JSON.stringify(data)
-    });
-    return res.json();
+      'Erreur lors de la mise à jour de la passerelle de paiement'
+    );
   },
 
   async getAdminPaymentTransactions(token: string): Promise<PaymentTransaction[]> {
@@ -804,8 +953,7 @@ export const apiClient = {
     if (params?.game) qs.set('game', params.game);
     if (params?.region) qs.set('region', params.region);
     const url = `/api/rechargegames/catalog${qs.toString() ? `?${qs.toString()}` : ''}`;
-    const res = await fetch(url);
-    return safeJson(res, 'Impossible de charger le catalogue RechargeGames.');
+    return fetchJson(url, undefined, 'Impossible de charger le catalogue RechargeGames.');
   },
 
   async createRechargeGamesOrder(payload: {
@@ -825,13 +973,21 @@ export const apiClient = {
     order: RechargeGamesOrderRecord;
     playupOrder?: Order;
   }> {
-    const res = await fetch('/api/rechargegames/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok || body.success === false) {
+    const body = await fetchJson<{
+      success: boolean;
+      message: string;
+      order: RechargeGamesOrderRecord;
+      playupOrder?: Order;
+    }>(
+      '/api/rechargegames/orders',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      },
+      'Impossible de traiter la commande pour le moment. Veuillez réessayer.'
+    );
+    if (body.success === false) {
       throw new Error(body.message || 'Impossible de traiter la commande pour le moment. Veuillez réessayer.');
     }
     return body;
@@ -850,8 +1006,11 @@ export const apiClient = {
     order?: RechargeGamesOrderRecord;
     message: string;
   }> {
-    const res = await fetch(`/api/rechargegames/orders/${encodeURIComponent(orderId)}/status`);
-    return safeJson(res, 'Impossible de vérifier le statut de la commande.');
+    return fetchJson(
+      `/api/rechargegames/orders/${encodeURIComponent(orderId)}/status`,
+      undefined,
+      'Impossible de vérifier le statut de la commande.'
+    );
   },
 
   // Admin RechargeGames
@@ -873,10 +1032,13 @@ export const apiClient = {
     webhookEvents: RechargeGamesWebhookEvent[];
     apiLogs: ProviderApiLog[];
   }> {
-    const res = await fetch('/api/admin/rechargegames/dashboard', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return safeJson(res, 'Erreur chargement dashboard RechargeGames');
+    return fetchJson(
+      '/api/admin/rechargegames/dashboard',
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur chargement dashboard RechargeGames'
+    );
   },
 
   async updateRechargeGamesConfig(
@@ -890,23 +1052,29 @@ export const apiClient = {
       autoSyncIntervalMinutes?: number;
     }
   ): Promise<{ success: boolean; message: string; mode: RechargeGamesMode; baseUrl: string }> {
-    const res = await fetch('/api/admin/rechargegames/config', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson(
+      '/api/admin/rechargegames/config',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
       },
-      body: JSON.stringify(payload)
-    });
-    return safeJson(res, 'Erreur sauvegarde configuration');
+      'Erreur sauvegarde configuration'
+    );
   },
 
   async testRechargeGamesConnection(token: string): Promise<ConnectionTestResult> {
-    const res = await fetch('/api/admin/rechargegames/test-connection', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return safeJson(res, 'Erreur lors du test de connexion RechargeGames');
+    return fetchJson(
+      '/api/admin/rechargegames/test-connection',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors du test de connexion RechargeGames'
+    );
   },
 
   async syncRechargeGamesCatalog(token: string): Promise<{
@@ -915,11 +1083,14 @@ export const apiClient = {
     products: RechargeGamesProduct[];
     stats: any;
   }> {
-    const res = await fetch('/api/admin/rechargegames/sync', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return safeJson(res, 'Erreur synchronisation catalogue RechargeGames');
+    return fetchJson(
+      '/api/admin/rechargegames/sync',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur synchronisation catalogue RechargeGames'
+    );
   },
 
   async updateRechargeGamesMargins(
@@ -931,15 +1102,18 @@ export const apiClient = {
     margins: RechargeGamesMarginConfig;
     products: RechargeGamesProduct[];
   }> {
-    const res = await fetch('/api/admin/rechargegames/margins', {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson(
+      '/api/admin/rechargegames/margins',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
       },
-      body: JSON.stringify(payload)
-    });
-    return safeJson(res, 'Erreur sauvegarde marges RechargeGames');
+      'Erreur sauvegarde marges RechargeGames'
+    );
   },
 
   async testRechargeGamesWebhook(
@@ -956,15 +1130,18 @@ export const apiClient = {
     responseBody: any;
     webhookEvent: RechargeGamesWebhookEvent;
   }> {
-    const res = await fetch('/api/admin/rechargegames/test-webhook', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+    return fetchJson(
+      '/api/admin/rechargegames/test-webhook',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
       },
-      body: JSON.stringify(payload)
-    });
-    return safeJson(res, 'Erreur lors du test webhook RechargeGames');
+      'Erreur lors du test webhook RechargeGames'
+    );
   },
 
   async runRechargeGamesTestSuite(token: string): Promise<{
@@ -973,10 +1150,13 @@ export const apiClient = {
     totalCount: number;
     results: RechargeGamesTestStepResult[];
   }> {
-    const res = await fetch('/api/admin/rechargegames/run-test-suite', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return safeJson(res, 'Erreur lors de l’exécution de la suite de tests RechargeGames');
+    return fetchJson(
+      '/api/admin/rechargegames/run-test-suite',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur lors de l’exécution de la suite de tests RechargeGames'
+    );
   }
 };

@@ -56,7 +56,13 @@ export const ApiDocsView: React.FC<ApiDocsViewProps> = ({ onNavigate, lang }) =>
       }
 
       const res = await fetch(sandboxEndpoint, options);
-      const data = await res.json().catch(() => ({ status: 'raw response', code: res.status }));
+      const rawText = await res.text();
+      let data: any;
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        data = { status: 'raw response', code: res.status };
+      }
       setSandboxStatus(res.status);
       setSandboxResponse(data);
     } catch (err: any) {

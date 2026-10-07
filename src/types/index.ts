@@ -468,6 +468,8 @@ export interface SystemLog {
   timestamp: string;
 }
 
+export type UserRole = 'USER' | 'ADMIN';
+
 export interface AppUser {
   id: string;
   uid?: string; // Firebase Auth UID if linked
@@ -475,12 +477,14 @@ export interface AppUser {
   email: string;
   phone?: string;
   avatarUrl?: string;
+  role: UserRole;
   authProvider: 'email' | 'google' | 'facebook';
   emailVerified: boolean;
   status: 'active' | 'suspended';
   preferredCurrency: 'USD' | 'HTG' | 'EUR';
   twoFactorEnabled: boolean;
   emailNotifications: boolean;
+  pushNotificationsEnabled?: boolean;
   walletBalance: number;
   ordersCount: number;
   totalSpent: number;
@@ -692,5 +696,71 @@ export interface RechargeGamesTestStepResult {
   details: string;
   evidence?: Record<string, any>;
 }
+
+// ============================================================================
+// REAL-TIME PUSH NOTIFICATIONS, EMAIL DELIVERY & PACKAGE DOWNLOAD TYPES
+// ============================================================================
+
+export interface PushSubscriptionRecord {
+  id: string;
+  userId: string;
+  userEmail?: string;
+  endpoint: string;
+  keys?: {
+    p256dh?: string;
+    auth?: string;
+  };
+  devicePlatform: 'android' | 'ios' | 'desktop';
+  userAgent: string;
+  active: boolean;
+  createdAt: string;
+  lastSeenAt: string;
+}
+
+export interface PushNotificationLog {
+  id: string;
+  userId: string;
+  orderId: string;
+  orderNumber: string;
+  title: string;
+  body: string;
+  deliveredDateLabel: string;
+  deliveredTimeLabel: string;
+  status: 'sent' | 'queued_offline' | 'delivered_to_device' | 'failed' | 'skipped_disabled';
+  errorMessage?: string;
+  createdAt: string;
+  deliveredAt?: string;
+}
+
+export interface EmailDeliveryLog {
+  id: string;
+  userId: string;
+  recipientEmail: string;
+  orderId: string;
+  orderNumber: string;
+  subject: string;
+  bodyText: string;
+  deliveredDateLabel: string;
+  deliveredTimeLabel: string;
+  status: 'sent' | 'failed' | 'skipped_disabled';
+  transportUsed: 'smtp' | 'webhook_relay' | 'internal_mail_spool';
+  errorMessage?: string;
+  createdAt: string;
+}
+
+export interface AppPackageMetadata {
+  platform: 'android' | 'ios';
+  fileName: string;
+  version: string;
+  buildNumber: number;
+  sizeBytes: number;
+  sizeFormatted: string;
+  sha256: string;
+  mimeType: string;
+  downloadUrl: string;
+  exists: boolean;
+  publishedAt: string;
+}
+
 
 

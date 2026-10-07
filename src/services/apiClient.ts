@@ -5,9 +5,16 @@ import {
   AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType,
   RechargeGamesMode, RechargeGamesProduct, RechargeGamesOrderRecord,
   RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesConfigState,
-  RechargeGamesTestStepResult
+  RechargeGamesTestStepResult, AppPackageMetadata, PushNotificationLog,
+  EmailDeliveryLog, PushSubscriptionRecord
 } from '../types';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
+import { safeStorage } from '../lib/safeStorage';
+
+function getAuthHeaders(tokenOverride?: string): Record<string, string> {
+  const token = tokenOverride || safeStorage.getItem('playup_user_token') || safeStorage.getItem('playup_admin_token') || '';
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 function isHtmlPayload(text: string): boolean {
   const trimmed = text.trim().toLowerCase();
@@ -200,6 +207,8 @@ export const apiClient = {
     user: AppUser;
     orders: Order[];
     paymentTransactions: PaymentTransaction[];
+    pushNotificationLogs?: PushNotificationLog[];
+    emailDeliveryLogs?: EmailDeliveryLog[];
   }> {
     return fetchJson(
       '/api/auth/me',
@@ -218,6 +227,7 @@ export const apiClient = {
       preferredCurrency?: 'USD' | 'HTG' | 'EUR';
       twoFactorEnabled?: boolean;
       emailNotifications?: boolean;
+      pushNotificationsEnabled?: boolean;
       currentPassword?: string;
       newPassword?: string;
     }
@@ -257,12 +267,15 @@ export const apiClient = {
       phone: string;
       otp: string;
     };
-  }): Promise<{ success: boolean; transaction: PaymentTransaction; user?: AppUser }> {
+  }, token?: string): Promise<{ success: boolean; transaction: PaymentTransaction; user?: AppUser }> {
     return fetchJson(
       '/api/payments/process',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
         body: JSON.stringify(data)
       },
       'Échec de la transaction de paiement'
@@ -282,14 +295,19 @@ export const apiClient = {
     );
   },
 
-  async getNotifications(userId?: string): Promise<UserNotification[]> {
+  async getNotifications(userId?: string, token?: string): Promise<UserNotification[]> {
+    const authHeaders = getAuthHeaders(token);
+    if (!authHeaders.Authorization) return [];
     const url = userId ? `/api/app/notifications?userId=${encodeURIComponent(userId)}` : '/api/app/notifications';
-    return safeFetchArray<UserNotification>(url);
+    return safeFetchArray<UserNotification>(url, { headers: authHeaders });
   },
 
-  async markNotificationRead(id: string): Promise<void> {
+  async markNotificationRead(id: string, token?: string): Promise<void> {
     try {
-      await fetch(`/api/app/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' });
+      await fetch(`/api/app/notifications/${encodeURIComponent(id)}/read`, {
+        method: 'POST',
+        headers: getAuthHeaders(token)
+      });
     } catch {
       // Ignore network hiccup when marking notification read
     }
@@ -307,46 +325,53 @@ export const apiClient = {
     paymentReference?: string;
     userId?: string;
     partnerOrderId?: string;
-  }): Promise<Order> {
+  }, token?: string): Promise<Order> {
     return fetchJson<Order>(
       '/api/app/orders',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
         body: JSON.stringify(data)
       },
       'Erreur lors de la création de la commande'
     );
   },
 
-  async getMobileOrder(orderId: string): Promise<Order> {
+  async getMobileOrder(orderId: string, token?: string): Promise<Order> {
     return fetchJson<Order>(
       `/api/app/orders/${encodeURIComponent(orderId)}`,
-      undefined,
+      {
+        headers: getAuthHeaders(token)
+      },
       'Commande non trouvée'
     );
   },
 
-  async getRecentOrders(userId?: string): Promise<Order[]> {
+  async getRecentOrders(userId?: string, token?: string): Promise<Order[]> {
+    const authHeaders = getAuthHeaders(token);
+    if (!authHeaders.Authorization) return [];
     const url = userId ? `/api/app/orders?userId=${encodeURIComponent(userId)}` : '/api/app/orders';
-    return safeFetchArray<Order>(url);
+    return safeFetchArray<Order>(url, { headers: authHeaders });
   },
 
   // Reseller Portal
-  async resellerLogin(email: string) {
-    return fetchJson<{ reseller: Reseller }>(
+  async resellerLogin(email: string, apiKey: string) {
+    return fetchJson<{ reseller: Reseller; apiKey: ApiKey }>(
       '/api/v1/auth/reseller-login',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
+        body: JSON.stringify({ email, apiKey })
       },
       'Connexion échouée'
     );
   },
 
   async resellerRegister(data: { name: string; email: string; company?: string }) {
-    return fetchJson<{ reseller: Reseller }>(
+    return fetchJson<{ reseller: Reseller; apiKey: ApiKey }>(
       '/api/v1/auth/reseller-register',
       {
         method: 'POST',
@@ -357,7 +382,7 @@ export const apiClient = {
     );
   },
 
-  async getResellerMe(resellerId: string) {
+  async getResellerMe(apiKey: string) {
     return fetchJson<{
       reseller: Reseller;
       stats: any;
@@ -368,20 +393,20 @@ export const apiClient = {
     }>(
       '/api/v1/reseller/me',
       {
-        headers: { 'x-reseller-id': resellerId }
+        headers: { 'x-api-key': apiKey }
       },
       'Session revendeur expirée'
     );
   },
 
-  async createApiKey(resellerId: string, name: string, isTest?: boolean) {
+  async createApiKey(apiKey: string, name: string, isTest?: boolean) {
     return fetchJson<ApiKey>(
       '/api/v1/reseller/api-keys',
       {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-reseller-id': resellerId 
+          'x-api-key': apiKey
         },
         body: JSON.stringify({ name, isTest })
       },
@@ -389,25 +414,25 @@ export const apiClient = {
     );
   },
 
-  async revokeApiKey(resellerId: string, keyId: string) {
+  async revokeApiKey(apiKey: string, keyId: string) {
     return fetchJson(
       `/api/v1/reseller/api-keys/${encodeURIComponent(keyId)}`,
       {
         method: 'DELETE',
-        headers: { 'x-reseller-id': resellerId }
+        headers: { 'x-api-key': apiKey }
       },
       'Erreur lors de la révocation de la clé API'
     );
   },
 
-  async updateWebhook(resellerId: string, webhookUrl: string) {
+  async updateWebhook(apiKey: string, webhookUrl: string) {
     return fetchJson(
       '/api/v1/reseller/webhook',
       {
         method: 'PUT',
         headers: { 
           'Content-Type': 'application/json',
-          'x-reseller-id': resellerId 
+          'x-api-key': apiKey
         },
         body: JSON.stringify({ webhookUrl })
       },
@@ -415,25 +440,25 @@ export const apiClient = {
     );
   },
 
-  async testWebhookPing(resellerId: string) {
+  async testWebhookPing(apiKey: string) {
     return fetchJson<any>(
       '/api/v1/reseller/webhook/test-ping',
       {
         method: 'POST',
-        headers: { 'x-reseller-id': resellerId }
+        headers: { 'x-api-key': apiKey }
       },
       'Erreur lors du test de ping webhook'
     );
   },
 
-  async depositTestBalance(resellerId: string, amount: number) {
+  async depositTestBalance(apiKey: string, amount: number) {
     return fetchJson(
       '/api/v1/reseller/deposit-test',
       {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
-          'x-reseller-id': resellerId 
+          'x-api-key': apiKey
         },
         body: JSON.stringify({ amount })
       },
@@ -967,7 +992,7 @@ export const apiClient = {
     paymentConfirmed: boolean;
     paymentMethod?: string;
     paymentReference?: string;
-  }): Promise<{
+  }, token?: string): Promise<{
     success: boolean;
     message: string;
     order: RechargeGamesOrderRecord;
@@ -982,7 +1007,10 @@ export const apiClient = {
       '/api/rechargegames/orders',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
         body: JSON.stringify(payload)
       },
       'Impossible de traiter la commande pour le moment. Veuillez réessayer.'
@@ -993,14 +1021,16 @@ export const apiClient = {
     return body;
   },
 
-  async getRechargeGamesOrders(userId?: string): Promise<RechargeGamesOrderRecord[]> {
+  async getRechargeGamesOrders(userId?: string, token?: string): Promise<RechargeGamesOrderRecord[]> {
+    const authHeaders = getAuthHeaders(token);
+    if (!authHeaders.Authorization) return [];
     const url = userId
       ? `/api/rechargegames/orders?userId=${encodeURIComponent(userId)}`
       : '/api/rechargegames/orders';
-    return safeFetchArray<RechargeGamesOrderRecord>(url);
+    return safeFetchArray<RechargeGamesOrderRecord>(url, { headers: authHeaders });
   },
 
-  async checkRechargeGamesOrderStatus(orderId: string): Promise<{
+  async checkRechargeGamesOrderStatus(orderId: string, token?: string): Promise<{
     success: boolean;
     status: 'pending' | 'delivered' | 'failed';
     order?: RechargeGamesOrderRecord;
@@ -1008,7 +1038,9 @@ export const apiClient = {
   }> {
     return fetchJson(
       `/api/rechargegames/orders/${encodeURIComponent(orderId)}/status`,
-      undefined,
+      {
+        headers: getAuthHeaders(token)
+      },
       'Impossible de vérifier le statut de la commande.'
     );
   },
@@ -1157,6 +1189,87 @@ export const apiClient = {
         headers: { Authorization: `Bearer ${token}` }
       },
       'Erreur lors de l’exécution de la suite de tests RechargeGames'
+    );
+  },
+
+  // Real App Download & Push Notifications
+  async getDownloadInfo(): Promise<{
+    detectedPlatform: 'android' | 'ios' | 'desktop';
+    latestVersion: string;
+    packages: {
+      android: AppPackageMetadata;
+      ios: AppPackageMetadata;
+    };
+  }> {
+    return fetchJson(
+      '/api/download/info',
+      undefined,
+      'Impossible de vérifier les packages de téléchargement'
+    );
+  },
+
+  async verifyPackageExists(platform: 'android' | 'ios'): Promise<boolean> {
+    try {
+      const res = await fetch(`/api/download/package?platform=${platform}`, { method: 'HEAD' });
+      const contentLen = Number(res.headers.get('content-length') || '0');
+      return res.ok && contentLen > 0;
+    } catch {
+      return false;
+    }
+  },
+
+  async subscribePushNotifications(
+    token: string,
+    payload: {
+      endpoint: string;
+      keys?: { p256dh: string; auth: string };
+      devicePlatform: 'android' | 'ios' | 'desktop';
+    }
+  ): Promise<{
+    success: boolean;
+    subscription: PushSubscriptionRecord;
+    queuedOfflineNotifications: PushNotificationLog[];
+  }> {
+    return fetchJson(
+      '/api/notifications/push-subscribe',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de l’activation des notifications push'
+    );
+  },
+
+  async unsubscribePushNotifications(token: string, endpoint?: string): Promise<{ success: boolean }> {
+    return fetchJson(
+      '/api/notifications/push-subscribe',
+      {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ endpoint })
+      },
+      'Erreur lors de la désactivation des notifications push'
+    );
+  },
+
+  async getNotificationHistory(token: string): Promise<{
+    pushNotifications: PushNotificationLog[];
+    emailDeliveries: EmailDeliveryLog[];
+    newlyDeliveredFromOfflineQueue: PushNotificationLog[];
+  }> {
+    return fetchJson(
+      '/api/notifications/history',
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Impossible de charger l’historique des notifications'
     );
   }
 };

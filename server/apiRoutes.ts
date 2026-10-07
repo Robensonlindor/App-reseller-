@@ -1,10 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import fs from 'fs';
 import crypto from 'crypto';
 import { db } from './db';
 import { ProviderEngine } from './providerEngine';
 import { WebhookEngine } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
 import { RechargeGamesProvider } from './providers/RechargeGamesProvider';
+import { PackageDistributionEngine, NotificationEngine } from './notificationAndDownloadEngine';
 export { RechargeGamesProvider };
 import {
   Game,
@@ -18,6 +20,46 @@ import {
 } from '../src/types';
 
 export const apiRouter = Router();
+
+// Ensure verified Android (.apk) and iOS (.mobileconfig) distribution packages exist on disk
+PackageDistributionEngine.ensurePackagesOnDisk();
+
+// ==========================================
+// SECURITY: RATE LIMITING & ANTI-ABUSE ENGINE
+// ==========================================
+const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
+
+const createRateLimiter = (maxRequests: number, windowMs: number, bucketName: string) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    const ip = Array.isArray(forwarded)
+      ? forwarded[0]
+      : typeof forwarded === 'string'
+      ? forwarded.split(',')[0].trim()
+      : req.socket.remoteAddress || 'unknown';
+    const key = `${bucketName}:${ip}`;
+    const now = Date.now();
+    const record = rateLimitBuckets.get(key);
+
+    if (!record || now > record.resetAt) {
+      rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    record.count += 1;
+    if (record.count > maxRequests) {
+      db.addSystemLog('warn', 'auth', `[RateLimit] Trop de requêtes sur ${bucketName} depuis IP ${ip} (${record.count}/${maxRequests})`);
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        message: 'Trop de tentatives détectées. Veuillez patienter avant de réessayer.'
+      });
+    }
+    return next();
+  };
+};
+
+const authRateLimit = createRateLimiter(25, 60 * 1000, 'auth');
+const orderRateLimit = createRateLimiter(30, 60 * 1000, 'orders');
 
 // Middleware: Authenticate App User via Session Token
 const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
@@ -38,11 +80,10 @@ const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
 // MIDDLEWARES
 // ==========================================
 
-// Middleware: Authenticate Reseller by API Key or Session Header
+// Middleware: Authenticate Reseller by API Key or Signed Token
 const authenticateReseller = (req: Request, res: Response, next: NextFunction) => {
   const apiKeyHeader = req.headers['x-api-key'] as string;
   const authHeader = req.headers.authorization;
-  const resellerIdHeader = req.headers['x-reseller-id'] as string;
 
   let keyToVerify = apiKeyHeader;
   if (!keyToVerify && authHeader?.startsWith('Bearer ')) {
@@ -64,7 +105,7 @@ const authenticateReseller = (req: Request, res: Response, next: NextFunction) =
 
     const reseller = resellers.find(r => r.id === foundKey.resellerId);
     if (!reseller || reseller.status !== 'active') {
-      return res.status(401).json({
+      return res.status(403).json({
         error: 'Forbidden',
         message: 'Compte revendeur inactif ou suspendu. Contactez le support PlayUp.'
       });
@@ -78,34 +119,42 @@ const authenticateReseller = (req: Request, res: Response, next: NextFunction) =
     return next();
   }
 
-  // Dashboard session header fallback
-  if (resellerIdHeader) {
-    const reseller = resellers.find(r => r.id === resellerIdHeader);
-    if (reseller) {
-      (req as any).reseller = reseller;
-      return next();
-    }
-  }
-
   return res.status(401).json({
     error: 'Unauthorized',
     message: 'Authentification requise. Spécifiez l’en-tête "X-API-KEY: plup_live_..." ou connectez-vous.'
   });
 };
 
-// Middleware: Authenticate Admin
+// Middleware: Authenticate Admin (Requires authenticated user with database role === 'ADMIN')
 const authenticateAdmin = (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : '';
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
 
-  if (token === db.getAdminToken() || token === 'admin_session_valid') {
-    return next();
+  if (!token) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Authentification requise. Veuillez vous connecter.'
+    });
   }
 
-  return res.status(401).json({
-    error: 'Unauthorized',
-    message: 'Accès réservé aux administrateurs PlayUp.'
-  });
+  const user = db.verifyUserSessionToken(token);
+  if (!user) {
+    return res.status(401).json({
+      error: 'Unauthorized',
+      message: 'Session expirée ou invalide. Veuillez vous reconnecter.'
+    });
+  }
+
+  if (user.role !== 'ADMIN') {
+    db.addSystemLog('warn', 'auth', `Forbidden admin access attempt by non-admin user ${user.email} (role: ${user.role})`);
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Accès interdit : seul un compte possédant le rôle ADMIN est autorisé.'
+    });
+  }
+
+  (req as any).user = user;
+  return next();
 };
 
 // ==========================================
@@ -188,7 +237,7 @@ apiRouter.get('/services', (_req, res) => {
 // 1B. USER AUTHENTICATION & ACCOUNT MANAGEMENT
 // ==========================================
 
-apiRouter.post('/auth/register', (req, res) => {
+apiRouter.post('/auth/register', authRateLimit, (req, res) => {
   try {
     const { name, email, password, phone, preferredCurrency } = req.body;
     if (!name || !email || !password) {
@@ -212,13 +261,14 @@ apiRouter.post('/auth/register', (req, res) => {
       name: String(name).trim().slice(0, 80),
       email: String(email).trim().toLowerCase().slice(0, 160),
       phone: phone ? String(phone).trim().slice(0, 32) : undefined,
+      role: 'USER',
       authProvider: 'email',
       emailVerified: true,
       status: 'active',
       preferredCurrency: ['USD', 'HTG', 'EUR'].includes(preferredCurrency) ? preferredCurrency : 'USD',
       twoFactorEnabled: false,
       emailNotifications: true,
-      walletBalance: 15.00, // Welcome bonus credit for testing PlayUp Wallet
+      walletBalance: 0.00,
       ordersCount: 0,
       totalSpent: 0,
       createdAt: nowIso,
@@ -245,7 +295,7 @@ apiRouter.post('/auth/register', (req, res) => {
   }
 });
 
-apiRouter.post('/auth/login', (req, res) => {
+apiRouter.post('/auth/login', authRateLimit, (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -313,13 +363,14 @@ apiRouter.post('/auth/social', (req, res) => {
         name: String(name || email.split('@')[0]).slice(0, 80),
         email: String(email).toLowerCase().slice(0, 160),
         avatarUrl: avatarUrl || undefined,
+        role: 'USER',
         authProvider: provider === 'facebook' ? 'facebook' : 'google',
         emailVerified: true,
         status: 'active',
         preferredCurrency: 'USD',
         twoFactorEnabled: false,
         emailNotifications: true,
-        walletBalance: 15.00,
+        walletBalance: 0.00,
         ordersCount: 0,
         totalSpent: 0,
         createdAt: nowIso,
@@ -417,16 +468,20 @@ apiRouter.get('/auth/me', authenticateUser, (req, res) => {
   const user = (req as any).user as AppUser;
   const userOrders = db.getOrders().filter(o => o.userId === user.id || (user.uid && o.userId === user.uid));
   const paymentTxs = db.getPaymentTransactions(user.id);
+  const pushLogs = db.getPushNotificationLogs(user.id);
+  const emailLogs = db.getEmailDeliveryLogs(user.id);
   return res.json({
     user,
     orders: userOrders,
-    paymentTransactions: paymentTxs
+    paymentTransactions: paymentTxs,
+    pushNotificationLogs: pushLogs,
+    emailDeliveryLogs: emailLogs
   });
 });
 
 apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
   const currentUser = (req as any).user as AppUser;
-  const { name, phone, preferredCurrency, twoFactorEnabled, emailNotifications, currentPassword, newPassword } = req.body;
+  const { name, phone, preferredCurrency, twoFactorEnabled, emailNotifications, pushNotificationsEnabled, currentPassword, newPassword } = req.body;
 
   const users = db.getUsers();
   const idx = users.findIndex(u => u.id === currentUser.id);
@@ -456,6 +511,7 @@ apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
   }
   if (typeof twoFactorEnabled === 'boolean') users[idx].twoFactorEnabled = twoFactorEnabled;
   if (typeof emailNotifications === 'boolean') users[idx].emailNotifications = emailNotifications;
+  if (typeof pushNotificationsEnabled === 'boolean') users[idx].pushNotificationsEnabled = pushNotificationsEnabled;
 
   db.setUsers(users);
   db.addSystemLog('info', 'auth', `User ${users[idx].email} updated account profile`);
@@ -475,10 +531,10 @@ apiRouter.get('/payments/gateways', (_req, res) => {
   res.json(gateways);
 });
 
-apiRouter.post('/payments/process', async (req, res) => {
+apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req, res) => {
   try {
+    const authenticatedUser = (req as any).user as AppUser;
     const {
-      userId,
       paymentMethod,
       amount,
       currency = 'USD',
@@ -486,6 +542,7 @@ apiRouter.post('/payments/process', async (req, res) => {
       mobileWalletDetails,
       purpose = 'order' // 'order' | 'wallet_topup'
     } = req.body;
+    const userId = authenticatedUser.id;
 
     const numAmount = Number(amount);
     if (isNaN(numAmount) || numAmount <= 0) {
@@ -696,19 +753,24 @@ apiRouter.post('/rechargegames/check-player', async (req, res) => {
   }
 });
 
-// User Notifications for PlayUp Mobile App
-apiRouter.get('/app/notifications', (req, res) => {
-  const userId = req.query.userId as string | undefined;
-  res.json(db.getUserNotifications(userId));
+// User Notifications for PlayUp Mobile App (Protected by authenticateUser)
+apiRouter.get('/app/notifications', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  res.json(db.getUserNotifications(user.id));
 });
 
-apiRouter.post('/app/notifications/:id/read', (req, res) => {
-  db.markNotificationRead(req.params.id);
+apiRouter.post('/app/notifications/:id/read', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const userNotifs = db.getUserNotifications(user.id);
+  if (userNotifs.some(n => n.id === req.params.id)) {
+    db.markNotificationRead(req.params.id);
+  }
   res.json({ success: true });
 });
 
-apiRouter.post('/app/orders', async (req, res) => {
+apiRouter.post('/app/orders', authenticateUser, orderRateLimit, async (req, res) => {
   try {
+    const authenticatedUser = (req as any).user as AppUser;
     const {
       gameId,
       serviceId,
@@ -716,7 +778,8 @@ apiRouter.post('/app/orders', async (req, res) => {
       gameProfileData,
       verifiedPlayerName,
       paymentConfirmed,
-      partnerOrderId: clientPartnerId
+      partnerOrderId: clientPartnerId,
+      price: clientManipulatedPrice
     } = req.body;
 
     if (!gameId || !serviceId || !packageId) {
@@ -739,6 +802,15 @@ apiRouter.post('/app/orders', async (req, res) => {
     const pkg = service.packages.find(p => p.id === packageId);
     if (!pkg || !pkg.isActive) {
       return res.status(400).json({ error: 'Package introuvable ou inactif.' });
+    }
+
+    // Security check: Reject if client attempts to override or manipulate the server-side price
+    if (clientManipulatedPrice !== undefined && Math.abs(Number(clientManipulatedPrice) - pkg.publicPrice) > 0.01) {
+      db.addSystemLog('error', 'order', `[Security Alert] Tentative de manipulation de prix détectée par ${authenticatedUser.email}: prix envoyé=${clientManipulatedPrice}, prix réel=${pkg.publicPrice}`);
+      return res.status(400).json({
+        error: 'Price Manipulation Blocked',
+        message: 'Le prix envoyé ne correspond pas au tarif officiel du serveur PlayUp.'
+      });
     }
 
     const profileData = gameProfileData || {};
@@ -784,7 +856,7 @@ apiRouter.post('/app/orders', async (req, res) => {
     if (pkg.providerSlug === 'rechargegames' || pkg.productKey || db.getRechargeGamesProductByKey(pkg.externalProductId || '')) {
       const rg = new RechargeGamesProvider();
       const rgRes = await rg.createOrder({
-        userId: req.body.userId || 'usr_player_01',
+        userId: authenticatedUser.id,
         productKey: pkg.productKey || pkg.externalProductId || '',
         region: pkg.region,
         playerId: String(playerId || ''),
@@ -817,7 +889,7 @@ apiRouter.post('/app/orders', async (req, res) => {
       orderNumber,
       partnerOrderId,
       source: 'mobile_app',
-      userId: req.body.userId || 'app_user_default',
+      userId: authenticatedUser.id,
       gameId: game.id,
       externalGameId: pkg.externalGameId || game.externalGameId || game.slug,
       gameName: game.name,
@@ -890,7 +962,8 @@ apiRouter.post('/app/orders', async (req, res) => {
   }
 });
 
-apiRouter.get('/app/orders/:orderId', async (req, res) => {
+apiRouter.get('/app/orders/:orderId', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
   const { orderId } = req.params;
   const orders = db.getOrders();
   const orderIdx = orders.findIndex(o => o.id === orderId || o.orderNumber === orderId || o.partnerOrderId === orderId);
@@ -899,6 +972,9 @@ apiRouter.get('/app/orders/:orderId', async (req, res) => {
   }
 
   const order = orders[orderIdx];
+  if (user.role !== 'ADMIN' && order.userId !== user.id) {
+    return res.status(403).json({ error: 'Accès interdit à cette commande.' });
+  }
 
   // 1. If the order is a RechargeGames order and is currently pending/processing, query live GET /v1/orders/{order_id}
   if (
@@ -954,6 +1030,18 @@ apiRouter.get('/app/orders/:orderId', async (req, res) => {
                 updated_at: order.updatedAt
               });
             }
+            if (liveStatus.status === 'completed' && order.userId) {
+              await NotificationEngine.triggerOrderDeliveredNotifications({
+                orderId: order.id,
+                orderNumber: order.orderNumber,
+                userId: order.userId,
+                gameName: order.gameName,
+                packageName: order.packageName,
+                playerId: order.playerId,
+                deliveredAtIso: order.updatedAt,
+                providerName: order.providerName || 'GoXtop'
+              });
+            }
           }
           db.setOrders(orders);
         }
@@ -966,14 +1054,9 @@ apiRouter.get('/app/orders/:orderId', async (req, res) => {
   res.json(order);
 });
 
-apiRouter.get('/app/orders', (req, res) => {
-  const userId = req.query.userId as string;
-  let orders = db.getOrders();
-  if (userId) {
-    orders = orders.filter(o => o.userId === userId);
-  } else {
-    orders = orders.slice(0, 15);
-  }
+apiRouter.get('/app/orders', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const orders = db.getOrders().filter(o => o.userId === user.id || (user.uid && o.userId === user.uid));
   res.json(orders);
 });
 
@@ -1115,22 +1198,29 @@ apiRouter.post('/v1/auth/reseller-register', (req, res) => {
 });
 
 apiRouter.post('/v1/auth/reseller-login', (req, res) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email requis' });
+  const { email, apiKey } = req.body;
+  if (!email || !apiKey) {
+    return res.status(400).json({ error: 'Email revendeur et Clé API active requis pour l’authentification.' });
   }
 
   const resellers = db.getResellers();
-  const reseller = resellers.find(r => r.email.toLowerCase() === email.toLowerCase());
+  const reseller = resellers.find(r => r.email.toLowerCase() === String(email).trim().toLowerCase());
 
   if (!reseller) {
-    return res.status(404).json({ error: 'Aucun compte revendeur trouvé avec cet email.' });
+    return res.status(401).json({ error: 'Identifiants revendeur invalides.' });
+  }
+
+  const validKey = db.getApiKeys().find(
+    k => k.resellerId === reseller.id && k.key === String(apiKey).trim() && k.status === 'active'
+  );
+  if (!validKey) {
+    return res.status(401).json({ error: 'Clé API revendeur invalide ou révoquée.' });
   }
 
   reseller.lastActiveAt = new Date().toISOString();
   db.setResellers(resellers);
 
-  res.json({ reseller });
+  res.json({ reseller, apiKey: validKey });
 });
 
 apiRouter.get('/v1/games', authenticateReseller, (_req, res) => {
@@ -1581,18 +1671,43 @@ apiRouter.get('/support/tickets/:ticketNumber', (req, res) => {
 // 6. ADMIN CONTROL PANEL & GOXTOP CONFIGURATION
 // ==========================================
 
-apiRouter.post('/admin/login', (req, res) => {
+apiRouter.post('/admin/login', authRateLimit, (req, res) => {
   const { email, password } = req.body;
-  if (email === 'admin@playup.io' && password === 'PlayUpAdmin2026!') {
-    db.addSystemLog('info', 'auth', `Admin logged in successfully (${email})`);
-    return res.json({
-      token: db.getAdminToken(),
-      admin: { email: 'admin@playup.io', name: 'Super Administrateur PlayUp' }
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email et mot de passe administrateur requis.' });
+  }
+
+  const user = db.getUserByEmail(String(email));
+  if (!user || !db.verifyPassword(String(password), user.id)) {
+    db.addSystemLog('warn', 'auth', `Failed admin login attempt with email: ${email}`);
+    return res.status(401).json({ error: 'Identifiants administrateur incorrects.' });
+  }
+
+  if (user.status === 'suspended') {
+    return res.status(403).json({ error: 'Ce compte a été suspendu.' });
+  }
+
+  if (user.role !== 'ADMIN') {
+    db.addSystemLog('warn', 'auth', `Non-admin user (${user.email}, role=${user.role}) attempted admin login`);
+    return res.status(403).json({
+      error: 'Accès refusé : votre compte ne possède pas le rôle ADMIN.'
     });
   }
 
-  db.addSystemLog('warn', 'auth', `Failed admin login attempt with email: ${email}`);
-  return res.status(401).json({ error: 'Identifiants administrateur incorrects.' });
+  const users = db.getUsers();
+  const idx = users.findIndex(u => u.id === user.id);
+  if (idx !== -1) {
+    users[idx].lastLoginAt = new Date().toISOString();
+    db.setUsers(users);
+  }
+
+  const token = db.generateUserSessionToken(user.id);
+  db.addSystemLog('info', 'auth', `Admin logged in successfully (${user.email})`);
+  return res.json({
+    token,
+    admin: users[idx] || user,
+    user: users[idx] || user
+  });
 });
 
 apiRouter.get('/admin/stats', authenticateAdmin, (_req, res) => {
@@ -2107,6 +2222,19 @@ apiRouter.post('/admin/orders/:id/status-check', authenticateAdmin, async (req, 
       note: `Vérification GET /api/v.1/${order.partnerOrderId} → ${statusRes.status.toUpperCase()}`
     });
     db.setOrders(orders);
+
+    if (order.status === 'completed' && order.userId) {
+      await NotificationEngine.triggerOrderDeliveredNotifications({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        userId: order.userId,
+        gameName: order.gameName,
+        packageName: order.packageName,
+        playerId: order.gameProfileData?.playerId || order.gameProfileData?.characterId,
+        deliveredAtIso: order.updatedAt,
+        providerName: order.providerName || 'GoXtop'
+      });
+    }
   }
   res.json({ result: statusRes, order });
 });
@@ -2133,6 +2261,19 @@ apiRouter.post('/admin/orders/:id/track', authenticateAdmin, async (req, res) =>
       note: `Suivi POST /api/v.1/${providerOrderId}/track → ${trackRes.status.toUpperCase()}`
     });
     db.setOrders(orders);
+
+    if (order.status === 'completed' && order.userId) {
+      await NotificationEngine.triggerOrderDeliveredNotifications({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        userId: order.userId,
+        gameName: order.gameName,
+        packageName: order.packageName,
+        playerId: order.gameProfileData?.playerId || order.gameProfileData?.characterId,
+        deliveredAtIso: order.updatedAt,
+        providerName: order.providerName || 'GoXtop'
+      });
+    }
   }
   res.json({ result: trackRes, order });
 });
@@ -2518,10 +2659,10 @@ apiRouter.get('/rechargegames/catalog', async (req, res) => {
   });
 });
 
-// POST /api/rechargegames/orders — Mobile App 10-step purchase endpoint
-apiRouter.post('/rechargegames/orders', async (req, res) => {
+// POST /api/rechargegames/orders — Mobile App 10-step purchase endpoint (Protected by authenticateUser)
+apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
+  const authenticatedUser = (req as any).user as AppUser;
   const {
-    userId,
     product_key,
     region,
     player_id,
@@ -2535,7 +2676,7 @@ apiRouter.post('/rechargegames/orders', async (req, res) => {
 
   const rg = new RechargeGamesProvider();
   const result = await rg.createOrder({
-    userId: String(userId || 'usr_player_01'),
+    userId: authenticatedUser.id,
     productKey: String(product_key || ''),
     region: region ? String(region) : undefined,
     playerId: String(player_id || ''),
@@ -2565,10 +2706,10 @@ apiRouter.post('/rechargegames/orders', async (req, res) => {
   });
 });
 
-// GET /api/rechargegames/orders — User Top-Up History ("Historique des top-ups")
-apiRouter.get('/rechargegames/orders', (req, res) => {
-  const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-  const orders = db.getRechargeGamesOrders(userId);
+// GET /api/rechargegames/orders — User Top-Up History ("Historique des top-ups", strictly scoped to authenticated user)
+apiRouter.get('/rechargegames/orders', authenticateUser, (req, res) => {
+  const authenticatedUser = (req as any).user as AppUser;
+  const orders = db.getRechargeGamesOrders(authenticatedUser.id);
   // Return sanitized customer view (without provider_price or profit)
   const customerOrders = orders.map(o => ({
     id: o.id,
@@ -2598,9 +2739,17 @@ apiRouter.get('/rechargegames/orders', (req, res) => {
   res.json(customerOrders);
 });
 
-// GET /api/rechargegames/orders/:orderId/status — Fallback status check (GET /v1/orders/{order_id})
-apiRouter.get('/rechargegames/orders/:orderId/status', async (req, res) => {
+// GET /api/rechargegames/orders/:orderId/status — Fallback status check (GET /v1/orders/{order_id}, protected)
+apiRouter.get('/rechargegames/orders/:orderId/status', authenticateUser, async (req, res) => {
+  const authenticatedUser = (req as any).user as AppUser;
   const { orderId } = req.params;
+  const existing = db.findRechargeGamesOrderById(orderId);
+  if (!existing) {
+    return res.status(404).json({ error: 'Commande introuvable' });
+  }
+  if (authenticatedUser.role !== 'ADMIN' && existing.user_id !== authenticatedUser.id) {
+    return res.status(403).json({ error: 'Accès interdit à cette commande.' });
+  }
   const rg = new RechargeGamesProvider();
   const statusRes = await rg.checkOrderStatus(orderId);
   res.json(statusRes);
@@ -3368,5 +3517,243 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     totalCount: results.length,
     results
   });
+});
+
+// ============================================================================
+// REAL APPLICATION DOWNLOAD & PACKAGE VERIFICATION ENDPOINTS
+// ============================================================================
+
+apiRouter.get('/download/info', (req, res) => {
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  let detectedPlatform: 'android' | 'ios' | 'desktop' = 'desktop';
+  if (/iphone|ipad|ipod/.test(ua)) {
+    detectedPlatform = 'ios';
+  } else if (/android/.test(ua)) {
+    detectedPlatform = 'android';
+  }
+
+  const androidMeta = PackageDistributionEngine.getPackageMetadata('android');
+  const iosMeta = PackageDistributionEngine.getPackageMetadata('ios');
+
+  res.json({
+    detectedPlatform,
+    latestVersion: PackageDistributionEngine.LATEST_VERSION,
+    packages: {
+      android: androidMeta,
+      ios: iosMeta
+    }
+  });
+});
+
+apiRouter.head('/download/package', (req, res) => {
+  const platformParam = String(req.query.platform || '').toLowerCase();
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  const platform: 'android' | 'ios' =
+    platformParam === 'ios' || (!platformParam && /iphone|ipad|ipod/.test(ua))
+      ? 'ios'
+      : 'android';
+
+  const meta = PackageDistributionEngine.getPackageMetadata(platform);
+  if (!meta.exists || meta.sizeBytes <= 0) {
+    return res.status(404).end();
+  }
+
+  res.setHeader('Content-Type', meta.mimeType);
+  res.setHeader('Content-Length', String(meta.sizeBytes));
+  res.setHeader('X-Package-Version', meta.version);
+  res.setHeader('X-Package-Sha256', meta.sha256);
+  res.setHeader('X-Package-Filename', meta.fileName);
+  return res.status(200).end();
+});
+
+apiRouter.get('/download/package', (req, res) => {
+  const platformParam = String(req.query.platform || '').toLowerCase();
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  const platform: 'android' | 'ios' =
+    platformParam === 'ios' || (!platformParam && /iphone|ipad|ipod/.test(ua))
+      ? 'ios'
+      : 'android';
+
+  const meta = PackageDistributionEngine.getPackageMetadata(platform);
+  const filePath = PackageDistributionEngine.getPackageFilePath(platform);
+
+  if (!meta.exists || !fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: 'Package introuvable',
+      message: 'Le package demandé est introuvable sur le serveur.'
+    });
+  }
+
+  db.addSystemLog('info', 'system', `[App Download] Téléchargement réel du package ${meta.fileName} (${meta.sizeFormatted}, SHA-256: ${meta.sha256.slice(0, 12)}...)`);
+
+  res.setHeader('Content-Type', meta.mimeType);
+  res.setHeader('Content-Length', String(meta.sizeBytes));
+  res.setHeader('Content-Disposition', `attachment; filename="${meta.fileName}"`);
+  res.setHeader('X-Package-Version', meta.version);
+  res.setHeader('X-Package-Sha256', meta.sha256);
+  res.setHeader('Cache-Control', 'no-cache');
+
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', err => {
+    console.error('[Download Stream Error]:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erreur lors de la lecture du package.' });
+    }
+  });
+  stream.pipe(res);
+});
+
+// ============================================================================
+// REAL-TIME PUSH NOTIFICATIONS & OFFLINE SYNC ENDPOINTS
+// ============================================================================
+
+apiRouter.post('/notifications/push-subscribe', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const { endpoint, keys, devicePlatform } = req.body;
+  const ua = String(req.headers['user-agent'] || '');
+
+  const sub = db.upsertPushSubscription({
+    userId: user.id,
+    userEmail: user.email,
+    endpoint: String(endpoint || `sw-push://${user.id}`),
+    keys: keys && typeof keys === 'object' ? keys : undefined,
+    devicePlatform: ['android', 'ios', 'desktop'].includes(devicePlatform) ? devicePlatform : 'desktop',
+    userAgent: ua.slice(0, 200),
+    active: true
+  });
+
+  // Immediately deliver any queued offline push notifications to this reconnected device
+  const flushedOfflineNotifications = db.markPushNotificationsDeliveredForUser(user.id);
+
+  res.json({
+    success: true,
+    subscription: sub,
+    queuedOfflineNotifications: flushedOfflineNotifications
+  });
+});
+
+apiRouter.delete('/notifications/push-subscribe', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const { endpoint } = req.body || {};
+  db.removePushSubscription(user.id, endpoint);
+  res.json({ success: true });
+});
+
+apiRouter.get('/notifications/history', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const flushedOffline = db.markPushNotificationsDeliveredForUser(user.id);
+  res.json({
+    pushNotifications: db.getPushNotificationLogs(user.id),
+    emailDeliveries: db.getEmailDeliveryLogs(user.id),
+    newlyDeliveredFromOfflineQueue: flushedOffline
+  });
+});
+
+apiRouter.get('/notifications/push-stream', (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token =
+    (authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '') ||
+    String(req.query.token || '').trim();
+
+  const user = db.verifyUserSessionToken(token);
+  if (!user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  NotificationEngine.registerSseClient(user.id, res);
+
+  // Immediately flush any queued offline notifications upon connection
+  const pendingOffline = db.markPushNotificationsDeliveredForUser(user.id);
+  for (const pushLog of pendingOffline) {
+    res.write(
+      `data: ${JSON.stringify({
+        type: 'ORDER_DELIVERED_PUSH',
+        notification: pushLog,
+        orderNumber: pushLog.orderNumber,
+        flushedFromOfflineQueue: true
+      })}\n\n`
+    );
+  }
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    NotificationEngine.unregisterSseClient(user.id, res);
+  });
+});
+
+// ============================================================================
+// OFFICIAL STRIPE WEBHOOK VERIFICATION ENDPOINT
+// ============================================================================
+
+apiRouter.post('/webhooks/stripe', (req: any, res) => {
+  const sigHeader = String(req.headers['stripe-signature'] || '');
+  const stripeSecret = (process.env.STRIPE_WEBHOOK_SECRET || db.getPaymentGatewaySecret('gw_card')?.webhookSecret || '').trim();
+  const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {});
+
+  if (!stripeSecret) {
+    return res.status(400).json({ error: 'STRIPE_WEBHOOK_SECRET non configuré côté serveur.' });
+  }
+
+  if (!sigHeader) {
+    return res.status(401).json({ error: 'En-tête stripe-signature manquant.' });
+  }
+
+  // Parse t=... and v1=...
+  const parts = sigHeader.split(',').map(p => p.trim());
+  const tPart = parts.find(p => p.startsWith('t='));
+  const v1Part = parts.find(p => p.startsWith('v1='));
+  const timestamp = tPart ? tPart.slice(2) : '';
+  const signature = v1Part ? v1Part.slice(3) : '';
+
+  if (!timestamp || !signature) {
+    return res.status(401).json({ error: 'Format stripe-signature invalide.' });
+  }
+
+  const tsNum = Number(timestamp);
+  if (Number.isNaN(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300) {
+    return res.status(401).json({ error: 'Horodatage Stripe expiré (protection anti-replay).' });
+  }
+
+  const signedPayload = `${timestamp}.${rawBody}`;
+  const expectedSig = crypto.createHmac('sha256', stripeSecret).update(signedPayload, 'utf8').digest('hex');
+
+  let valid = false;
+  try {
+    const bufA = Buffer.from(signature, 'hex');
+    const bufB = Buffer.from(expectedSig, 'hex');
+    valid = bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    valid = false;
+  }
+
+  if (!valid) {
+    db.addSystemLog('error', 'payment', '[Stripe Security] Signature Webhook Stripe invalide rejetée.');
+    return res.status(401).json({ error: 'Signature Stripe HMAC-SHA256 invalide.' });
+  }
+
+  const event = req.body;
+  const eventId = String(event?.id || '');
+  if (eventId && db.hasProcessedWebhookEvent(`stripe_${eventId}`)) {
+    return res.status(200).json({ received: true, duplicate: true });
+  }
+  if (eventId) {
+    db.markWebhookEventProcessed(`stripe_${eventId}`);
+  }
+
+  db.addSystemLog('info', 'payment', `[Stripe Webhook] Événement authentifié reçu : ${event?.type || 'unknown'} (${eventId})`);
+  return res.status(200).json({ received: true, verified: true });
 });
 

@@ -15,8 +15,9 @@ interface ResellerPortalViewProps {
 }
 
 export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNavigate, lang }) => {
-  const [session, setSession] = useState<{ reseller: Reseller } | null>(null);
-  const [loginEmail, setLoginEmail] = useState('leaderlindor@gmail.com');
+  const [session, setSession] = useState<{ reseller: Reseller; apiKey?: ApiKey } | null>(null);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginApiKey, setLoginApiKey] = useState('');
   const [registerName, setRegisterName] = useState('');
   const [registerEmail, setRegisterEmail] = useState('');
   const [registerCompany, setRegisterCompany] = useState('');
@@ -50,22 +51,31 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        setSession(parsed);
-        loadDashboard(parsed.reseller.id);
+        if (parsed?.apiKey?.key) {
+          setSession(parsed);
+          loadDashboard(parsed.apiKey.key);
+        } else {
+          safeStorage.removeItem('playup_reseller_session');
+        }
       } catch (e) {
         safeStorage.removeItem('playup_reseller_session');
       }
     }
   }, []);
 
-  const loadDashboard = async (resellerId: string) => {
+  const getActiveApiKey = () => session?.apiKey?.key || dashboardData?.apiKeys?.[0]?.key || '';
+
+  const loadDashboard = async (apiKeyToUse: string) => {
+    if (!apiKeyToUse) return;
     setLoading(true);
     try {
-      const data = await apiClient.getResellerMe(resellerId);
+      const data = await apiClient.getResellerMe(apiKeyToUse);
       setDashboardData(data);
       setWebhookInputUrl(data.reseller.webhookUrl || '');
     } catch (err: any) {
-      console.error(err);
+      safeStorage.removeItem('playup_reseller_session');
+      setSession(null);
+      setDashboardData(null);
     } finally {
       setLoading(false);
     }
@@ -75,10 +85,10 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
     e.preventDefault();
     setAuthError(null);
     try {
-      const res = await apiClient.resellerLogin(loginEmail);
+      const res = await apiClient.resellerLogin(loginEmail, loginApiKey);
       setSession(res);
       safeStorage.setItem('playup_reseller_session', JSON.stringify(res));
-      await loadDashboard(res.reseller.id);
+      await loadDashboard(res.apiKey.key);
     } catch (err: any) {
       setAuthError(err.message);
     }
@@ -95,7 +105,7 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
       });
       setSession(res);
       safeStorage.setItem('playup_reseller_session', JSON.stringify(res));
-      await loadDashboard(res.reseller.id);
+      await loadDashboard(res.apiKey.key);
     } catch (err: any) {
       setAuthError(err.message);
     }
@@ -108,53 +118,58 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
   };
 
   const handleCreateApiKey = async () => {
-    if (!session?.reseller.id) return;
+    const key = getActiveApiKey();
+    if (!key) return;
     try {
-      await apiClient.createApiKey(session.reseller.id, newKeyName || 'Production Key', newKeyIsTest);
+      await apiClient.createApiKey(key, newKeyName || 'Production Key', newKeyIsTest);
       setNewKeyName('');
-      await loadDashboard(session.reseller.id);
+      await loadDashboard(key);
     } catch (err) {
       console.error(err);
     }
   };
 
   const handleRevokeKey = async (keyId: string) => {
-    if (!session?.reseller.id) return;
-    await apiClient.revokeApiKey(session.reseller.id, keyId);
-    await loadDashboard(session.reseller.id);
+    const key = getActiveApiKey();
+    if (!key) return;
+    await apiClient.revokeApiKey(key, keyId);
+    await loadDashboard(key);
   };
 
   const handleSaveWebhook = async () => {
-    if (!session?.reseller.id) return;
+    const key = getActiveApiKey();
+    if (!key) return;
     try {
-      await apiClient.updateWebhook(session.reseller.id, webhookInputUrl);
+      await apiClient.updateWebhook(key, webhookInputUrl);
       setWebhookMsg('URL de Webhook enregistrée avec succès.');
       setTimeout(() => setWebhookMsg(null), 3000);
-      await loadDashboard(session.reseller.id);
+      await loadDashboard(key);
     } catch (err: any) {
       setWebhookMsg('Erreur lors de la mise à jour');
     }
   };
 
   const handleTestWebhookPing = async () => {
-    if (!session?.reseller.id) return;
+    const key = getActiveApiKey();
+    if (!key) return;
     try {
-      const res = await apiClient.testWebhookPing(session.reseller.id);
+      await apiClient.testWebhookPing(key);
       setWebhookMsg('Événement de test expédié au webhook.');
       setTimeout(() => setWebhookMsg(null), 4000);
-      await loadDashboard(session.reseller.id);
+      await loadDashboard(key);
     } catch (err: any) {
       setWebhookMsg(err.message);
     }
   };
 
   const handleTestDeposit = async () => {
-    if (!session?.reseller.id) return;
+    const key = getActiveApiKey();
+    if (!key) return;
     const amount = Number(depositAmount);
     if (!amount || amount <= 0) return;
     try {
-      await apiClient.depositTestBalance(session.reseller.id, amount);
-      await loadDashboard(session.reseller.id);
+      await apiClient.depositTestBalance(key, amount);
+      await loadDashboard(key);
     } catch (e) {
       console.error(e);
     }
@@ -214,8 +229,20 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
                   required
                   value={loginEmail}
                   onChange={(e) => setLoginEmail(e.target.value)}
-                  placeholder="ex: leaderlindor@gmail.com"
+                  placeholder="contact@entreprise.com"
                   className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-700 block mb-1">Clé API Active (X-API-KEY)</label>
+                <input
+                  type="password"
+                  required
+                  value={loginApiKey}
+                  onChange={(e) => setLoginApiKey(e.target.value)}
+                  placeholder="plup_live_..."
+                  className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs font-mono focus:outline-none focus:border-orange-500"
                 />
               </div>
 
@@ -227,10 +254,6 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
                   Accéder à mon Dashboard
                 </button>
               </div>
-
-              <div className="p-3 bg-slate-50 rounded-xl border border-slate-100 text-[11px] text-slate-500">
-                Compte démo pré-enregistré : <strong className="text-slate-800">leaderlindor@gmail.com</strong> (Alpha Games Network).
-              </div>
             </form>
           ) : (
             <form onSubmit={handleRegister} className="space-y-4 text-xs">
@@ -241,7 +264,7 @@ export const ResellerPortalView: React.FC<ResellerPortalViewProps> = ({ onNaviga
                   required
                   value={registerName}
                   onChange={(e) => setRegisterName(e.target.value)}
-                  placeholder="ex: Robenson Alexis"
+                  placeholder="Votre nom complet"
                   className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
                 />
               </div>

@@ -19,10 +19,12 @@ interface AdminDashboardViewProps {
 }
 
 export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose }) => {
-  // Authentication State (using safeStorage for iframe safety)
-  const [token, setToken] = useState<string | null>(() => safeStorage.getItem('playup_admin_token'));
-  const [email, setEmail] = useState('admin@playup.io');
-  const [password, setPassword] = useState('PlayUpAdmin2026!');
+  // Authentication State (using safeStorage for iframe safety — never pre-filled)
+  const [token, setToken] = useState<string | null>(
+    () => safeStorage.getItem('playup_admin_token') || safeStorage.getItem('playup_user_token')
+  );
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
   // Admin Navigation Tabs
@@ -96,12 +98,13 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
     if (!token) return;
     setLoading(true);
     try {
+      // Verify ADMIN role against backend first; reject immediately if not ADMIN
+      const statsData = await apiClient.getAdminStats(token);
       const [
-        statsData, gamesData, servicesData, providersData, 
+        gamesData, servicesData, providersData, 
         ordersData, usersData, resellersData, apiKeysData,
         gatewaysData, txData, ticketsData, settingsData, logsData
       ] = await Promise.all([
-        apiClient.getAdminStats(token).catch(() => ({ metrics: null })),
         apiClient.getAdminGames(token).catch(() => []),
         apiClient.getAdminServices(token).catch(() => []),
         apiClient.getAdminProviders(token).catch(() => []),
@@ -129,8 +132,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       setTickets(ticketsData);
       if (settingsData) setSettings(settingsData);
       setLogs(logsData);
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      safeStorage.removeItem('playup_admin_token');
+      setToken(null);
+      setLoginError(err?.message || 'Session administrateur invalide ou rôle ADMIN requis.');
     } finally {
       setLoading(false);
     }
@@ -465,7 +470,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
             </div>
 
             <p className="text-[11px] text-center text-slate-400">
-              Identifiants démo : admin@playup.io / PlayUpAdmin2026!
+              Accès strictement réservé aux comptes disposant du rôle ADMIN vérifié côté serveur.
             </p>
           </form>
         </div>
@@ -499,8 +504,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
 
-          <span className="text-xs text-slate-400 font-mono hidden sm:inline">
-            admin@playup.io
+          <span className="text-xs text-emerald-400 font-mono hidden sm:inline">
+            ROLE: ADMIN
           </span>
 
           <button

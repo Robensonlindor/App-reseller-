@@ -2,6 +2,7 @@ import { db } from './db';
 import { Order } from '../src/types';
 import { WebhookEngine } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
+import { NotificationEngine } from './notificationAndDownloadEngine';
 
 export class ProviderEngine {
   /**
@@ -89,6 +90,18 @@ export class ProviderEngine {
       });
       if (order.status === 'completed') {
         WebhookEngine.dispatchOrderEvent(order, 'order.completed').catch(console.error);
+        if (order.userId) {
+          NotificationEngine.triggerOrderDeliveredNotifications({
+            orderId: order.id,
+            orderNumber: order.orderNumber,
+            userId: order.userId,
+            gameName: order.gameName,
+            packageName: order.packageName,
+            playerId: order.gameProfileData?.playerId || order.gameProfileData?.characterId,
+            deliveredAtIso: order.updatedAt,
+            providerName: provider.name
+          }).catch(console.error);
+        }
       }
     } else {
       order.status = 'failed';

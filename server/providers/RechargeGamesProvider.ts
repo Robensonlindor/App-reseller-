@@ -11,6 +11,7 @@ import {
   RechargeGamesWebhookEvent
 } from '../../src/types';
 import { db } from '../db';
+import { NotificationEngine } from '../notificationAndDownloadEngine';
 import {
   acquireInFlightWebhookLock,
   releaseInFlightWebhookLock,
@@ -2644,6 +2645,18 @@ export class RechargeGamesProvider {
         message: `Top-up livré avec succès. Votre commande #${rgOrder.id} (${rgOrder.product_name} - ${rgOrder.region}) a été créditée sur le Player ID ${rgOrder.player_id}.`,
         type: 'order'
       });
+
+      // Single Source of Truth: Trigger real Push Notification + Email upon confirmed delivery
+      NotificationEngine.triggerOrderDeliveredNotifications({
+        orderId: rgOrder.id,
+        orderNumber: rgOrder.id,
+        userId: rgOrder.user_id,
+        gameName: rgOrder.game,
+        packageName: `${rgOrder.product_name} (${rgOrder.region})`,
+        playerId: rgOrder.player_id,
+        deliveredAtIso: rgOrder.delivered_at || nowIso,
+        providerName: 'RechargeGames'
+      }).catch(console.error);
     } else if (newStatus === 'refunded') {
       db.addUserNotification({
         userId: rgOrder.user_id,

@@ -323,63 +323,9 @@ export const INITIAL_SERVICES: Service[] = [
   }
 ];
 
-export const INITIAL_RESELLERS: Reseller[] = [
-  {
-    id: 'res_demo_01',
-    name: 'Robenson Alexis',
-    email: 'leaderlindor@gmail.com',
-    company: 'Alpha Games Network',
-    balance: 485.50,
-    currency: 'USD',
-    status: 'active',
-    webhookUrl: 'https://webhook.site/demo-playup-reseller-test',
-    webhookSecret: 'whsec_playup_891278391203',
-    createdAt: '2026-02-10T09:00:00Z',
-    lastActiveAt: '2026-10-02T17:15:00Z',
-    ordersCount: 142,
-    totalSpent: 1290.30
-  },
-  {
-    id: 'res_demo_02',
-    name: 'Caribbean TopUp Tech',
-    email: 'api@caribbeantopup.net',
-    company: 'CTech International',
-    balance: 124.00,
-    currency: 'USD',
-    status: 'active',
-    webhookUrl: 'https://caribbeantopup.net/api/v1/webhook',
-    webhookSecret: 'whsec_plup_7891238910',
-    createdAt: '2026-03-01T11:00:00Z',
-    lastActiveAt: '2026-10-02T14:30:00Z',
-    ordersCount: 38,
-    totalSpent: 412.50
-  }
-];
+export const INITIAL_RESELLERS: Reseller[] = [];
 
-export const INITIAL_API_KEYS: ApiKey[] = [
-  {
-    id: 'key_live_01',
-    resellerId: 'res_demo_01',
-    name: 'Production Primary Key',
-    key: 'plup_live_99f2b87a1c4e908d1234567890abcdef',
-    maskedKey: 'plup_live_99f2...cdef',
-    permissions: ['games.read', 'services.read', 'orders.create', 'orders.read', 'balance.read'],
-    status: 'active',
-    createdAt: '2026-02-10T09:15:00Z',
-    lastUsedAt: '2026-10-02T17:10:00Z'
-  },
-  {
-    id: 'key_sandbox_01',
-    resellerId: 'res_demo_01',
-    name: 'Sandbox Test Key',
-    key: 'plup_test_aa12984ef00192837465abcde1234567',
-    maskedKey: 'plup_test_aa12...4567',
-    permissions: ['games.read', 'services.read', 'orders.create', 'orders.read', 'balance.read'],
-    status: 'active',
-    createdAt: '2026-02-12T14:00:00Z',
-    lastUsedAt: '2026-10-01T19:40:00Z'
-  }
-];
+export const INITIAL_API_KEYS: ApiKey[] = [];
 
 export const INITIAL_ORDERS: Order[] = [];
 
@@ -405,39 +351,7 @@ export const INITIAL_SETTINGS: AppSettings = {
   defaultProviderId: 'prov_goxtop'
 };
 
-export const INITIAL_TICKETS: SupportTicket[] = [
-  {
-    id: 'tkt_01',
-    ticketNumber: 'TKT-9012',
-    userId: 'user_gamer_01',
-    email: 'leaderlindor@gmail.com',
-    name: 'Robenson',
-    subject: 'Question sur la recharge 310 Diamants Free Fire',
-    category: 'order',
-    orderId: 'PLUP-2026-98210',
-    status: 'resolved',
-    priority: 'medium',
-    message: 'Bonjour, ma commande a été complétée très rapidement, merci ! Je voulais juste savoir si le bonus de premier rechargement s’applique aussi.',
-    messages: [
-      {
-        id: 'msg_01',
-        sender: 'user',
-        senderName: 'Robenson',
-        text: 'Bonjour, ma commande a été complétée très rapidement, merci ! Je voulais juste savoir si le bonus de premier rechargement s’applique aussi.',
-        createdAt: '2026-10-02T16:20:00Z'
-      },
-      {
-        id: 'msg_02',
-        sender: 'agent',
-        senderName: 'Support PlayUp',
-        text: 'Bonjour Robenson ! Oui, si vous n’avez jamais rechargé ce pack en jeu, Garena crédite automatiquement le bonus 100% lors de la livraison.',
-        createdAt: '2026-10-02T16:25:00Z'
-      }
-    ],
-    createdAt: '2026-10-02T16:20:00Z',
-    updatedAt: '2026-10-02T16:25:00Z'
-  }
-];
+export const INITIAL_TICKETS: SupportTicket[] = [];
 
 export const INITIAL_LOGS: SystemLog[] = [
   {

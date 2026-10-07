@@ -16,16 +16,18 @@ import { SupportView } from './views/web/SupportView';
 import { UserAccountView } from './views/web/UserAccountView';
 import { PlayUpMobileApp } from './views/mobile/PlayUpMobileApp';
 import { AdminDashboardView } from './views/admin/AdminDashboardView';
-import { Game, Service, AppSettings } from './types';
+import { Game, Service, AppSettings, AppUser } from './types';
 import { apiClient } from './services/apiClient';
 import { Language } from './i18n';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from './data/initialData';
+import { safeStorage } from './lib/safeStorage';
 
 const VALID_TABS = new Set(['home', 'services', 'reseller', 'api-docs', 'download', 'support', 'account']);
 
 export default function App() {
   const [currentTab, setCurrentTab] = useState<string>('home');
   const [lang, setLang] = useState<Language>('fr');
+  const [authUser, setAuthUser] = useState<AppUser | null>(null);
 
   // Shared platform state initialized immediately with local fallback catalog
   const [games, setGames] = useState<Game[]>(INITIAL_GAMES);
@@ -41,6 +43,31 @@ export default function App() {
   const [isMobileAppOpen, setIsMobileAppOpen] = useState(false);
   // Admin Overlay
   const [isAdminOpen, setIsAdminOpen] = useState(false);
+
+  // Verify any existing local token against the backend on startup
+  const verifyCurrentSession = useCallback(async () => {
+    const token = safeStorage.getItem('playup_user_token');
+    if (!token) {
+      safeStorage.removeItem('playup_user_profile');
+      setAuthUser(null);
+      return;
+    }
+    try {
+      const res = await apiClient.getUserProfile(token);
+      if (res && res.user) {
+        setAuthUser(res.user);
+        safeStorage.setItem('playup_user_profile', JSON.stringify(res.user));
+      } else {
+        safeStorage.removeItem('playup_user_token');
+        safeStorage.removeItem('playup_user_profile');
+        setAuthUser(null);
+      }
+    } catch {
+      safeStorage.removeItem('playup_user_token');
+      safeStorage.removeItem('playup_user_profile');
+      setAuthUser(null);
+    }
+  }, []);
 
   const loadBackendCatalog = useCallback(async () => {
     setIsSyncingBackend(true);
@@ -82,11 +109,17 @@ export default function App() {
 
   useEffect(() => {
     loadBackendCatalog();
-  }, [loadBackendCatalog]);
+    verifyCurrentSession();
+  }, [loadBackendCatalog, verifyCurrentSession]);
 
   const handleNavigate = (tab: string) => {
     if (tab === 'admin') {
-      setIsAdminOpen(true);
+      // Only allow opening Admin Panel if authenticated with role === 'ADMIN'
+      if (authUser && authUser.role === 'ADMIN') {
+        setIsAdminOpen(true);
+      } else {
+        setCurrentTab('account');
+      }
       return;
     }
     if (tab === 'mobile-app') {
@@ -137,6 +170,7 @@ export default function App() {
         lang={lang}
         onLanguageChange={setLang}
         onOpenMobileApp={() => setIsMobileAppOpen(true)}
+        authUser={authUser}
       />
 
       {/* Main Dynamic View Content */}
@@ -198,6 +232,7 @@ export default function App() {
           <UserAccountView
             onOpenMobileApp={() => setIsMobileAppOpen(true)}
             onNavigate={handleNavigate}
+            onAuthChange={(user) => setAuthUser(user)}
           />
         )}
       </main>
@@ -206,6 +241,7 @@ export default function App() {
       <Footer
         onNavigate={handleNavigate}
         lang={lang}
+        authUser={authUser}
       />
 
       {/* PLAYUP MOBILE APP MODAL SIMULATOR */}
@@ -216,17 +252,19 @@ export default function App() {
           onClose={() => {
             setIsMobileAppOpen(false);
             loadBackendCatalog();
+            verifyCurrentSession();
           }}
           lang={lang}
         />
       )}
 
-      {/* ADMIN CONTROL PANEL OVERLAY */}
-      {isAdminOpen && (
+      {/* ADMIN CONTROL PANEL OVERLAY (Only accessible to verified ADMIN role) */}
+      {isAdminOpen && authUser?.role === 'ADMIN' && (
         <AdminDashboardView
           onClose={() => {
             setIsAdminOpen(false);
             loadBackendCatalog();
+            verifyCurrentSession();
           }}
         />
       )}

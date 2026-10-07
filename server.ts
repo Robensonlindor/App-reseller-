@@ -40,6 +40,124 @@ async function loadBackendCore(): Promise<{ apiRouter: express.Router; RechargeG
 async function startServer() {
   const { apiRouter, RechargeGamesProvider } = await loadBackendCore();
   const app = express();
+  app.disable('x-powered-by');
+
+  // Strict Security Headers & Controlled CORS Middleware
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-KEY, stripe-signature, webhook-id, webhook-timestamp, webhook-signature');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
+
+  // Serve Web App Manifest for Android & iOS PWA Installation
+  app.get('/manifest.webmanifest', (_req, res) => {
+    res.setHeader('Content-Type', 'application/manifest+json');
+    res.json({
+      id: '/',
+      name: 'PlayUp Gaming Top-Up',
+      short_name: 'PlayUp',
+      description: 'Plateforme officielle de recharges gaming instantanées (Free Fire, PUBG Mobile, Mobile Legends, Cartes Cadeaux).',
+      start_url: '/',
+      scope: '/',
+      display: 'standalone',
+      background_color: '#0f172a',
+      theme_color: '#ea580c',
+      icons: [
+        {
+          src: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
+          sizes: '192x192',
+          type: 'image/jpeg',
+          purpose: 'any'
+        },
+        {
+          src: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
+          sizes: '512x512',
+          type: 'image/jpeg',
+          purpose: 'any'
+        }
+      ]
+    });
+  });
+
+  // Serve Real Service Worker (/sw.js) for Background, Closed-App & Locked-Screen Push Notifications
+  app.get('/sw.js', (_req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Service-Worker-Allowed', '/');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(`
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+// Listen for Web Push events from PlayUp Backend even when app is closed or phone is locked
+self.addEventListener('push', (event) => {
+  let payload = {
+    title: 'PlayUp',
+    body: 'Votre commande est terminée.',
+    orderNumber: ''
+  };
+  if (event.data) {
+    try {
+      payload = Object.assign(payload, event.data.json());
+    } catch (e) {
+      payload.body = event.data.text() || payload.body;
+    }
+  }
+  event.waitUntil(
+    self.registration.showNotification(payload.title || 'PlayUp', {
+      body: payload.body,
+      tag: payload.orderNumber ? 'playup-order-' + payload.orderNumber : 'playup-push-' + Date.now(),
+      renotify: true,
+      requireInteraction: false,
+      data: payload
+    })
+  );
+});
+
+// Also allow triggering OS notifications from the background SSE listener
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SHOW_ORDER_NOTIFICATION') {
+    const n = event.data.notification || {};
+    self.registration.showNotification(n.title || 'PlayUp', {
+      body: n.body || 'Votre commande est terminée.',
+      tag: n.orderNumber ? 'playup-order-' + n.orderNumber : 'playup-push-' + Date.now(),
+      renotify: true,
+      data: n
+    });
+  }
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ('focus' in client) return client.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow('/');
+    })
+  );
+});
+`);
+  });
 
   // JSON & URL-encoded body parser (preserving exact rawBody buffer for HMAC-SHA256 webhook verification)
   app.use(

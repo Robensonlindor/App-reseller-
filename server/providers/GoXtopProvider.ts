@@ -4,6 +4,7 @@ import {
   Provider, ConnectionTestResult, Order, PlayerCheckResult, OrderStatus, GameField 
 } from '../../src/types';
 import { WebhookEngine } from '../webhookEngine';
+import { NotificationEngine } from '../notificationAndDownloadEngine';
 
 export interface ProviderSyncResponse {
   success: boolean;
@@ -2409,6 +2410,20 @@ export class GoXtopProvider extends BaseProvider {
           : `Le statut de votre commande ${order.orderNumber} est passé à : ${mappedStatus}. ${order.errorMessage || ''}`,
       type: mappedStatus === 'completed' ? 'order' : mappedStatus === 'refunded' ? 'refund' : 'error'
     });
+
+    // 8b. Single Source of Truth: When GoXtop confirms delivery ('completed'), trigger real Push Notification + Email
+    if (mappedStatus === 'completed' && order.userId) {
+      await NotificationEngine.triggerOrderDeliveredNotifications({
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        userId: order.userId,
+        gameName: order.gameName,
+        packageName: order.packageName,
+        playerId: order.gameProfileData?.playerId || order.gameProfileData?.characterId,
+        deliveredAtIso: order.updatedAt,
+        providerName: this.provider.name || 'GoXtop'
+      });
+    }
 
     // 9. Notify downstream reseller if applicable
     if (order.resellerId && ['completed', 'failed', 'processing'].includes(mappedStatus)) {

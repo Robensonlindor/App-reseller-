@@ -1,14 +1,17 @@
 import React from 'react';
 import { ShieldCheck, Zap, Download, Terminal, Mail, Phone } from 'lucide-react';
 import { Language, translations } from '../../i18n';
+import { AppUser } from '../../types';
 
 interface FooterProps {
   onNavigate: (tab: string) => void;
   lang: Language;
+  authUser?: AppUser | null;
 }
 
-export const Footer: React.FC<FooterProps> = ({ onNavigate, lang }) => {
+export const Footer: React.FC<FooterProps> = ({ onNavigate, lang, authUser }) => {
   const t = translations[lang];
+  const isAdmin = authUser?.role === 'ADMIN';
 
   return (
     <footer className="bg-slate-900 text-slate-300 border-t border-slate-800">
@@ -83,11 +86,13 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate, lang }) => {
                   Spécification Webhooks
                 </button>
               </li>
-              <li>
-                <button onClick={() => onNavigate('admin')} className="hover:text-white transition-colors">
-                  Accès Administrateur
-                </button>
-              </li>
+              {isAdmin && (
+                <li>
+                  <button onClick={() => onNavigate('admin')} className="hover:text-white transition-colors">
+                    Accès Administrateur
+                  </button>
+                </li>
+              )}
             </ul>
           </div>
 

@@ -2,39 +2,40 @@ import React, { useState, useEffect } from 'react';
 import {
   User, Lock, Mail, Phone, Wallet, ShoppingBag, Settings, LogOut,
   CheckCircle2, AlertCircle, CreditCard, ShieldCheck, Key, RefreshCw,
-  ArrowRight, Sparkles
+  ArrowRight, Sparkles, Bell
 } from 'lucide-react';
 import {
-  AppUser, Order, PaymentTransaction, PaymentGatewayConfig, PaymentMethodType
+  AppUser, Order, PaymentTransaction, PaymentGatewayConfig, PaymentMethodType,
+  PushNotificationLog, EmailDeliveryLog
 } from '../../types';
 import { apiClient } from '../../services/apiClient';
 import { safeStorage } from '../../lib/safeStorage';
 import { signInWithGooglePopup, signOutFirebase } from '../../lib/firebase';
+import {
+  connectRealTimePushStream,
+  requestAndSubscribePushNotifications
+} from '../../lib/pushNotifications';
 
 interface UserAccountViewProps {
   onOpenMobileApp: () => void;
   onNavigate: (tab: string) => void;
+  onAuthChange?: (user: AppUser | null) => void;
 }
 
 export const UserAccountView: React.FC<UserAccountViewProps> = ({
   onOpenMobileApp,
-  onNavigate
+  onNavigate,
+  onAuthChange
 }) => {
-  const [authUser, setAuthUser] = useState<AppUser | null>(() => {
-    const saved = safeStorage.getItem('playup_user_profile');
-    if (saved) {
-      try { return JSON.parse(saved); } catch { return null; }
-    }
-    return null;
-  });
+  const [authUser, setAuthUser] = useState<AppUser | null>(null);
   const [userToken, setUserToken] = useState<string>(() => safeStorage.getItem('playup_user_token') || '');
 
-  // Auth form state
+  // Auth form state (strictly empty on new device — no preloaded account or credentials)
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
-  const [email, setEmail] = useState('alex@playup.gg');
-  const [password, setPassword] = useState('PlayUp2026!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [name, setName] = useState('');
-  const [phone, setPhone] = useState('+509 3711-2233');
+  const [phone, setPhone] = useState('');
   const [resetCode, setResetCode] = useState('');
   const [newResetPassword, setNewResetPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -44,6 +45,8 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   const [activeSubTab, setActiveSubTab] = useState<'overview' | 'orders' | 'wallet' | 'settings'>('overview');
   const [orders, setOrders] = useState<Order[]>([]);
   const [transactions, setTransactions] = useState<PaymentTransaction[]>([]);
+  const [pushLogs, setPushLogs] = useState<PushNotificationLog[]>([]);
+  const [emailLogs, setEmailLogs] = useState<EmailDeliveryLog[]>([]);
   const [gateways, setGateways] = useState<PaymentGatewayConfig[]>([]);
 
   // Profile Settings State
@@ -52,6 +55,7 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   const [profileCurrency, setProfileCurrency] = useState<'USD' | 'HTG' | 'EUR'>('USD');
   const [profileTwoFactor, setProfileTwoFactor] = useState(false);
   const [profileEmailNotifs, setProfileEmailNotifs] = useState(true);
+  const [profilePushNotifs, setProfilePushNotifs] = useState(true);
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [savingSettings, setSavingSettings] = useState(false);
@@ -59,12 +63,12 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   // Wallet Top-Up State
   const [topUpAmount, setTopUpAmount] = useState('25');
   const [topUpMethod, setTopUpMethod] = useState<PaymentMethodType>('moncash');
-  const [mobilePhone, setMobilePhone] = useState('+509 3711-2233');
-  const [mobileOtp, setMobileOtp] = useState('482910');
-  const [cardHolder, setCardHolder] = useState('ALEX GAMER');
-  const [cardNumber, setCardNumber] = useState('4532015112830366');
-  const [cardExpiry, setCardExpiry] = useState('08/28');
-  const [cardCvc, setCardCvc] = useState('842');
+  const [mobilePhone, setMobilePhone] = useState('');
+  const [mobileOtp, setMobileOtp] = useState('');
+  const [cardHolder, setCardHolder] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [cardExpiry, setCardExpiry] = useState('');
+  const [cardCvc, setCardCvc] = useState('');
   const [processingTopUp, setProcessingTopUp] = useState(false);
 
   useEffect(() => {
@@ -74,6 +78,17 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   useEffect(() => {
     if (userToken) {
       refreshProfileData(userToken);
+      const disconnectPush = connectRealTimePushStream(userToken, (notif) => {
+        setPushLogs(prev => [notif, ...prev.filter(p => p.id !== notif.id)]);
+        setFeedback({
+          type: 'success',
+          text: `${notif.title} — ${notif.body}`
+        });
+      });
+      return () => disconnectPush();
+    } else {
+      setAuthUser(null);
+      onAuthChange?.(null);
     }
   }, [userToken]);
 
@@ -82,12 +97,17 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
     setUserToken(token);
     safeStorage.setItem('playup_user_token', token);
     safeStorage.setItem('playup_user_profile', JSON.stringify(user));
+    onAuthChange?.(user);
     setProfileName(user.name);
     setProfilePhone(user.phone || '');
     setProfileCurrency(user.preferredCurrency || 'USD');
     setProfileTwoFactor(Boolean(user.twoFactorEnabled));
     setProfileEmailNotifs(user.emailNotifications !== false);
+    setProfilePushNotifs(user.pushNotificationsEnabled !== false);
     if (user.phone) setMobilePhone(user.phone);
+    if (user.pushNotificationsEnabled !== false) {
+      requestAndSubscribePushNotifications(token).catch(() => {});
+    }
   };
 
   const refreshProfileData = async (tokenToUse: string) => {
@@ -95,15 +115,24 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
       const data = await apiClient.getUserProfile(tokenToUse);
       setAuthUser(data.user);
       safeStorage.setItem('playup_user_profile', JSON.stringify(data.user));
+      onAuthChange?.(data.user);
       setOrders(data.orders || []);
       setTransactions(data.paymentTransactions || []);
+      setPushLogs(data.pushNotificationLogs || []);
+      setEmailLogs(data.emailDeliveryLogs || []);
       setProfileName(data.user.name);
       setProfilePhone(data.user.phone || '');
       setProfileCurrency(data.user.preferredCurrency || 'USD');
       setProfileTwoFactor(Boolean(data.user.twoFactorEnabled));
       setProfileEmailNotifs(data.user.emailNotifications !== false);
-    } catch (e) {
-      console.error(e);
+      setProfilePushNotifs(data.user.pushNotificationsEnabled !== false);
+    } catch {
+      // Invalid or expired session: immediately purge local state
+      safeStorage.removeItem('playup_user_token');
+      safeStorage.removeItem('playup_user_profile');
+      setAuthUser(null);
+      setUserToken('');
+      onAuthChange?.(null);
     }
   };
 
@@ -189,10 +218,14 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
     signOutFirebase().catch(() => {});
     safeStorage.removeItem('playup_user_token');
     safeStorage.removeItem('playup_user_profile');
+    safeStorage.removeItem('playup_admin_token');
     setAuthUser(null);
     setUserToken('');
     setOrders([]);
     setTransactions([]);
+    setPushLogs([]);
+    setEmailLogs([]);
+    onAuthChange?.(null);
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
@@ -207,10 +240,17 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
         preferredCurrency: profileCurrency,
         twoFactorEnabled: profileTwoFactor,
         emailNotifications: profileEmailNotifs,
+        pushNotificationsEnabled: profilePushNotifs,
         ...(newPassword ? { currentPassword, newPassword } : {})
       });
       setAuthUser(res.user);
       safeStorage.setItem('playup_user_profile', JSON.stringify(res.user));
+      onAuthChange?.(res.user);
+      if (profilePushNotifs) {
+        await requestAndSubscribePushNotifications(userToken).catch(() => {});
+      } else {
+        await apiClient.unsubscribePushNotifications(userToken).catch(() => {});
+      }
       setCurrentPassword('');
       setNewPassword('');
       setFeedback({ type: 'success', text: res.message });
@@ -329,7 +369,9 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                     {authMode === 'reset' && 'Définir un nouveau mot de passe'}
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Identifiants démo pré-remplis : alex@playup.gg / PlayUp2026!
+                    {authMode === 'register'
+                      ? 'Créez votre compte personnel sécurisé (aucun compte partagé).'
+                      : 'Authentifiez-vous avec vos identifiants personnels.'}
                   </p>
                 </div>
                 <div className="w-10 h-10 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center text-orange-600">
@@ -380,7 +422,7 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="alex@playup.gg"
+                    placeholder="votre@email.com"
                     className="w-full border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs focus:outline-none focus:border-orange-500"
                   />
                 </div>
@@ -566,28 +608,94 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
 
           {/* SUB-TAB 1: OVERVIEW */}
           {activeSubTab === 'overview' && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
-                <span className="text-xs font-semibold text-slate-500">Commandes Réalisées</span>
-                <div className="font-mono text-3xl font-extrabold text-slate-900">{orders.length}</div>
-                <p className="text-xs text-slate-500">Livraisons automatiques GoXtop</p>
-              </div>
-              <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
-                <span className="text-xs font-semibold text-slate-500">Total Dépensé</span>
-                <div className="font-mono text-3xl font-extrabold text-orange-600">
-                  ${authUser.totalSpent.toFixed(2)} USD
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
+                  <span className="text-xs font-semibold text-slate-500">Commandes Réalisées</span>
+                  <div className="font-mono text-3xl font-extrabold text-slate-900">{orders.length}</div>
+                  <p className="text-xs text-slate-500">Livraisons automatiques vérifiées</p>
                 </div>
-                <p className="text-xs text-slate-500">Depuis la création du compte</p>
-              </div>
-              <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
-                <span className="text-xs font-semibold text-slate-500">Statut Sécurité</span>
-                <div className="font-display text-lg font-bold text-emerald-700 flex items-center gap-1.5 pt-1">
-                  <ShieldCheck className="w-5 h-5" />
-                  <span>Compte Vérifié ({authUser.status})</span>
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
+                  <span className="text-xs font-semibold text-slate-500">Total Dépensé</span>
+                  <div className="font-mono text-3xl font-extrabold text-orange-600">
+                    ${authUser.totalSpent.toFixed(2)} USD
+                  </div>
+                  <p className="text-xs text-slate-500">Depuis la création du compte</p>
                 </div>
-                <p className="text-xs text-slate-500">
-                  2FA : {authUser.twoFactorEnabled ? 'Activé' : 'Désactivé'} · Alertes Email : {authUser.emailNotifications !== false ? 'Actives' : 'Inactives'}
-                </p>
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-2">
+                  <span className="text-xs font-semibold text-slate-500">Statut Sécurité &amp; Notifications</span>
+                  <div className="font-display text-lg font-bold text-emerald-700 flex items-center gap-1.5 pt-1">
+                    <ShieldCheck className="w-5 h-5" />
+                    <span>Compte Vérifié ({authUser.role})</span>
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Push : {authUser.pushNotificationsEnabled !== false ? 'Actives' : 'Inactives'} · Email : {authUser.emailNotifications !== false ? 'Actives' : 'Inactives'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Real-Time Push Notifications & Post-Delivery Emails Log */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="font-display text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <Bell className="w-4 h-4 text-orange-600" />
+                      <span>Notifications Push de Livraison ({pushLogs.length})</span>
+                    </h4>
+                    <button
+                      type="button"
+                      onClick={() => requestAndSubscribePushNotifications(userToken)}
+                      className="text-[11px] font-semibold text-orange-600 hover:underline"
+                    >
+                      Synchroniser cet appareil
+                    </button>
+                  </div>
+                  <div className="space-y-2 max-h-56 overflow-y-auto">
+                    {pushLogs.map(log => (
+                      <div key={log.id} className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-slate-900">{log.title}</span>
+                          <span className="font-mono text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                            {log.orderNumber}
+                          </span>
+                        </div>
+                        <p className="text-slate-700">{log.body}</p>
+                      </div>
+                    ))}
+                    {pushLogs.length === 0 && (
+                      <p className="text-xs text-slate-400">
+                        Aucune notification push de livraison reçue pour le moment.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="font-display text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <Mail className="w-4 h-4 text-orange-600" />
+                      <span>Emails de Confirmation Après Livraison ({emailLogs.length})</span>
+                    </h4>
+                  </div>
+                  <div className="space-y-2 max-h-56 overflow-y-auto">
+                    {emailLogs.map(mail => (
+                      <div key={mail.id} className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-slate-900">{mail.subject}</span>
+                          <span className="font-mono text-[10px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                            {mail.status}
+                          </span>
+                        </div>
+                        <pre className="text-[11px] text-slate-600 font-sans whitespace-pre-wrap">{mail.bodyText}</pre>
+                      </div>
+                    ))}
+                    {emailLogs.length === 0 && (
+                      <p className="text-xs text-slate-400">
+                        Aucun email de livraison envoyé pour le moment.
+                      </p>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -907,14 +1015,22 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                   </label>
                 </div>
 
-                <div className="flex items-center pt-5">
+                <div className="flex flex-col justify-center gap-2 pt-4">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="checkbox"
                       checked={profileEmailNotifs}
                       onChange={(e) => setProfileEmailNotifs(e.target.checked)}
                     />
-                    <span className="font-semibold text-slate-800">Notifications Email</span>
+                    <span className="font-semibold text-slate-800">Notifications Email après livraison</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={profilePushNotifs}
+                      onChange={(e) => setProfilePushNotifs(e.target.checked)}
+                    />
+                    <span className="font-semibold text-slate-800">Notifications Push Temps Réel</span>
                   </label>
                 </div>
               </div>

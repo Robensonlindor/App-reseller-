@@ -16,7 +16,7 @@ export const ApiDocsView: React.FC<ApiDocsViewProps> = ({ onNavigate, lang }) =>
   const [codeLanguage, setCodeLanguage] = useState<'curl' | 'js' | 'python'>('curl');
 
   // Interactive Sandbox state
-  const [sandboxApiKey, setSandboxApiKey] = useState('plup_live_99f2b87a1c4e908d1234567890abcdef');
+  const [sandboxApiKey, setSandboxApiKey] = useState('');
   const [sandboxEndpoint, setSandboxEndpoint] = useState('/api/v1/games');
   const [sandboxMethod, setSandboxMethod] = useState<'GET' | 'POST'>('GET');
   const [sandboxBody, setSandboxBody] = useState(`{\n  "gameId": "game_ff",\n  "serviceId": "srv_ff_diamonds",\n  "packageId": "pkg_ff_100",\n  "gameProfileData": {\n    "playerId": "123456789",\n    "playerName": "AlexGamer"\n  }\n}`);
@@ -165,7 +165,7 @@ export const ApiDocsView: React.FC<ApiDocsViewProps> = ({ onNavigate, lang }) =>
 
               <div className="bg-slate-900 text-slate-200 rounded-2xl p-5 font-mono text-xs overflow-x-auto relative">
                 <div className="text-slate-400 mb-2">// Exemple d'en-tête HTTP</div>
-                <div className="text-emerald-400">X-API-KEY: plup_live_99f2b87a1c4e908d1234567890abcdef</div>
+                <div className="text-emerald-400">X-API-KEY: &lt;VOTRE_CLE_API_SECRETE&gt;</div>
                 <div>Content-Type: application/json</div>
                 <div>Accept: application/json</div>
               </div>
@@ -294,8 +294,8 @@ export const ApiDocsView: React.FC<ApiDocsViewProps> = ({ onNavigate, lang }) =>
   "serviceId": "srv_ff_diamonds",
   "packageId": "pkg_ff_310",
   "gameProfileData": {
-    "playerId": "123456789",
-    "playerName": "Robenson"
+    "playerId": "16777227705",
+    "playerName": "PlayerOne"
   }
 }`}
                 </div>

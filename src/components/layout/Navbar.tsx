@@ -4,6 +4,7 @@ import {
   Sparkles, Layers, User
 } from 'lucide-react';
 import { Language, translations } from '../../i18n';
+import { AppUser } from '../../types';
 
 interface NavbarProps {
   currentTab: string;
@@ -11,6 +12,7 @@ interface NavbarProps {
   lang: Language;
   onLanguageChange: (l: Language) => void;
   onOpenMobileApp: () => void;
+  authUser?: AppUser | null;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -18,10 +20,12 @@ export const Navbar: React.FC<NavbarProps> = ({
   onNavigate,
   lang,
   onLanguageChange,
-  onOpenMobileApp
+  onOpenMobileApp,
+  authUser
 }) => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const t = translations[lang];
+  const isAdmin = authUser?.role === 'ADMIN';
 
   const navLinks = [
     { id: 'home', label: t.nav.home },
@@ -123,7 +127,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               }`}
             >
               <User className="w-3.5 h-3.5" />
-              <span>Mon Compte</span>
+              <span>{authUser ? authUser.name : 'Connexion / Inscription'}</span>
             </button>
 
             {/* Reseller Portal Login */}
@@ -138,16 +142,18 @@ export const Navbar: React.FC<NavbarProps> = ({
               Espace Reseller
             </button>
 
-            {/* Admin Access Link */}
-            <button
-              onClick={() => onNavigate('admin')}
-              className={`p-1.5 text-slate-500 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-colors ${
-                currentTab === 'admin' ? 'text-orange-600 bg-orange-50' : ''
-              }`}
-              title="Espace Administrateur"
-            >
-              <Shield className="w-4 h-4" />
-            </button>
+            {/* Admin Access Link (strictly restricted to ADMIN role) */}
+            {isAdmin && (
+              <button
+                onClick={() => onNavigate('admin')}
+                className={`p-1.5 text-slate-500 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-colors ${
+                  currentTab === 'admin' ? 'text-orange-600 bg-orange-50' : ''
+                }`}
+                title="Espace Administrateur"
+              >
+                <Shield className="w-4 h-4" />
+              </button>
+            )}
           </div>
 
           {/* Mobile hamburger */}
@@ -218,12 +224,12 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Smartphone className="w-4 h-4" />
               <span>Ouvrir l’App Mobile PlayUp</span>
             </button>
-            <div className="grid grid-cols-3 gap-2">
+            <div className={`grid ${isAdmin ? 'grid-cols-3' : 'grid-cols-2'} gap-2`}>
               <button
                 onClick={() => handleLinkClick('account')}
                 className="py-2 px-3 text-center border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
               >
-                Mon Compte
+                {authUser ? authUser.name : 'Connexion / Inscription'}
               </button>
               <button
                 onClick={() => handleLinkClick('reseller')}
@@ -231,12 +237,14 @@ export const Navbar: React.FC<NavbarProps> = ({
               >
                 Espace Reseller
               </button>
-              <button
-                onClick={() => handleLinkClick('admin')}
-                className="py-2 px-3 text-center border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
-              >
-                Admin Panel
-              </button>
+              {isAdmin && (
+                <button
+                  onClick={() => handleLinkClick('admin')}
+                  className="py-2 px-3 text-center border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  Admin Panel
+                </button>
+              )}
             </div>
           </div>
         </div>

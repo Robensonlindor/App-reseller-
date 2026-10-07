@@ -135,7 +135,7 @@ export const SupportView: React.FC<SupportViewProps> = ({ initialOrderId, lang }
                     required
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="ex: Robenson Alexis"
+                    placeholder="Votre nom complet"
                     className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
                   />
                 </div>
@@ -146,7 +146,7 @@ export const SupportView: React.FC<SupportViewProps> = ({ initialOrderId, lang }
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="ex: alexis@gmail.com"
+                    placeholder="votre@email.com"
                     className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
                   />
                 </div>

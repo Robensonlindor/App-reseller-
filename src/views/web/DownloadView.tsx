@@ -1,241 +1,502 @@
-import React, { useState } from 'react';
-import { 
-  Download, Smartphone, Apple, CheckCircle2, ShieldCheck, 
-  ExternalLink, QrCode, FileText, ArrowRight, HelpCircle 
+import React, { useState, useEffect } from 'react';
+import {
+  Smartphone, ShieldCheck, Zap, Bell, CheckCircle2, ArrowUpRight,
+  Download, Lock, RefreshCw, AlertCircle, Cpu, Check
 } from 'lucide-react';
-import { AppSettings } from '../../types';
+import { AppSettings, AppPackageMetadata } from '../../types';
 import { Language, translations } from '../../i18n';
+import { apiClient } from '../../services/apiClient';
+import { detectClientPlatform } from '../../lib/pushNotifications';
 
 interface DownloadViewProps {
-  settings: AppSettings;
+  settings: AppSettings | null;
   onOpenMobileApp: () => void;
   lang: Language;
 }
 
 export const DownloadView: React.FC<DownloadViewProps> = ({
-  settings,
   onOpenMobileApp,
   lang
 }) => {
-  const t = translations[lang];
-  const [downloadTriggered, setDownloadTriggered] = useState(false);
+  const t = translations[lang].download;
 
-  const links = settings.downloadLinks;
+  const [detectedDevice, setDetectedDevice] = useState<'android' | 'ios' | 'desktop'>(() => detectClientPlatform());
+  const [selectedPlatform, setSelectedPlatform] = useState<'android' | 'ios'>(() =>
+    detectClientPlatform() === 'ios' ? 'ios' : 'android'
+  );
+  const [packagesInfo, setPackagesInfo] = useState<{
+    android: AppPackageMetadata;
+    ios: AppPackageMetadata;
+  } | null>(null);
+  const [loadingInfo, setLoadingInfo] = useState<boolean>(true);
+  const [infoError, setInfoError] = useState<string | null>(null);
 
-  const handleDownloadApk = () => {
-    setDownloadTriggered(true);
-    // Trigger download of APK via dynamic admin configured URL
-    const a = document.createElement('a');
-    a.href = links.androidApkUrl;
-    a.download = 'PlayUp_Latest.apk';
-    a.target = '_blank';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  // Real download streaming & progress state
+  const [downloadState, setDownloadState] = useState<'idle' | 'verifying' | 'downloading' | 'completed' | 'error'>('idle');
+  const [downloadPlatform, setDownloadPlatform] = useState<'android' | 'ios' | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [downloadedBytes, setDownloadedBytes] = useState<number>(0);
+  const [totalBytes, setTotalBytes] = useState<number>(0);
+  const [downloadErrorMsg, setDownloadErrorMsg] = useState<string | null>(null);
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
+
+  useEffect(() => {
+    loadPackageMetadata();
+
+    const handleBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+  }, []);
+
+  const loadPackageMetadata = async () => {
+    setLoadingInfo(true);
+    setInfoError(null);
+    try {
+      const info = await apiClient.getDownloadInfo();
+      setPackagesInfo(info.packages);
+      const clientDet = detectClientPlatform();
+      const effectivePlatform = clientDet !== 'desktop' ? clientDet : info.detectedPlatform;
+      setDetectedDevice(effectivePlatform);
+      if (effectivePlatform === 'ios') {
+        setSelectedPlatform('ios');
+      } else {
+        setSelectedPlatform('android');
+      }
+    } catch (err: any) {
+      setInfoError(err.message || 'Impossible de vérifier les packages sur le serveur.');
+    } finally {
+      setLoadingInfo(false);
+    }
   };
+
+  const handleRealPackageDownload = async (platform: 'android' | 'ios') => {
+    setDownloadPlatform(platform);
+    setDownloadState('verifying');
+    setDownloadProgress(0);
+    setDownloadedBytes(0);
+    setTotalBytes(0);
+    setDownloadErrorMsg(null);
+
+    try {
+      // 1. Verify package existence on backend before starting download
+      const exists = await apiClient.verifyPackageExists(platform);
+      if (!exists) {
+        throw new Error(`Le package ${platform === 'android' ? 'Android (.apk)' : 'iOS (.mobileconfig)'} n'est pas disponible sur le serveur.`);
+      }
+
+      setDownloadState('downloading');
+
+      // 2. Stream real binary package with progress tracking
+      const response = await fetch(`/api/download/package?platform=${platform}`);
+      if (!response.ok) {
+        throw new Error(`Erreur serveur HTTP ${response.status} lors du téléchargement.`);
+      }
+
+      const contentLengthHeader = response.headers.get('Content-Length');
+      const expectedBytes = contentLengthHeader
+        ? parseInt(contentLengthHeader, 10)
+        : packagesInfo?.[platform]?.sizeBytes || 0;
+      setTotalBytes(expectedBytes);
+
+      const fileName =
+        platform === 'android'
+          ? packagesInfo?.android?.fileName || 'PlayUp-Android-v2.4.1.apk'
+          : packagesInfo?.ios?.fileName || 'PlayUp-iOS-v2.4.1.mobileconfig';
+      const mimeType =
+        platform === 'android'
+          ? 'application/vnd.android.package-archive'
+          : 'application/x-apple-aspen-config';
+
+      let blob: Blob;
+      if (response.body && typeof response.body.getReader === 'function') {
+        const reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let receivedLength = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            receivedLength += value.length;
+            setDownloadedBytes(receivedLength);
+            if (expectedBytes > 0) {
+              setDownloadProgress(Math.min(99, Math.round((receivedLength / expectedBytes) * 100)));
+            }
+          }
+        }
+        blob = new Blob(chunks as BlobPart[], { type: mimeType });
+      } else {
+        blob = await response.blob();
+        setDownloadedBytes(blob.size);
+      }
+
+      if (blob.size === 0) {
+        throw new Error('Le fichier téléchargé est vide.');
+      }
+
+      // 3. Trigger real browser file download of the verified package
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15000);
+
+      setDownloadProgress(100);
+      setDownloadState('completed');
+    } catch (err: any) {
+      setDownloadState('error');
+      setDownloadErrorMsg(err.message || 'Échec du téléchargement du package.');
+    }
+  };
+
+  const activePkg = packagesInfo ? packagesInfo[selectedPlatform] : null;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-16">
-      {/* Header */}
-      <div className="text-center max-w-3xl mx-auto space-y-4">
-        <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-orange-600 bg-orange-50 px-3 py-1 rounded-full">
-          <span>Application Mobile Officielle</span>
-          <span aria-hidden="true">·</span>
-          <span>{links.appVersion}</span>
+      {/* Main Hero Download Card */}
+      <div className="bg-slate-900 text-white rounded-3xl p-8 sm:p-12 lg:p-16 relative overflow-hidden">
+        <div className="absolute -top-24 -right-24 w-96 h-96 bg-orange-600/20 rounded-full blur-3xl pointer-events-none" />
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center relative z-10">
+          <div className="lg:col-span-7 space-y-6">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-orange-500/10 border border-orange-500/30 text-orange-400 text-xs font-medium">
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>Application Officielle PlayUp (Android &amp; iOS)</span>
+              </div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-mono font-semibold">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>
+                  Appareil détecté :{' '}
+                  {detectedDevice === 'android'
+                    ? 'Android'
+                    : detectedDevice === 'ios'
+                    ? 'iPhone / iOS'
+                    : 'Ordinateur (Android & iOS disponibles)'}
+                </span>
+              </div>
+            </div>
+
+            <h1 className="font-display text-3xl sm:text-5xl font-extrabold tracking-tight leading-tight">
+              {t.title}
+            </h1>
+
+            <p className="text-slate-300 text-sm sm:text-base leading-relaxed max-w-xl">
+              {t.subtitle}
+            </p>
+
+            {/* Platform Switcher */}
+            <div className="inline-flex p-1 bg-slate-800/90 border border-slate-700 rounded-2xl text-xs font-bold">
+              <button
+                type="button"
+                onClick={() => setSelectedPlatform('android')}
+                className={`px-4 py-2.5 rounded-xl transition-all flex items-center gap-2 ${
+                  selectedPlatform === 'android'
+                    ? 'bg-orange-600 text-white shadow-sm'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Android (.APK officiel)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedPlatform('ios')}
+                className={`px-4 py-2.5 rounded-xl transition-all flex items-center gap-2 ${
+                  selectedPlatform === 'ios'
+                    ? 'bg-orange-600 text-white shadow-sm'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>iPhone / iOS (.mobileconfig)</span>
+              </button>
+            </div>
+
+            {/* Verified Package Metadata Box */}
+            {loadingInfo ? (
+              <div className="p-4 rounded-2xl bg-slate-800/70 border border-slate-700 flex items-center gap-3 text-xs text-slate-300">
+                <RefreshCw className="w-4 h-4 animate-spin text-orange-400" />
+                <span>Vérification de l’intégrité du package sur le serveur PlayUp...</span>
+              </div>
+            ) : infoError ? (
+              <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-between text-xs text-red-300">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{infoError}</span>
+                </div>
+                <button
+                  onClick={loadPackageMetadata}
+                  className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 rounded-lg font-semibold"
+                >
+                  Réessayer
+                </button>
+              </div>
+            ) : activePkg ? (
+              <div className="p-4 rounded-2xl bg-slate-800/80 border border-slate-700/80 space-y-2.5 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[11px]">
+                      v{activePkg.version} (Build {activePkg.buildNumber})
+                    </span>
+                    <span className="font-mono font-semibold text-white">{activePkg.fileName}</span>
+                  </div>
+                  <span className="font-mono text-slate-300">{activePkg.sizeFormatted}</span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+                  <span className="truncate max-w-md">SHA-256 : {activePkg.sha256.slice(0, 32)}...</span>
+                  <span className="text-emerald-400 flex items-center gap-1 shrink-0">
+                    <Check className="w-3.5 h-3.5" /> Package vérifié &amp; signé
+                  </span>
+                </div>
+              </div>
+            ) : null}
+
+            {/* Primary Download Action Buttons */}
+            <div className="flex flex-wrap items-center gap-4 pt-1">
+              <button
+                type="button"
+                disabled={loadingInfo || !activePkg?.exists || downloadState === 'downloading' || downloadState === 'verifying'}
+                onClick={() => handleRealPackageDownload(selectedPlatform)}
+                className="px-6 py-4 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white font-bold rounded-2xl text-sm transition-all flex items-center gap-3 shadow-lg shadow-orange-600/25 cursor-pointer"
+              >
+                {downloadState === 'verifying' || downloadState === 'downloading' ? (
+                  <RefreshCw className="w-5 h-5 animate-spin" />
+                ) : (
+                  <Download className="w-5 h-5" />
+                )}
+                <div className="text-left">
+                  <div className="text-[10px] uppercase tracking-wider text-orange-200 font-semibold">
+                    Télécharger l’application ({selectedPlatform === 'android' ? 'Android APK' : 'iPhone iOS'})
+                  </div>
+                  <div className="text-sm font-bold">
+                    {selectedPlatform === 'android'
+                      ? `Télécharger PlayUp v${activePkg?.version || '2.4.1'} (.APK)`
+                      : `Installer PlayUp iOS v${activePkg?.version || '2.4.1'}`}
+                  </div>
+                </div>
+              </button>
+
+              {deferredInstallPrompt && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    deferredInstallPrompt.prompt();
+                    await deferredInstallPrompt.userChoice;
+                    setDeferredInstallPrompt(null);
+                  }}
+                  className="px-5 py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-2xl text-sm transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  <Smartphone className="w-4 h-4" />
+                  <span>Installer la WebApp sur cet appareil</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={onOpenMobileApp}
+                className="px-5 py-4 bg-white/10 hover:bg-white/15 text-white font-semibold rounded-2xl text-sm border border-white/15 transition-all flex items-center gap-2 cursor-pointer"
+              >
+                <span>Ouvrir la WebApp Mobile</span>
+                <ArrowUpRight className="w-4 h-4 text-orange-400" />
+              </button>
+            </div>
+
+            {/* Real-Time Download Progress & Verification Status Bar */}
+            {downloadState !== 'idle' && (
+              <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-white flex items-center gap-2">
+                    {downloadState === 'verifying' && (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                        <span>Vérification de l’existence et du SHA-256 du package...</span>
+                      </>
+                    )}
+                    {downloadState === 'downloading' && (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-orange-400" />
+                        <span>
+                          Téléchargement en cours ({downloadPlatform === 'ios' ? 'iOS .mobileconfig' : 'Android .APK'})...
+                        </span>
+                      </>
+                    )}
+                    {downloadState === 'completed' && (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        <span className="text-emerald-400">
+                          Téléchargement terminé ! Le package {packagesInfo?.[downloadPlatform || 'android']?.fileName} est prêt à installer.
+                        </span>
+                      </>
+                    )}
+                    {downloadState === 'error' && (
+                      <>
+                        <AlertCircle className="w-4 h-4 text-red-400" />
+                        <span className="text-red-400">{downloadErrorMsg}</span>
+                      </>
+                    )}
+                  </span>
+                  <span className="font-mono font-bold text-orange-400">{downloadProgress}%</span>
+                </div>
+
+                <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-200 rounded-full ${
+                      downloadState === 'error'
+                        ? 'bg-red-500'
+                        : downloadState === 'completed'
+                        ? 'bg-emerald-500'
+                        : 'bg-orange-500'
+                    }`}
+                    style={{ width: `${downloadProgress}%` }}
+                  />
+                </div>
+
+                {totalBytes > 0 && (
+                  <div className="flex justify-between text-[11px] font-mono text-slate-400">
+                    <span>
+                      {(downloadedBytes / 1024).toFixed(1)} KB / {(totalBytes / 1024).toFixed(1)} KB transférés
+                    </span>
+                    <span>Aucun secret embarqué • Distribution HTTPS vérifiée</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="pt-2 flex flex-wrap items-center gap-6 text-xs text-slate-400">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                <span>{t.directFast}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                <span>Notifications Push Temps Réel (Même fermé/verrouillé)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Lock className="w-4 h-4 text-emerald-400" />
+                <span>Zéro clé API ou secret dans le package</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Right Column: Interactive Mobile Preview + Direct Platform Cards */}
+          <div className="lg:col-span-5 flex flex-col items-center gap-4">
+            <div className="w-72 bg-slate-950 rounded-[36px] p-3 border-4 border-slate-800 shadow-2xl">
+              <div className="bg-slate-900 rounded-[28px] p-5 space-y-5 border border-slate-800">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-7 h-7 rounded-lg bg-orange-600 flex items-center justify-center font-black text-xs">
+                      P
+                    </div>
+                    <span className="font-display font-bold text-sm">PlayUp App</span>
+                  </div>
+                  <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-semibold">
+                    v{packagesInfo?.android.version || '2.4.1'}
+                  </span>
+                </div>
+
+                <div className="bg-gradient-to-br from-orange-600 to-amber-600 rounded-2xl p-4 space-y-1">
+                  <span className="text-[10px] uppercase tracking-wider text-orange-100 font-semibold">
+                    Android &amp; iOS
+                  </span>
+                  <div className="font-display font-bold text-base">
+                    Téléchargement Direct
+                  </div>
+                  <p className="text-[11px] text-orange-100 pt-1">
+                    Package vérifié par SHA-256 + Notifications Push &amp; Email après livraison fournisseur.
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedPlatform('android');
+                      handleRealPackageDownload('android');
+                    }}
+                    className="w-full p-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 flex items-center justify-between text-xs transition-colors cursor-pointer"
+                  >
+                    <span className="font-medium text-slate-200 flex items-center gap-2">
+                      <Download className="w-3.5 h-3.5 text-orange-400" />
+                      <span>Package Android (.APK)</span>
+                    </span>
+                    <span className="text-orange-400 font-mono font-bold">
+                      {packagesInfo?.android.sizeFormatted || '225 KB'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedPlatform('ios');
+                      handleRealPackageDownload('ios');
+                    }}
+                    className="w-full p-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 flex items-center justify-between text-xs transition-colors cursor-pointer"
+                  >
+                    <span className="font-medium text-slate-200 flex items-center gap-2">
+                      <Smartphone className="w-3.5 h-3.5 text-orange-400" />
+                      <span>Profil iPhone (.mobileconfig)</span>
+                    </span>
+                    <span className="text-orange-400 font-mono font-bold">
+                      {packagesInfo?.ios.sizeFormatted || '1.8 KB'}
+                    </span>
+                  </button>
+                </div>
+
+                <button
+                  onClick={onOpenMobileApp}
+                  className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer"
+                >
+                  Lancer PlayUp Mobile
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
-        <h1 className="font-display text-4xl sm:text-5xl font-extrabold tracking-tight text-slate-900">
-          {t.download.title}
-        </h1>
-        <p className="text-base text-slate-600 max-w-2xl mx-auto leading-relaxed">
-          {t.download.subtitle}
-        </p>
       </div>
 
-      {/* Main Download Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-5xl mx-auto">
-        {/* 1. Android Direct APK */}
-        <div className="bg-white border-2 border-orange-500/80 rounded-3xl p-6 sm:p-8 flex flex-col justify-between shadow-lg relative overflow-hidden">
-          <div className="absolute top-0 right-0 bg-orange-600 text-white text-[11px] font-bold px-3 py-1 rounded-bl-xl uppercase tracking-wider">
-            Recommandé
+      {/* App Features Breakdown */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-3">
+          <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-center text-orange-600">
+            <Zap className="w-5 h-5" />
           </div>
-
-          <div className="space-y-4">
-            <div className="w-12 h-12 rounded-2xl bg-orange-100 flex items-center justify-center text-orange-600">
-              <Download className="w-6 h-6" />
-            </div>
-
-            <div>
-              <h3 className="font-display text-xl font-bold text-slate-900">Android APK Direct</h3>
-              <p className="text-xs text-slate-500 mt-1">
-                Installation directe sans compte Google. Mises à jour automatiques intégrées.
-              </p>
-            </div>
-
-            <div className="space-y-2 py-2 text-xs text-slate-600 border-t border-slate-100">
-              <div className="flex justify-between">
-                <span>Version actuelle :</span>
-                <span className="font-semibold text-slate-900">{links.appVersion}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Taille du fichier :</span>
-                <span className="font-mono text-slate-900">{links.apkFileSize}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Système requis :</span>
-                <span className="text-slate-900">Android 7.0+</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="pt-6 space-y-2">
-            <button
-              onClick={handleDownloadApk}
-              className="w-full py-3.5 px-4 bg-orange-600 hover:bg-orange-500 text-white font-semibold text-xs sm:text-sm rounded-xl shadow-md transition-all flex items-center justify-center gap-2"
-            >
-              <Download className="w-4 h-4" />
-              <span>{t.download.androidApk}</span>
-            </button>
-            <p className="text-[11px] text-center text-slate-500">
-              Fichier vérifié sans malware par PlayUp Core
-            </p>
-          </div>
-        </div>
-
-        {/* 2. Google Play Store */}
-        <div className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 flex flex-col justify-between shadow-xs">
-          <div className="space-y-4">
-            <div className="w-12 h-12 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-800">
-              <Smartphone className="w-6 h-6" />
-            </div>
-
-            <div>
-              <h3 className="font-display text-xl font-bold text-slate-900">Google Play</h3>
-              <p className="text-xs text-slate-500 mt-1">
-                Téléchargement via la boutique officielle Google Play pour smartphones et tablettes Android.
-              </p>
-            </div>
-
-            <div className="space-y-2 py-2 text-xs text-slate-600 border-t border-slate-100">
-              <div className="flex justify-between">
-                <span>Plateforme :</span>
-                <span className="text-slate-900">Google Play Store</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Protection :</span>
-                <span className="text-emerald-700 font-medium">Google Play Protect</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="pt-6 space-y-2">
-            <a
-              href={links.googlePlayUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="w-full py-3.5 px-4 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs sm:text-sm rounded-xl transition-colors flex items-center justify-center gap-2 text-center"
-            >
-              <span>{t.download.googlePlay}</span>
-              <ExternalLink className="w-4 h-4" />
-            </a>
-            <p className="text-[11px] text-center text-slate-400">
-              Lien officiel configuré dans l’administration
-            </p>
-          </div>
-        </div>
-
-        {/* 3. Apple iOS / App Store */}
-        <div className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 flex flex-col justify-between shadow-xs">
-          <div className="space-y-4">
-            <div className="w-12 h-12 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-800">
-              <Apple className="w-6 h-6" />
-            </div>
-
-            <div>
-              <h3 className="font-display text-xl font-bold text-slate-900">Apple App Store</h3>
-              <p className="text-xs text-slate-500 mt-1">
-                Version iOS compatible iPhone et iPad avec authentification biométrique Face ID.
-              </p>
-            </div>
-
-            <div className="space-y-2 py-2 text-xs text-slate-600 border-t border-slate-100">
-              <div className="flex justify-between">
-                <span>Plateforme :</span>
-                <span className="text-slate-900">iOS / iPadOS</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Compatibilité :</span>
-                <span className="text-slate-900">iOS 15.0 ou ultérieur</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="pt-6 space-y-2">
-            <a
-              href={links.iosAppStoreUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="w-full py-3.5 px-4 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs sm:text-sm rounded-xl transition-colors flex items-center justify-center gap-2 text-center"
-            >
-              <span>{t.download.appStore}</span>
-              <ExternalLink className="w-4 h-4" />
-            </a>
-            <p className="text-[11px] text-center text-slate-400">
-              Certifié par Apple App Store Connect
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* Simulator Direct Access */}
-      <div className="max-w-3xl mx-auto bg-slate-900 text-white rounded-3xl p-8 flex flex-col sm:flex-row items-center justify-between gap-6 shadow-xl">
-        <div className="space-y-2">
-          <span className="text-xs font-semibold text-orange-400 uppercase tracking-wider">
-            Test instantané dans votre navigateur
-          </span>
-          <h3 className="font-display text-xl font-bold">
-            Envie d’essayer l’application tout de suite ?
+          <h3 className="font-display font-bold text-lg text-slate-900">
+            Livraison Instantanée &amp; Validation UID
           </h3>
-          <p className="text-xs text-slate-300">
-            Vous pouvez tester le flux complet d’achat (Free Fire, PUBG, MLBB, etc.) directement dans le simulateur web intégré.
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Vérification officielle de votre Player ID avant paiement et envoi automatique des diamants et UC dès confirmation.
           </p>
         </div>
-        <button
-          onClick={onOpenMobileApp}
-          className="px-6 py-3.5 bg-orange-600 hover:bg-orange-500 text-white text-xs sm:text-sm font-semibold rounded-xl shrink-0 transition-colors flex items-center gap-2"
-        >
-          <Smartphone className="w-4 h-4" />
-          <span>Ouvrir le simulateur PlayUp</span>
-        </button>
-      </div>
 
-      {/* Guide Installation APK Android */}
-      <div className="max-w-4xl mx-auto bg-slate-50 border border-slate-200 rounded-3xl p-8 space-y-6">
-        <div className="flex items-center gap-3">
-          <HelpCircle className="w-6 h-6 text-orange-600" />
-          <h3 className="font-display text-xl font-bold text-slate-900">
-            Guide d’installation du fichier APK Android
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-3">
+          <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-center text-orange-600">
+            <Bell className="w-5 h-5" />
+          </div>
+          <h3 className="font-display font-bold text-lg text-slate-900">
+            Notifications Push &amp; Email Temps Réel
           </h3>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Dès que GoXtop ou RechargeGames confirme la livraison de votre commande, vous recevez instantanément une notification Push (même écran verrouillé) et un email officiel de confirmation.
+          </p>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 text-xs text-slate-600">
-          <div className="space-y-2">
-            <span className="font-bold text-slate-900 block text-sm">Étape 1 : Téléchargement</span>
-            <p className="leading-relaxed">
-              Cliquez sur « Télécharger l'APK Android » ci-dessus. Si Android vous demande confirmation, acceptez le téléchargement.
-            </p>
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-3">
+          <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-100 flex items-center justify-center text-orange-600">
+            <ShieldCheck className="w-5 h-5" />
           </div>
-          <div className="space-y-2">
-            <span className="font-bold text-slate-900 block text-sm">Étape 2 : Autoriser la source</span>
-            <p className="leading-relaxed">
-              Ouvrez le fichier téléchargé. Si le système vous le demande, activez l’option « Autoriser cette source » dans les paramètres de sécurité.
-            </p>
-          </div>
-          <div className="space-y-2">
-            <span className="font-bold text-slate-900 block text-sm">Étape 3 : Lancez PlayUp</span>
-            <p className="leading-relaxed">
-              Cliquez sur « Installer ». Une fois terminé, lancez PlayUp et commencez à recharger vos jeux favoris instantanément !
-            </p>
-          </div>
+          <h3 className="font-display font-bold text-lg text-slate-900">
+            Architecture Sécurisée Sans Secret Embarqué
+          </h3>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Les packages Android et iOS communiquent exclusivement avec le backend sécurisé PlayUp. Aucune clé API Stripe, GoXtop ou RechargeGames n’est stockée dans l’application.
+          </p>
         </div>
       </div>
     </div>

@@ -1,0 +1,19 @@
+{
+  "name": "PlayUp — Gaming Top-Up & API",
+  "short_name": "PlayUp",
+  "description": "Plateforme officielle PlayUp de recharge gaming instantanée (Free Fire, PUBG Mobile, Mobile Legends) avec notifications temps réel.",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#ea580c",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/playup-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

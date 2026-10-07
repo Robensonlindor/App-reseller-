@@ -15,6 +15,10 @@ import { apiClient } from '../../services/apiClient';
 import { signInWithGooglePopup, signOutFirebase } from '../../lib/firebase';
 import { safeStorage } from '../../lib/safeStorage';
 import { Language, translations } from '../../i18n';
+import {
+  connectRealTimePushStream,
+  requestAndSubscribePushNotifications
+} from '../../lib/pushNotifications';
 
 interface PlayUpMobileAppProps {
   games: Game[];
@@ -52,15 +56,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     gameName: string;
     label: string;
     data: Record<string, string>;
-  }>>([
-    {
-      id: 'prof_ff_01',
-      gameId: 'game_ff',
-      gameName: 'Free Fire',
-      label: 'Compte Principal (Robenson)',
-      data: { playerName: 'Robenson', playerId: '123456789' }
-    }
-  ]);
+  }>>([]);
 
   // Order submission & GoXtop Name Checker + Payment step
   const [isOrdering, setIsOrdering] = useState(false);
@@ -92,18 +88,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   // Notifications drawer
   const [showNotifications, setShowNotifications] = useState(false);
 
-  // User Authentication & Account State
-  const [authUser, setAuthUser] = useState<AppUser | null>(() => {
-    const saved = safeStorage.getItem('playup_user_profile');
-    if (saved) {
-      try { return JSON.parse(saved); } catch { return null; }
-    }
-    return null;
-  });
+  // User Authentication & Account State (strictly empty on new device — no pre-loaded account)
+  const [authUser, setAuthUser] = useState<AppUser | null>(null);
   const [userToken, setUserToken] = useState<string>(() => safeStorage.getItem('playup_user_token') || '');
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
-  const [authEmail, setAuthEmail] = useState('alex@playup.gg');
-  const [authPassword, setAuthPassword] = useState('PlayUp2026!');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
   const [authName, setAuthName] = useState('');
   const [authPhone, setAuthPhone] = useState('');
   const [resetCodeInput, setResetCodeInput] = useState('');
@@ -119,6 +109,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   const [profileCurrency, setProfileCurrency] = useState<'USD' | 'HTG' | 'EUR'>('USD');
   const [profileTwoFactor, setProfileTwoFactor] = useState(false);
   const [profileEmailNotifs, setProfileEmailNotifs] = useState(true);
+  const [profilePushNotifs, setProfilePushNotifs] = useState(true);
   const [currentPasswordInput, setCurrentPasswordInput] = useState('');
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [profileSaving, setProfileSaving] = useState(false);
@@ -126,12 +117,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   // Payment Gateways & Checkout State
   const [paymentGateways, setPaymentGateways] = useState<PaymentGatewayConfig[]>([]);
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<PaymentMethodType>('moncash');
-  const [cardHolderName, setCardHolderName] = useState('ALEX GAMER');
-  const [cardNumber, setCardNumber] = useState('4532015112830366');
-  const [cardExpiry, setCardExpiry] = useState('08/28');
-  const [cardCvc, setCardCvc] = useState('842');
-  const [mobilePhone, setMobilePhone] = useState('+509 3711-2233');
-  const [mobileOtp, setMobileOtp] = useState('482910');
+  const [cardHolderName, setCardHolderName] = useState('');
+  const [cardNumber, setCardNumber] = useState('');
+  const [cardExpiry, setCardExpiry] = useState('');
+  const [cardCvc, setCardCvc] = useState('');
+  const [mobilePhone, setMobilePhone] = useState('');
+  const [mobileOtp, setMobileOtp] = useState('');
   const [lastPaymentTx, setLastPaymentTx] = useState<PaymentTransaction | null>(null);
   const [userPaymentTransactions, setUserPaymentTransactions] = useState<PaymentTransaction[]>([]);
 
@@ -142,11 +133,24 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   const [topUpProcessing, setTopUpProcessing] = useState(false);
 
   useEffect(() => {
-    loadUserOrders();
-    loadNotifications();
     loadPaymentGateways();
     loadRechargeGamesCatalog();
-  }, [authUser?.id]);
+    if (userToken) {
+      loadUserOrders();
+      loadNotifications();
+      const disconnectPush = connectRealTimePushStream(userToken, (notif) => {
+        setAuthSuccess(`${notif.title} — ${notif.body}`);
+        loadNotifications();
+        loadUserOrders();
+      });
+      return () => disconnectPush();
+    } else {
+      setAuthUser(null);
+      setUserOrders([]);
+      setRgOrders([]);
+      setNotifications([]);
+    }
+  }, [userToken, authUser?.id]);
 
   const loadRechargeGamesCatalog = async () => {
     try {
@@ -179,7 +183,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setProfileCurrency(user.preferredCurrency || 'USD');
     setProfileTwoFactor(Boolean(user.twoFactorEnabled));
     setProfileEmailNotifs(user.emailNotifications !== false);
+    setProfilePushNotifs(user.pushNotificationsEnabled !== false);
     if (user.phone) setMobilePhone(user.phone);
+    if (user.pushNotificationsEnabled !== false) {
+      requestAndSubscribePushNotifications(token).catch(() => {});
+    }
   };
 
   const handleEmailAuth = async (e: React.FormEvent) => {
@@ -280,9 +288,15 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
         preferredCurrency: profileCurrency,
         twoFactorEnabled: profileTwoFactor,
         emailNotifications: profileEmailNotifs,
+        pushNotificationsEnabled: profilePushNotifs,
         ...(newPasswordInput ? { currentPassword: currentPasswordInput, newPassword: newPasswordInput } : {})
       });
       setAuthUser(res.user);
+      if (profilePushNotifs) {
+        await requestAndSubscribePushNotifications(userToken).catch(() => {});
+      } else {
+        await apiClient.unsubscribePushNotifications(userToken).catch(() => {});
+      }
       setCurrentPasswordInput('');
       setNewPasswordInput('');
       setAuthSuccess(res.message);
@@ -340,23 +354,35 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   };
 
   const loadUserOrders = async () => {
+    if (!userToken) {
+      setUserOrders([]);
+      setRgOrders([]);
+      return;
+    }
     setOrdersLoading(true);
     try {
+      const prof = await apiClient.getUserProfile(userToken);
+      setAuthUser(prof.user);
+      setProfileName(prof.user.name);
+      setProfilePhone(prof.user.phone || '');
+      setProfileCurrency(prof.user.preferredCurrency || 'USD');
+      setProfileTwoFactor(Boolean(prof.user.twoFactorEnabled));
+      setProfileEmailNotifs(prof.user.emailNotifications !== false);
+      setProfilePushNotifs(prof.user.pushNotificationsEnabled !== false);
+      setUserPaymentTransactions(prof.paymentTransactions || []);
       const [orders, rgList] = await Promise.all([
-        apiClient.getRecentOrders(authUser?.id),
-        apiClient.getRechargeGamesOrders(authUser?.id).catch(() => [])
+        apiClient.getRecentOrders(prof.user.id, userToken),
+        apiClient.getRechargeGamesOrders(prof.user.id).catch(() => [])
       ]);
       setUserOrders(orders);
       setRgOrders(rgList);
-      if (userToken) {
-        const prof = await apiClient.getUserProfile(userToken).catch(() => null);
-        if (prof) {
-          setAuthUser(prof.user);
-          setUserPaymentTransactions(prof.paymentTransactions || []);
-        }
-      }
-    } catch (e) {
-      console.error(e);
+    } catch {
+      safeStorage.removeItem('playup_user_token');
+      safeStorage.removeItem('playup_user_profile');
+      setAuthUser(null);
+      setUserToken('');
+      setUserOrders([]);
+      setRgOrders([]);
     } finally {
       setOrdersLoading(false);
     }
@@ -454,9 +480,16 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     }
   };
 
-  // Proceed to confirmation & payment step (Enforces real provider Player ID check when supported)
+  // Proceed to confirmation & payment step (Enforces real provider Player ID check when supported + user auth)
   const handleProceedToPayment = async () => {
     if (!selectedGame || !selectedService || !selectedPackage) return;
+
+    if (!authUser || !userToken) {
+      setOrderError('Vous devez vous connecter ou créer un compte PlayUp pour passer une commande.');
+      setSelectedGame(null);
+      setActiveTab('profile');
+      return;
+    }
 
     const requiresPlayer = selectedPackage.requiresPlayerId !== false && selectedGame.requiresPlayerId !== false;
     if (requiresPlayer) {
@@ -2233,7 +2266,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                               required
                               value={authName}
                               onChange={(e) => setAuthName(e.target.value)}
-                              placeholder="Ex: Robenson Pierre"
+                              placeholder="Votre nom complet"
                               className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
                             />
                           </div>
@@ -2504,6 +2537,15 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                                 className="rounded text-orange-600"
                               />
                               <span className="text-[11px] font-semibold text-slate-700">Alertes Email</span>
+                            </label>
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={profilePushNotifs}
+                                onChange={(e) => setProfilePushNotifs(e.target.checked)}
+                                className="rounded text-orange-600"
+                              />
+                              <span className="text-[11px] font-semibold text-slate-700">Notifications Push</span>
                             </label>
                           </div>
                         </div>

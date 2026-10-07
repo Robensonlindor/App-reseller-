@@ -9,7 +9,7 @@ import {
   AppUser, PaymentGatewayConfig, PaymentTransaction,
   RechargeGamesMode, RechargeGamesProduct, RechargeGamesOrderRecord,
   RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesSyncStats,
-  FirestoreWebhookIdempotencyRecord
+  FirestoreWebhookIdempotencyRecord, PushSubscriptionRecord, PushNotificationLog, EmailDeliveryLog
 } from '../src/types';
 import { 
   INITIAL_GAMES, INITIAL_SERVICES, INITIAL_PROVIDERS, 
@@ -141,6 +141,11 @@ export interface DatabaseSchema {
   rechargeGamesMargins?: RechargeGamesMarginConfig;      // PlayUp Margin System
   rechargeGamesSyncStats?: RechargeGamesSyncStats;
   rechargeGamesBuyerRefCounter?: number;
+  // Real-time Push Notifications & Email Delivery logs
+  pushSubscriptions?: PushSubscriptionRecord[];
+  pushNotificationLogs?: PushNotificationLog[];
+  emailDeliveryLogs?: EmailDeliveryLog[];
+  processedOrderDeliveries?: string[];
 }
 
 class PlayUpDatabase {
@@ -380,40 +385,84 @@ class PlayUpDatabase {
       changed = true;
     }
 
-    if (!this.data.users || this.data.users.length === 0) {
-      const salt = crypto.randomBytes(16).toString('hex');
-      const hash = crypto.scryptSync('PlayUp2026!', salt, 64).toString('hex');
-      this.data.users = [
-        {
-          id: 'usr_player_01',
-          name: 'Alex Gamer',
-          email: 'alex@playup.gg',
-          phone: '+509 3711-2233',
+    if (!this.data.userCredentials) {
+      this.data.userCredentials = {};
+      changed = true;
+    }
+
+    if (!this.data.users) {
+      this.data.users = [];
+      changed = true;
+    }
+
+    // Purge legacy demo accounts and demo API keys if present from older builds
+    const beforeUsersLen = this.data.users.length;
+    this.data.users = this.data.users.filter(u => u.id !== 'usr_demo_01');
+    if (this.data.users.length !== beforeUsersLen) {
+      delete this.data.userCredentials['usr_demo_01'];
+      changed = true;
+    }
+
+    if (this.data.resellers) {
+      const beforeResLen = this.data.resellers.length;
+      this.data.resellers = this.data.resellers.filter(r => r.id !== 'res_demo_01' && r.id !== 'res_demo_02');
+      if (this.data.resellers.length !== beforeResLen) changed = true;
+    }
+
+    if (this.data.apiKeys) {
+      const beforeKeysLen = this.data.apiKeys.length;
+      this.data.apiKeys = this.data.apiKeys.filter(k => k.id !== 'key_live_01' && k.id !== 'key_sandbox_01');
+      if (this.data.apiKeys.length !== beforeKeysLen) changed = true;
+    }
+
+    // Ensure every user record has an explicit role ('USER' | 'ADMIN') and pushNotificationsEnabled
+    const configuredAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || '').trim().toLowerCase();
+    for (const u of this.data.users) {
+      if (!u.role) {
+        u.role = configuredAdminEmail && u.email.toLowerCase() === configuredAdminEmail ? 'ADMIN' : 'USER';
+        changed = true;
+      }
+      if (typeof u.pushNotificationsEnabled !== 'boolean') {
+        u.pushNotificationsEnabled = true;
+        changed = true;
+      }
+    }
+
+    // Provision the dedicated ADMIN account ONLY if PLAYUP_ADMIN_EMAIL and PLAYUP_ADMIN_PASSWORD are set in server environment variables
+    const adminInitialPassword = (process.env.PLAYUP_ADMIN_PASSWORD || '').trim();
+    if (configuredAdminEmail && adminInitialPassword) {
+      let adminUser = this.data.users.find(u => u.email.toLowerCase() === configuredAdminEmail);
+      if (!adminUser) {
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hash = crypto.scryptSync(adminInitialPassword, salt, 64).toString('hex');
+        adminUser = {
+          id: 'usr_admin_master',
+          name: 'Administrateur PlayUp',
+          email: configuredAdminEmail,
+          role: 'ADMIN',
           authProvider: 'email',
           emailVerified: true,
           status: 'active',
           preferredCurrency: 'USD',
-          twoFactorEnabled: false,
+          twoFactorEnabled: true,
           emailNotifications: true,
-          walletBalance: 45.00,
+          pushNotificationsEnabled: true,
+          walletBalance: 0,
           ordersCount: 0,
           totalSpent: 0,
-          createdAt: '2026-02-15T12:00:00Z',
+          createdAt: '2026-01-01T00:00:00Z',
           lastLoginAt: new Date().toISOString()
-        }
-      ];
-      this.data.userCredentials = {
-        usr_player_01: {
+        };
+        this.data.users.push(adminUser);
+        this.data.userCredentials[adminUser.id] = {
           passwordHash: hash,
           passwordSalt: salt
-        }
-      };
-      changed = true;
-    }
-
-    if (!this.data.userCredentials) {
-      this.data.userCredentials = {};
-      changed = true;
+        };
+        changed = true;
+      } else if (adminUser.role !== 'ADMIN') {
+        adminUser.role = 'ADMIN';
+        changed = true;
+      }
     }
 
     if (!this.data.paymentGateways || this.data.paymentGateways.length === 0) {
@@ -710,13 +759,11 @@ class PlayUpDatabase {
     }
   }
 
-  // User Notifications
+  // User Notifications (Strictly scoped to the authenticated user)
   public getUserNotifications(userId?: string): UserNotification[] {
+    if (!userId) return [];
     const list = this.data.userNotifications || [];
-    if (userId) {
-      return list.filter(n => !n.userId || n.userId === userId);
-    }
-    return list;
+    return list.filter(n => n.userId === userId);
   }
 
   public markNotificationRead(id: string) {
@@ -958,12 +1005,13 @@ class PlayUpDatabase {
   }
 
   public generateUserSessionToken(userId: string): string {
-    const payload = `${userId}.${Date.now()}`;
+    const nonce = crypto.randomBytes(8).toString('hex');
+    const payload = `${userId}.${Date.now()}.${nonce}`;
     const sig = crypto
       .createHmac('sha256', this.data.adminToken || 'playup_secret')
       .update(payload)
       .digest('hex');
-    return `plup_usr_${ Buffer.from(payload).toString('base64url') }.${sig}`;
+    return `plup_usr_${Buffer.from(payload).toString('base64url')}.${sig}`;
   }
 
   public verifyUserSessionToken(token?: string): AppUser | null {
@@ -977,10 +1025,16 @@ class PlayUpDatabase {
         .createHmac('sha256', this.data.adminToken || 'playup_secret')
         .update(payload)
         .digest('hex');
-      if (sig !== expectedSig) return null;
+      if (sig.length !== expectedSig.length) return null;
+      if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expectedSig, 'hex'))) {
+        return null;
+      }
       const [userId] = payload.split('.');
       const user = this.getUserById(userId);
       if (!user || user.status === 'suspended') return null;
+      if (!user.role) {
+        user.role = 'USER';
+      }
       return user;
     } catch {
       return null;
@@ -1370,6 +1424,141 @@ class PlayUpDatabase {
     }
     this.save();
     return sanitized;
+  }
+
+  // ==========================================================================
+  // PUSH SUBSCRIPTIONS, PUSH NOTIFICATION LOGS & EMAIL DELIVERY LOGS
+  // ==========================================================================
+
+  public getPushSubscriptions(userId?: string): PushSubscriptionRecord[] {
+    const subs = this.data.pushSubscriptions || [];
+    if (userId) {
+      return subs.filter(s => s.userId === userId && s.active);
+    }
+    return subs;
+  }
+
+  public upsertPushSubscription(sub: Omit<PushSubscriptionRecord, 'id' | 'createdAt' | 'lastSeenAt'>): PushSubscriptionRecord {
+    if (!this.data.pushSubscriptions) {
+      this.data.pushSubscriptions = [];
+    }
+    const now = new Date().toISOString();
+    const existingIdx = this.data.pushSubscriptions.findIndex(
+      s => s.userId === sub.userId && s.endpoint === sub.endpoint
+    );
+    if (existingIdx !== -1) {
+      this.data.pushSubscriptions[existingIdx] = {
+        ...this.data.pushSubscriptions[existingIdx],
+        ...sub,
+        active: true,
+        lastSeenAt: now
+      };
+      this.save();
+      return this.data.pushSubscriptions[existingIdx];
+    }
+    const created: PushSubscriptionRecord = {
+      ...sub,
+      id: 'psub_' + crypto.randomUUID().slice(0, 12),
+      createdAt: now,
+      lastSeenAt: now
+    };
+    this.data.pushSubscriptions.unshift(created);
+    this.save();
+    return created;
+  }
+
+  public removePushSubscription(userId: string, endpoint?: string): void {
+    if (!this.data.pushSubscriptions) return;
+    this.data.pushSubscriptions = this.data.pushSubscriptions.filter(
+      s => !(s.userId === userId && (!endpoint || s.endpoint === endpoint))
+    );
+    this.save();
+  }
+
+  public hasOrderDeliveryNotificationBeenSent(orderId: string): boolean {
+    if (!orderId) return false;
+    return (this.data.processedOrderDeliveries || []).includes(orderId);
+  }
+
+  public markOrderDeliveryNotificationSent(orderId: string): void {
+    if (!orderId) return;
+    if (!this.data.processedOrderDeliveries) {
+      this.data.processedOrderDeliveries = [];
+    }
+    if (!this.data.processedOrderDeliveries.includes(orderId)) {
+      this.data.processedOrderDeliveries.unshift(orderId);
+      if (this.data.processedOrderDeliveries.length > 2000) {
+        this.data.processedOrderDeliveries.pop();
+      }
+      this.save();
+    }
+  }
+
+  public getPushNotificationLogs(userId?: string): PushNotificationLog[] {
+    const logs = this.data.pushNotificationLogs || [];
+    if (userId) {
+      return logs.filter(l => l.userId === userId);
+    }
+    return logs;
+  }
+
+  public addPushNotificationLog(entry: Omit<PushNotificationLog, 'id' | 'createdAt'>): PushNotificationLog {
+    if (!this.data.pushNotificationLogs) {
+      this.data.pushNotificationLogs = [];
+    }
+    const record: PushNotificationLog = {
+      ...entry,
+      id: 'push_' + crypto.randomUUID().slice(0, 12),
+      createdAt: new Date().toISOString()
+    };
+    this.data.pushNotificationLogs.unshift(record);
+    if (this.data.pushNotificationLogs.length > 500) {
+      this.data.pushNotificationLogs.pop();
+    }
+    this.save();
+    return record;
+  }
+
+  public markPushNotificationsDeliveredForUser(userId: string): PushNotificationLog[] {
+    if (!this.data.pushNotificationLogs) return [];
+    const now = new Date().toISOString();
+    const pending: PushNotificationLog[] = [];
+    for (const log of this.data.pushNotificationLogs) {
+      if (log.userId === userId && (log.status === 'queued_offline' || log.status === 'sent')) {
+        log.status = 'delivered_to_device';
+        log.deliveredAt = now;
+        pending.push(log);
+      }
+    }
+    if (pending.length > 0) {
+      this.save();
+    }
+    return pending;
+  }
+
+  public getEmailDeliveryLogs(userId?: string): EmailDeliveryLog[] {
+    const logs = this.data.emailDeliveryLogs || [];
+    if (userId) {
+      return logs.filter(l => l.userId === userId);
+    }
+    return logs;
+  }
+
+  public addEmailDeliveryLog(entry: Omit<EmailDeliveryLog, 'id' | 'createdAt'>): EmailDeliveryLog {
+    if (!this.data.emailDeliveryLogs) {
+      this.data.emailDeliveryLogs = [];
+    }
+    const record: EmailDeliveryLog = {
+      ...entry,
+      id: 'mail_' + crypto.randomUUID().slice(0, 12),
+      createdAt: new Date().toISOString()
+    };
+    this.data.emailDeliveryLogs.unshift(record);
+    if (this.data.emailDeliveryLogs.length > 500) {
+      this.data.emailDeliveryLogs.pop();
+    }
+    this.save();
+    return record;
   }
 }
 

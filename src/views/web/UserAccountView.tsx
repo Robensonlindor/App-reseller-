@@ -15,6 +15,8 @@ import {
   connectRealTimePushStream,
   requestAndSubscribePushNotifications
 } from '../../lib/pushNotifications';
+import { TotpCodeInput } from '../../components/common/TotpCodeInput';
+import { MonCashNatCashOcrPaymentFlow } from '../../components/MonCashNatCashOcrPaymentFlow';
 
 interface UserAccountViewProps {
   onOpenMobileApp: () => void;
@@ -38,6 +40,8 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   const [phone, setPhone] = useState('');
   const [resetCode, setResetCode] = useState('');
   const [newResetPassword, setNewResetPassword] = useState('');
+  const [loginTotpRequired, setLoginTotpRequired] = useState(false);
+  const [loginTotpCode, setLoginTotpCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -70,6 +74,22 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   const [cardExpiry, setCardExpiry] = useState('');
   const [cardCvc, setCardCvc] = useState('');
   const [processingTopUp, setProcessingTopUp] = useState(false);
+
+  // Wallet Withdrawal + Blocking 2FA SMS/Email State
+  const [withdrawAmount, setWithdrawAmount] = useState('10');
+  const [withdrawMethod, setWithdrawMethod] = useState<'moncash' | 'natcash'>('moncash');
+  const [withdrawPhone, setWithdrawPhone] = useState('+509 37 12 3456');
+  const [withdraw2FAChannel, setWithdraw2FAChannel] = useState<'sms' | 'email'>('email');
+  const [withdraw2FAChallengeId, setWithdraw2FAChallengeId] = useState('');
+  const [withdraw2FAMaskedDest, setWithdraw2FAMaskedDest] = useState('');
+  const [withdraw2FACode, setWithdraw2FACode] = useState('');
+  const [withdraw2FADemoCode, setWithdraw2FADemoCode] = useState<string | null>(null);
+  const [withdraw2FAToken, setWithdraw2FAToken] = useState('');
+  const [withdraw2FAVerified, setWithdraw2FAVerified] = useState(false);
+  const [sendingWithdraw2FA, setSendingWithdraw2FA] = useState(false);
+  const [verifyingWithdraw2FA, setVerifyingWithdraw2FA] = useState(false);
+  const [processingWithdraw, setProcessingWithdraw] = useState(false);
+  const [withdrawFeedback, setWithdrawFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
     apiClient.getPaymentGateways().then(setGateways).catch(console.error);
@@ -142,10 +162,26 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
     setFeedback(null);
     try {
       if (authMode === 'login') {
-        const res = await apiClient.loginUser(email, password);
-        syncSession(res.user, res.token);
-        await refreshProfileData(res.token);
-        setFeedback({ type: 'success', text: `Heureux de vous revoir, ${res.user.name} !` });
+        const res = await apiClient.loginUser(
+          email,
+          password,
+          loginTotpRequired ? loginTotpCode : undefined
+        );
+        if (res.requiresTwoFactor) {
+          setLoginTotpRequired(true);
+          setFeedback({
+            type: 'success',
+            text: res.message || 'Entrez votre code Google Authenticator à 6 chiffres pour continuer.'
+          });
+          return;
+        }
+        if (res.user && res.token) {
+          setLoginTotpRequired(false);
+          setLoginTotpCode('');
+          syncSession(res.user, res.token);
+          await refreshProfileData(res.token);
+          setFeedback({ type: 'success', text: `Heureux de vous revoir, ${res.user.name} !` });
+        }
       } else if (authMode === 'register') {
         const res = await apiClient.registerUser({ name, email, password, phone });
         syncSession(res.user, res.token);
@@ -202,6 +238,9 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
   };
 
   const handleLogout = () => {
+    if (userToken) {
+      apiClient.logoutUser(userToken).catch(() => {});
+    }
     signOutFirebase().catch(() => {});
     safeStorage.removeItem('playup_user_token');
     safeStorage.removeItem('playup_user_profile');
@@ -448,6 +487,18 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder="••••••••"
                       className="w-full border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs focus:outline-none focus:border-orange-500"
+                    />
+                  </div>
+                )}
+
+                {authMode === 'login' && loginTotpRequired && (
+                  <div className="p-3.5 rounded-2xl bg-orange-50/70 border border-orange-200">
+                    <TotpCodeInput
+                      value={loginTotpCode}
+                      onChange={setLoginTotpCode}
+                      disabled={loading}
+                      label="Code Google Authenticator (2FA)"
+                      helperText="Ouvrez Google Authenticator et saisissez le code à 6 chiffres associé à votre compte PlayUp."
                     />
                   </div>
                 )}
@@ -817,93 +868,374 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                   </div>
 
                   {(topUpMethod === 'moncash' || topUpMethod === 'natcash') ? (
-                    <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                      <div>
-                        <label className="font-semibold text-slate-700 block mb-1">
-                          Numéro {topUpMethod === 'moncash' ? 'Digicel MonCash' : 'Natcom NatCash'}
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={mobilePhone}
-                          onChange={(e) => setMobilePhone(e.target.value)}
-                          className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
-                        />
-                      </div>
-                      <div>
-                        <label className="font-semibold text-slate-700 block mb-1">Code PIN / OTP</label>
-                        <input
-                          type="password"
-                          required
-                          value={mobileOtp}
-                          onChange={(e) => setMobileOtp(e.target.value)}
-                          className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
-                        />
-                      </div>
-                    </div>
+                    <MonCashNatCashOcrPaymentFlow
+                      token={userToken}
+                      user={authUser}
+                      purpose="wallet_topup"
+                      initialMethod={topUpMethod}
+                      packageName={`Recharge PlayUp Wallet +$${Number(topUpAmount || 10).toFixed(2)} USD`}
+                      expectedAmountUsd={Math.max(1, Number(topUpAmount || 10))}
+                      onWalletCredited={async ({ newWalletBalance }) => {
+                        const updated = { ...authUser, walletBalance: newWalletBalance };
+                        setAuthUser(updated);
+                        onAuthChange?.(updated);
+                        await refreshProfileData(userToken);
+                      }}
+                      onRedirectHome={() => {
+                        onNavigate('home');
+                      }}
+                    />
                   ) : (
-                    <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                      <div>
-                        <label className="font-semibold text-slate-700 block mb-1">Titulaire de la carte</label>
-                        <input
-                          type="text"
-                          required
-                          value={cardHolder}
-                          onChange={(e) => setCardHolder(e.target.value)}
-                          className="w-full border border-slate-300 rounded-lg px-3 py-2 bg-white"
-                        />
-                      </div>
-                      <div>
-                        <label className="font-semibold text-slate-700 block mb-1">Numéro de carte</label>
-                        <input
-                          type="text"
-                          required
-                          value={cardNumber}
-                          onChange={(e) => setCardNumber(e.target.value)}
-                          className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
-                        />
-                      </div>
-                      <div className="grid grid-cols-2 gap-2">
+                    <>
+                      <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
                         <div>
-                          <label className="font-semibold text-slate-700 block mb-1">Expiration</label>
+                          <label className="font-semibold text-slate-700 block mb-1">Titulaire de la carte</label>
                           <input
                             type="text"
                             required
-                            value={cardExpiry}
-                            onChange={(e) => setCardExpiry(e.target.value)}
-                            className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
+                            value={cardHolder}
+                            onChange={(e) => setCardHolder(e.target.value)}
+                            className="w-full border border-slate-300 rounded-lg px-3 py-2 bg-white"
                           />
                         </div>
                         <div>
-                          <label className="font-semibold text-slate-700 block mb-1">CVC</label>
+                          <label className="font-semibold text-slate-700 block mb-1">Numéro de carte</label>
                           <input
-                            type="password"
+                            type="text"
                             required
-                            value={cardCvc}
-                            onChange={(e) => setCardCvc(e.target.value)}
+                            value={cardNumber}
+                            onChange={(e) => setCardNumber(e.target.value)}
                             className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
                           />
                         </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">Expiration</label>
+                            <input
+                              type="text"
+                              required
+                              value={cardExpiry}
+                              onChange={(e) => setCardExpiry(e.target.value)}
+                              className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
+                            />
+                          </div>
+                          <div>
+                            <label className="font-semibold text-slate-700 block mb-1">CVC</label>
+                            <input
+                              type="password"
+                              required
+                              value={cardCvc}
+                              onChange={(e) => setCardCvc(e.target.value)}
+                              className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono bg-white"
+                            />
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  )}
 
-                  <button
-                    type="submit"
-                    disabled={processingTopUp}
-                    className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-xl shadow-xs transition-colors"
-                  >
-                    {processingTopUp
-                      ? 'Traitement sécurisé en cours...'
-                      : `Payer & Créditer $${Number(topUpAmount || 0).toFixed(2)} USD`}
-                  </button>
+                      <button
+                        type="submit"
+                        disabled={processingTopUp}
+                        className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-xl shadow-xs transition-colors"
+                      >
+                        {processingTopUp
+                          ? 'Traitement sécurisé en cours...'
+                          : `Payer & Créditer $${Number(topUpAmount || 0).toFixed(2)} USD`}
+                      </button>
+                    </>
+                  )}
                 </form>
               </div>
 
-              <div className="lg:col-span-7 bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
-                <h3 className="font-display text-lg font-bold text-slate-900">
-                  Journal des Transactions de Paiement
-                </h3>
+              <div className="lg:col-span-7 space-y-6">
+                {/* Wallet Withdrawal with Mandatory Blocking 2FA (SMS / Email) */}
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="font-display text-lg font-bold text-slate-900 flex items-center gap-2">
+                        <Lock className="w-5 h-5 text-indigo-600" />
+                        <span>Retirer des Fonds du PlayUp Wallet (2FA SMS/Email Bloquant)</span>
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Tout retrait vers MonCash ou NatCash exige un code 2FA à 6 chiffres vérifié côté backend. Si la vérification 2FA échoue, l’opération est immédiatement bloquée.
+                      </p>
+                    </div>
+                    <span className="px-3 py-1 rounded-lg bg-slate-900 text-white font-mono text-xs font-bold">
+                      Solde dispo : ${(authUser.walletBalance || 0).toFixed(2)} USD
+                    </span>
+                  </div>
+
+                  {withdrawFeedback && (
+                    <div
+                      className={`p-3 rounded-xl border text-xs font-medium flex items-center gap-2 ${
+                        withdrawFeedback.type === 'success'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : 'bg-rose-50 border-rose-200 text-rose-800'
+                      }`}
+                    >
+                      {withdrawFeedback.type === 'success' ? (
+                        <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                      )}
+                      <span>{withdrawFeedback.text}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                    <div>
+                      <label className="font-semibold text-slate-700 block mb-1">Montant du retrait (USD)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        step="0.5"
+                        value={withdrawAmount}
+                        onChange={e => {
+                          setWithdrawAmount(e.target.value);
+                          setWithdraw2FAVerified(false);
+                          setWithdraw2FAToken('');
+                        }}
+                        className="w-full border border-slate-300 rounded-xl px-3 py-2 font-mono font-bold text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="font-semibold text-slate-700 block mb-1">Vers le portefeuille</label>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {(['moncash', 'natcash'] as const).map(m => (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => setWithdrawMethod(m)}
+                            className={`py-2 px-2.5 rounded-xl border font-bold uppercase text-[11px] ${
+                              withdrawMethod === m
+                                ? 'border-orange-600 bg-orange-50 text-orange-700'
+                                : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                            }`}
+                          >
+                            {m}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="font-semibold text-slate-700 block mb-1">Numéro de réception</label>
+                      <input
+                        type="text"
+                        value={withdrawPhone}
+                        onChange={e => setWithdrawPhone(e.target.value)}
+                        placeholder="+509 37XX-XXXX"
+                        className="w-full border border-slate-300 rounded-xl px-3 py-2 font-mono text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Step 2: 2FA SMS / Email Challenge & Verification */}
+                  <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 space-y-3 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-slate-900 uppercase tracking-wider text-[11px]">
+                        Étape 2FA Obligatoire : Choisir le canal de réception du code
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          withdraw2FAVerified
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : 'bg-amber-100 text-amber-800'
+                        }`}
+                      >
+                        {withdraw2FAVerified ? '2FA Vérifié Côté Serveur' : 'En attente de validation 2FA'}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setWithdraw2FAChannel('email')}
+                        className={`px-3 py-1.5 rounded-lg font-bold border ${
+                          withdraw2FAChannel === 'email'
+                            ? 'border-indigo-600 bg-indigo-600 text-white'
+                            : 'border-slate-300 bg-white text-slate-700'
+                        }`}
+                      >
+                        Code par Email ({authUser.email})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setWithdraw2FAChannel('sms')}
+                        className={`px-3 py-1.5 rounded-lg font-bold border ${
+                          withdraw2FAChannel === 'sms'
+                            ? 'border-indigo-600 bg-indigo-600 text-white'
+                            : 'border-slate-300 bg-white text-slate-700'
+                        }`}
+                      >
+                        Code par SMS ({withdrawPhone || authUser.phone || '+509 37 00 0000'})
+                      </button>
+                      <button
+                        type="button"
+                        disabled={sendingWithdraw2FA}
+                        onClick={async () => {
+                          setSendingWithdraw2FA(true);
+                          setWithdrawFeedback(null);
+                          try {
+                            const res = await apiClient.requestWallet2FAChallenge(userToken, {
+                              operationType: 'wallet_withdrawal',
+                              channel: withdraw2FAChannel,
+                              amount: Math.max(1, Number(withdrawAmount || 0)),
+                              currency: 'USD',
+                              destinationOverride: withdrawPhone
+                            });
+                            setWithdraw2FAChallengeId(res.challengeId);
+                            setWithdraw2FAMaskedDest(res.maskedDestination);
+                            setWithdraw2FADemoCode(res.demoCode || null);
+                            setWithdraw2FAVerified(false);
+                            setWithdraw2FAToken('');
+                            setWithdraw2FACode('');
+                            setWithdrawFeedback({
+                              type: 'success',
+                              text: `Code 2FA à 6 chiffres envoyé par ${withdraw2FAChannel.toUpperCase()} à ${res.maskedDestination}.`
+                            });
+                            await refreshProfileData(userToken);
+                          } catch (err: any) {
+                            setWithdrawFeedback({
+                              type: 'error',
+                              text: err?.message || 'Erreur lors de l’envoi du code 2FA.'
+                            });
+                          } finally {
+                            setSendingWithdraw2FA(false);
+                          }
+                        }}
+                        className="ml-auto px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-bold cursor-pointer"
+                      >
+                        {sendingWithdraw2FA
+                          ? 'Envoi en cours...'
+                          : withdraw2FAChallengeId
+                          ? 'Renvoyer le code 2FA'
+                          : 'Envoyer le code 2FA'}
+                      </button>
+                    </div>
+
+                    {withdraw2FADemoCode && (
+                      <div className="flex items-center justify-between bg-white border border-indigo-200 rounded-lg px-3 py-2">
+                        <span className="text-slate-600">
+                          Code 2FA envoyé ({withdraw2FAMaskedDest}) :
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setWithdraw2FACode(withdraw2FADemoCode)}
+                          className="font-mono font-bold text-indigo-700 bg-indigo-50 px-2.5 py-1 rounded border border-indigo-200 hover:bg-indigo-100"
+                        >
+                          {withdraw2FADemoCode} (Cliquer pour saisir)
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        maxLength={6}
+                        value={withdraw2FACode}
+                        onChange={e => {
+                          setWithdraw2FACode(e.target.value.replace(/\D/g, '').slice(0, 6));
+                          setWithdraw2FAVerified(false);
+                          setWithdraw2FAToken('');
+                        }}
+                        placeholder="Code 2FA à 6 chiffres"
+                        className="flex-1 border border-slate-300 rounded-xl px-3.5 py-2 font-mono text-sm tracking-widest bg-white"
+                      />
+                      <button
+                        type="button"
+                        disabled={!withdraw2FAChallengeId || withdraw2FACode.length !== 6 || verifyingWithdraw2FA}
+                        onClick={async () => {
+                          setVerifyingWithdraw2FA(true);
+                          setWithdrawFeedback(null);
+                          try {
+                            const res = await apiClient.verifyWallet2FAChallenge(userToken, {
+                              challengeId: withdraw2FAChallengeId,
+                              code: withdraw2FACode
+                            });
+                            if (!res.verified || !res.verificationToken) {
+                              setWithdraw2FAVerified(false);
+                              setWithdraw2FAToken('');
+                              setWithdrawFeedback({
+                                type: 'error',
+                                text: res.message || 'Code 2FA invalide — retrait bloqué.'
+                              });
+                              return;
+                            }
+                            setWithdraw2FAVerified(true);
+                            setWithdraw2FAToken(res.verificationToken);
+                            setWithdrawFeedback({
+                              type: 'success',
+                              text: res.message
+                            });
+                          } catch (err: any) {
+                            setWithdrawFeedback({
+                              type: 'error',
+                              text: err?.message || 'Échec de vérification 2FA.'
+                            });
+                          } finally {
+                            setVerifyingWithdraw2FA(false);
+                          }
+                        }}
+                        className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-200 disabled:text-slate-400 text-white font-bold"
+                      >
+                        {verifyingWithdraw2FA ? 'Vérification...' : 'Vérifier le code 2FA'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={processingWithdraw}
+                        onClick={async () => {
+                          setProcessingWithdraw(true);
+                          setWithdrawFeedback(null);
+                          try {
+                            const res = await apiClient.withdrawWalletFunds(userToken, {
+                              amount: Number(withdrawAmount || 0),
+                              currency: 'USD',
+                              payoutMethod: withdrawMethod,
+                              destinationPhone: withdrawPhone,
+                              idempotencyKey: `idem_wdr_${authUser.id}_${withdraw2FAChallengeId || Date.now()}_${withdraw2FACode}`,
+                              twoFactorVerificationToken: withdraw2FAToken || undefined,
+                              twoFactorChallengeId: withdraw2FAChallengeId || undefined,
+                              twoFactorCode: withdraw2FACode || undefined
+                            });
+                            if (!res.withdrawn) {
+                              setWithdrawFeedback({
+                                type: 'error',
+                                text: res.message || 'Retrait bloqué par la sécurité 2FA côté backend.'
+                              });
+                              return;
+                            }
+                            setWithdrawFeedback({
+                              type: 'success',
+                              text: res.message
+                            });
+                            setWithdraw2FAChallengeId('');
+                            setWithdraw2FACode('');
+                            setWithdraw2FAToken('');
+                            setWithdraw2FAVerified(false);
+                            setWithdraw2FADemoCode(null);
+                            await refreshProfileData(userToken);
+                          } catch (err: any) {
+                            setWithdrawFeedback({
+                              type: 'error',
+                              text: err?.message || 'Erreur lors du retrait.'
+                            });
+                          } finally {
+                            setProcessingWithdraw(false);
+                          }
+                        }}
+                        className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold cursor-pointer"
+                      >
+                        {processingWithdraw
+                          ? 'Exécution...'
+                          : `Confirmer le retrait ($${Number(withdrawAmount || 0).toFixed(2)})`}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+                  <h3 className="font-display text-lg font-bold text-slate-900">
+                    Journal des Transactions de Paiement
+                  </h3>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">
                     <thead>
@@ -951,6 +1283,7 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                     </tbody>
                   </table>
                 </div>
+              </div>
               </div>
             </div>
           )}

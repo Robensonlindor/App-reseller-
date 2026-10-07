@@ -22,10 +22,10 @@ process.on('unhandledRejection', reason => {
 async function loadBackendCore(): Promise<{ apiRouter: express.Router; RechargeGamesProvider: any }> {
   if (!isProduction) {
     try {
-      const devMod = './server/apiRoutes';
+      const devMod = './server/apiRoutes.ts';
       return await import(devMod);
-    } catch {
-      // Running under plain node without tsx loader; fall through to bundled ESM
+    } catch (err) {
+      console.error('[PlayUp Engine] Dev import ./server/apiRoutes.ts failed, falling back:', err);
     }
   }
 

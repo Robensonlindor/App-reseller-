@@ -16,6 +16,7 @@ import { SupportView } from './views/web/SupportView';
 import { UserAccountView } from './views/web/UserAccountView';
 import { PlayUpMobileApp } from './views/mobile/PlayUpMobileApp';
 import { AdminDashboardView } from './views/admin/AdminDashboardView';
+import { PlayUpSplashLogo } from './components/common/PlayUpSplashLogo';
 import { Game, Service, AppSettings, AppUser } from './types';
 import { apiClient } from './services/apiClient';
 import { Language } from './i18n';
@@ -43,6 +44,15 @@ export default function App() {
   const [isMobileAppOpen, setIsMobileAppOpen] = useState(false);
   // Admin Overlay
   const [isAdminOpen, setIsAdminOpen] = useState(false);
+  // Automatic 2-second startup splash screen (disappears automatically without pressing any button)
+  const [showStartupSplash, setShowStartupSplash] = useState(true);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setShowStartupSplash(false);
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, []);
 
   // Verify any existing local token against the backend on startup
   const verifyCurrentSession = useCallback(async () => {
@@ -147,6 +157,13 @@ export default function App() {
 
   return (
     <div className="min-h-screen w-full overflow-x-hidden flex flex-col bg-white text-slate-900 selection:bg-orange-500 selection:text-white">
+      {/* Startup Splash Screen — Appears at app opening and disappears automatically after 2 seconds */}
+      {showStartupSplash && (
+        <div className="fixed inset-0 z-[100] bg-[#050302] flex items-center justify-center p-8 select-none pointer-events-none transition-opacity duration-300">
+          <PlayUpSplashLogo className="w-[75%] max-w-[280px] h-auto" />
+        </div>
+      )}
+
       {/* Top Banner Notice if in maintenance or announcement */}
       {settings?.announcementNotice && (
         <div className="bg-slate-950 text-white text-[11px] py-1.5 px-4 text-center border-b border-slate-800">

@@ -3,10 +3,13 @@ import {
   AppSettings, SystemLog, Provider, ConnectionTestResult, ProviderApiLog,
   PlayerCheckResult, UserNotification, ProviderOrder, ProviderWebhookLog, WebhookTestResult,
   AppUser, PaymentGatewayConfig, PaymentTransaction, PaymentMethodType,
+  PaymentLifecycleStatus, OrderLifecycleStatus, RefundRecord,
+  ManualPaymentValidationRecord, OrderRetryAttemptRecord,
   RechargeGamesMode, RechargeGamesProduct, RechargeGamesOrderRecord,
   RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesConfigState,
   RechargeGamesTestStepResult, AppPackageMetadata, PushNotificationLog,
-  EmailDeliveryLog, PushSubscriptionRecord
+  EmailDeliveryLog, PushSubscriptionRecord,
+  PaymentRequestRecord, PaymentAuditLogEntry, PaymentIdempotentOperationType
 } from '../types';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
 import { safeStorage } from '../lib/safeStorage';
@@ -139,16 +142,36 @@ export const apiClient = {
     );
   },
 
-  async loginUser(email: string, password: string): Promise<{ user: AppUser; token: string }> {
-    return fetchJson<{ user: AppUser; token: string }>(
+  async loginUser(
+    email: string,
+    password: string,
+    totpCode?: string
+  ): Promise<{ user?: AppUser; token?: string; requiresTwoFactor?: boolean; message?: string }> {
+    return fetchJson<{ user?: AppUser; token?: string; requiresTwoFactor?: boolean; message?: string }>(
       '/api/auth/login',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password })
+        body: JSON.stringify({ email, password, ...(totpCode ? { totpCode } : {}) })
       },
       'Email ou mot de passe incorrect'
     );
+  },
+
+  async logoutUser(token?: string): Promise<{ success: boolean }> {
+    const activeToken = token || safeStorage.getItem('playup_user_token') || safeStorage.getItem('playup_admin_token') || '';
+    try {
+      const res = await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(activeToken ? { Authorization: `Bearer ${activeToken}` } : {})
+        }
+      });
+      return await res.json();
+    } catch {
+      return { success: true };
+    }
   },
 
   async socialLoginUser(data: {
@@ -230,6 +253,7 @@ export const apiClient = {
       pushNotificationsEnabled?: boolean;
       currentPassword?: string;
       newPassword?: string;
+      totpCode?: string;
     }
   ): Promise<{ user: AppUser; message: string }> {
     return fetchJson(
@@ -246,9 +270,143 @@ export const apiClient = {
     );
   },
 
+  // TOTP (Google Authenticator) Endpoints
+  async getTotpStatus(token: string): Promise<{
+    enabled: boolean;
+    hasPendingSetup: boolean;
+    issuer: string;
+    accountName: string;
+  }> {
+    return fetchJson(
+      '/api/auth/totp/status',
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Impossible de récupérer le statut Google Authenticator'
+    );
+  },
+
+  async setupTotp(token: string): Promise<{
+    secret: string;
+    otpauthUrl: string;
+    issuer: string;
+    accountName: string;
+    period: number;
+    digits: number;
+  }> {
+    return fetchJson(
+      '/api/auth/totp/setup',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        }
+      },
+      'Erreur lors de la génération de la clé secrète Google Authenticator'
+    );
+  },
+
+  async verifyTotpSetup(
+    token: string,
+    totpCode: string
+  ): Promise<{ success: boolean; user: AppUser; message: string }> {
+    return fetchJson(
+      '/api/auth/totp/verify-setup',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ totpCode })
+      },
+      'Code Google Authenticator invalide'
+    );
+  },
+
+  async verifyTotpCode(
+    token: string,
+    totpCode: string
+  ): Promise<{ verified: boolean; message: string }> {
+    return fetchJson(
+      '/api/auth/totp/verify',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ totpCode })
+      },
+      'Code Google Authenticator invalide'
+    );
+  },
+
+  async disableTotp(
+    token: string,
+    totpCode: string
+  ): Promise<{ success: boolean; user: AppUser; message: string }> {
+    return fetchJson(
+      '/api/auth/totp/disable',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ totpCode })
+      },
+      'Impossible de désactiver Google Authenticator'
+    );
+  },
+
   // Payment Gateways
   async getPaymentGateways(): Promise<PaymentGatewayConfig[]> {
     return safeFetchArray<PaymentGatewayConfig>('/api/payments/gateways');
+  },
+
+  async validateBeforePayment(data: {
+    productKey?: string;
+    packageId?: string;
+    gameId?: string;
+    region?: string;
+    playerId?: string;
+    serverId?: string;
+    quantity?: number;
+    paymentMethod?: PaymentMethodType;
+  }, token?: string): Promise<{
+    valid: boolean;
+    httpStatus: number;
+    errorCode?: string;
+    message: string;
+    product?: RechargeGamesProduct;
+    verifiedPlayerName?: string;
+    playerVerificationStatus?: 'VERIFIED' | 'NON SUPPORTÉ' | 'NOT_REQUIRED' | 'FAILED';
+    pricing?: {
+      unitPrice: number;
+      quantity: number;
+      subtotalPrice: number;
+      gatewayFee: number;
+      totalAmount: number;
+      currency: string;
+      providerCost: number;
+      margin: number;
+    };
+  }> {
+    const res = await fetch('/api/payments/validate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(token)
+      },
+      body: JSON.stringify(data)
+    });
+    return await res.json().catch(() => ({
+      valid: false,
+      httpStatus: res.status,
+      message: 'Erreur lors de la validation pré-paiement.'
+    }));
   },
 
   async processPayment(data: {
@@ -257,6 +415,14 @@ export const apiClient = {
     amount: number;
     currency?: string;
     purpose?: 'order' | 'wallet_topup';
+    productKey?: string;
+    packageId?: string;
+    gameId?: string;
+    region?: string;
+    playerId?: string;
+    serverId?: string;
+    quantity?: number;
+    requestedPaymentStatus?: PaymentLifecycleStatus;
     cardDetails?: {
       cardNumber: string;
       expiry: string;
@@ -267,7 +433,12 @@ export const apiClient = {
       phone: string;
       otp: string;
     };
-  }, token?: string): Promise<{ success: boolean; transaction: PaymentTransaction; user?: AppUser }> {
+  }, token?: string): Promise<{
+    success: boolean;
+    payment_status?: PaymentLifecycleStatus;
+    transaction: PaymentTransaction;
+    user?: AppUser;
+  }> {
     return fetchJson(
       '/api/payments/process',
       {
@@ -280,6 +451,36 @@ export const apiClient = {
       },
       'Échec de la transaction de paiement'
     );
+  },
+
+  async checkOrUpdatePaymentStatus(
+    transactionRef: string,
+    payload?: { action?: 'check' | 'confirm_gateway' | 'cancel' | 'fail'; orderId?: string },
+    token?: string
+  ): Promise<{
+    success: boolean;
+    payment_status: PaymentLifecycleStatus;
+    transaction: PaymentTransaction;
+    recovery?: any;
+  }> {
+    return fetchJson(
+      `/api/payments/${encodeURIComponent(transactionRef)}/status`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload || { action: 'check' })
+      },
+      'Erreur lors de la vérification du statut de paiement'
+    );
+  },
+
+  async getUserRefunds(token?: string): Promise<RefundRecord[]> {
+    const authHeaders = getAuthHeaders(token);
+    if (!authHeaders.Authorization) return [];
+    return safeFetchArray<RefundRecord>('/api/app/refunds', { headers: authHeaders });
   },
 
   // PlayUp Mobile App
@@ -988,21 +1189,27 @@ export const apiClient = {
     player_id: string;
     player_name?: string;
     server_id?: string;
+    quantity?: number;
     buyer_ref?: string;
     paymentConfirmed: boolean;
+    paymentStatus?: PaymentLifecycleStatus;
     paymentMethod?: string;
     paymentReference?: string;
+    paymentTransactionId?: string;
+    allowIdempotentRecovery?: boolean;
   }, token?: string): Promise<{
     success: boolean;
     message: string;
     order: RechargeGamesOrderRecord;
     playupOrder?: Order;
+    refundRecord?: RefundRecord;
   }> {
     const body = await fetchJson<{
       success: boolean;
       message: string;
       order: RechargeGamesOrderRecord;
       playupOrder?: Order;
+      refundRecord?: RefundRecord;
     }>(
       '/api/rechargegames/orders',
       {
@@ -1021,6 +1228,33 @@ export const apiClient = {
     return body;
   },
 
+  async recoverRechargeGamesOrder(
+    orderIdOrBuyerRef: string,
+    options?: { paymentStatus?: PaymentLifecycleStatus; paymentReference?: string },
+    token?: string
+  ): Promise<{
+    success: boolean;
+    httpStatus: number;
+    alreadyDelivered?: boolean;
+    recoveredAction: string;
+    message: string;
+    order?: RechargeGamesOrderRecord;
+    playupOrder?: Order;
+  }> {
+    return fetchJson(
+      `/api/rechargegames/orders/${encodeURIComponent(orderIdOrBuyerRef)}/recover`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(options || {})
+      },
+      'Erreur lors de la reprise sécurisée de la commande'
+    );
+  },
+
   async getRechargeGamesOrders(userId?: string, token?: string): Promise<RechargeGamesOrderRecord[]> {
     const authHeaders = getAuthHeaders(token);
     if (!authHeaders.Authorization) return [];
@@ -1032,7 +1266,7 @@ export const apiClient = {
 
   async checkRechargeGamesOrderStatus(orderId: string, token?: string): Promise<{
     success: boolean;
-    status: 'pending' | 'delivered' | 'failed';
+    status: RechargeGamesOrderRecord['status'];
     order?: RechargeGamesOrderRecord;
     message: string;
   }> {
@@ -1056,11 +1290,15 @@ export const apiClient = {
       deliveredOrders: number;
       refundedOrders?: number;
       failedOrders: number;
+      manualReviewOrders?: number;
       totalProfitUsd: number;
       apiErrorsCount: number;
     };
     products: RechargeGamesProduct[];
     orders: RechargeGamesOrderRecord[];
+    refunds?: RefundRecord[];
+    manualPaymentValidations?: ManualPaymentValidationRecord[];
+    orderRetryAttempts?: OrderRetryAttemptRecord[];
     webhookEvents: RechargeGamesWebhookEvent[];
     apiLogs: ProviderApiLog[];
   }> {
@@ -1070,6 +1308,134 @@ export const apiClient = {
         headers: { Authorization: `Bearer ${token}` }
       },
       'Erreur chargement dashboard RechargeGames'
+    );
+  },
+
+  async validateRechargeGamesPaymentManually(
+    token: string,
+    orderId: string,
+    options?: {
+      note?: string;
+      simulateTemporaryProviderError?: boolean;
+      simulateImmediateDelivery?: boolean;
+      simulateDefinitiveFailure?: boolean;
+    }
+  ): Promise<{
+    success: boolean;
+    httpStatus: number;
+    alreadyValidated?: boolean;
+    errorCode?: string;
+    message: string;
+    flowSteps: string[];
+    validationRecord?: ManualPaymentValidationRecord;
+    order?: RechargeGamesOrderRecord;
+    playupOrder?: Order;
+    refundRecord?: RefundRecord;
+  }> {
+    return fetchJson(
+      `/api/admin/rechargegames/orders/${encodeURIComponent(orderId)}/validate-payment`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(options || {})
+      },
+      'Erreur lors de la validation manuelle du paiement'
+    );
+  },
+
+  async retryRechargeGamesOrder(
+    token: string,
+    orderId: string,
+    options?: {
+      triggerType?: 'automatic' | 'manual_admin';
+      reason?: string;
+      simulateTemporaryError?: boolean;
+      bypassDelayForTest?: boolean;
+      requirePriorAdminStatusCheck?: boolean;
+    }
+  ): Promise<{
+    success: boolean;
+    httpStatus: number;
+    errorCode?: string;
+    message: string;
+    attemptRecord?: OrderRetryAttemptRecord;
+    order?: RechargeGamesOrderRecord;
+    playupOrder?: Order;
+  }> {
+    return fetchJson(
+      `/api/admin/rechargegames/orders/${encodeURIComponent(orderId)}/retry`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(options || {})
+      },
+      'Erreur lors de la nouvelle tentative de commande'
+    );
+  },
+
+  async getRechargeGamesRefundEligibility(
+    token: string,
+    orderId: string
+  ): Promise<{
+    eligible: boolean;
+    code: string;
+    reason: string;
+    preview: {
+      orderId: string;
+      buyerRef: string;
+      providerOrderId: string;
+      amount: number;
+      currency: string;
+      userId: string;
+      userName: string;
+      userEmail: string;
+      productName: string;
+      defaultReason: string;
+      refundMethod: string;
+      currentStatus: string;
+      paymentStatus: string;
+      refundStatus: string;
+    };
+  }> {
+    return fetchJson(
+      `/api/admin/rechargegames/orders/${encodeURIComponent(orderId)}/refund-eligibility`,
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Impossible de vérifier l’éligibilité au remboursement'
+    );
+  },
+
+  async executeRechargeGamesManualRefund(
+    token: string,
+    orderId: string,
+    payload: { reason: string; refundMethod?: string }
+  ): Promise<{
+    success: boolean;
+    httpStatus: number;
+    errorCode?: string;
+    message: string;
+    refundRecord?: RefundRecord;
+    order?: RechargeGamesOrderRecord;
+    playupOrder?: Order;
+  }> {
+    return fetchJson(
+      `/api/admin/rechargegames/orders/${encodeURIComponent(orderId)}/refund`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors du remboursement manuel'
     );
   },
 
@@ -1270,6 +1636,534 @@ export const apiClient = {
         headers: { Authorization: `Bearer ${token}` }
       },
       'Impossible de charger l’historique des notifications'
+    );
+  },
+
+  // Order Tracker Status Change Notification Preferences
+  async updateOrderTrackerNotifications(
+    token: string,
+    orderId: string,
+    payload: {
+      pushAlerts?: boolean;
+      emailAlerts?: boolean;
+      sendTestStatusAlert?: boolean;
+    }
+  ): Promise<{
+    success: boolean;
+    orderId: string;
+    orderNumber: string;
+    orderTrackerPushAlerts: boolean;
+    orderTrackerEmailAlerts: boolean;
+    notificationResult?: any;
+  }> {
+    return fetchJson(
+      `/api/orders/${encodeURIComponent(orderId)}/tracker-notifications`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de la mise à jour des alertes Order Tracker'
+    );
+  },
+
+  // ==========================================================================
+  // REAL MONCASH (+509 48 03 9151) & NATCASH (+509 55964606) OCR PAYMENT,
+  // ANTI-FRAUD, IDEMPOTENCY, ANTI-REPLAY & ATOMIC WALLET CREDIT CLIENT
+  // ==========================================================================
+
+  async issuePaymentSecurityNonce(
+    token: string,
+    payload?: {
+      paymentRequestId?: string;
+      operationType?: PaymentIdempotentOperationType;
+    }
+  ): Promise<{
+    success: boolean;
+    nonce: string;
+    requestId: string;
+    serverTimestamp: number;
+    expiresAt: string;
+    ttlSeconds: number;
+  }> {
+    return fetchJson(
+      '/api/payments/security/nonce',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload || {})
+      },
+      'Erreur génération jeton anti-replay'
+    );
+  },
+
+  async getActivePaymentRequest(
+    token: string,
+    filters?: { packageId?: string; purpose?: 'service_order' | 'wallet_topup' }
+  ): Promise<{
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    activeRequest: PaymentRequestRecord | null;
+    securityToken: {
+      nonce: string;
+      requestId: string;
+      serverTimestamp: number;
+      expiresAt: string;
+      ttlSeconds: number;
+    };
+  }> {
+    const params = new URLSearchParams();
+    if (filters?.packageId) params.set('packageId', filters.packageId);
+    if (filters?.purpose) params.set('purpose', filters.purpose);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return fetchJson(
+      `/api/payments/requests/active${qs}`,
+      {
+        headers: getAuthHeaders(token)
+      },
+      'Erreur lors de la récupération de la demande de paiement active'
+    );
+  },
+
+  async getMyPaymentRequests(token: string): Promise<{
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    requests: PaymentRequestRecord[];
+    auditLogs: PaymentAuditLogEntry[];
+  }> {
+    return fetchJson(
+      '/api/payments/requests/my',
+      {
+        headers: getAuthHeaders(token)
+      },
+      'Erreur chargement de vos demandes de paiement'
+    );
+  },
+
+  async getPaymentRequestById(
+    token: string,
+    requestId: string
+  ): Promise<{
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    paymentRequest: PaymentRequestRecord;
+    auditLogs: PaymentAuditLogEntry[];
+    securityToken: {
+      nonce: string;
+      requestId: string;
+      serverTimestamp: number;
+      expiresAt: string;
+      ttlSeconds: number;
+    };
+  }> {
+    return fetchJson(
+      `/api/payments/requests/${encodeURIComponent(requestId)}`,
+      {
+        headers: getAuthHeaders(token)
+      },
+      'Demande de paiement introuvable'
+    );
+  },
+
+  async createOrResumePaymentRequest(
+    token: string,
+    payload: {
+      paymentMethod: 'moncash' | 'natcash';
+      purpose: 'service_order' | 'wallet_topup';
+      packageId?: string;
+      gameId?: string;
+      serviceId?: string;
+      playerId?: string;
+      playerName?: string;
+      serverId?: string;
+      region?: string;
+      gameProfileData?: Record<string, string>;
+      amountUsd?: number;
+      forceNew?: boolean;
+      idempotencyKey: string;
+      requestId?: string;
+      nonce?: string;
+      clientTimestamp?: number;
+    }
+  ): Promise<{
+    resumedExisting: boolean;
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    paymentRequest: PaymentRequestRecord;
+    idempotent_replay?: boolean;
+    idempotency_key?: string;
+    securityToken?: {
+      nonce: string;
+      requestId: string;
+      serverTimestamp: number;
+      expiresAt: string;
+      ttlSeconds: number;
+    };
+  }> {
+    return fetchJson(
+      '/api/payments/requests',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': payload.idempotencyKey,
+          ...(payload.requestId ? { 'X-Request-Id': payload.requestId } : {}),
+          ...(payload.nonce ? { 'X-Payment-Nonce': payload.nonce } : {}),
+          'X-Client-Timestamp': String(payload.clientTimestamp || Date.now()),
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de l’initialisation de la demande de paiement'
+    );
+  },
+
+  async selectPaymentRequestMethod(
+    token: string,
+    requestId: string,
+    paymentMethod: 'moncash' | 'natcash'
+  ): Promise<{
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    paymentRequest: PaymentRequestRecord;
+    securityToken?: any;
+  }> {
+    return fetchJson(
+      `/api/payments/requests/${encodeURIComponent(requestId)}/select-method`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify({ paymentMethod })
+      },
+      'Erreur lors du changement de méthode de paiement'
+    );
+  },
+
+  async confirmPaymentNumberCopied(
+    token: string,
+    requestId: string,
+    copiedText: string
+  ): Promise<{
+    officialNumbers: Record<'moncash' | 'natcash', string>;
+    paymentRequest: PaymentRequestRecord;
+    securityToken?: any;
+  }> {
+    return fetchJson(
+      `/api/payments/requests/${encodeURIComponent(requestId)}/confirm-copy`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify({ copiedText })
+      },
+      'Erreur lors de la validation de la copie du numéro'
+    );
+  },
+
+  async uploadPaymentProofScreenshot(
+    token: string,
+    requestId: string,
+    payload: {
+      imageDataUrl: string;
+      fileName?: string;
+      idempotencyKey: string;
+      requestId?: string;
+      nonce?: string;
+      clientTimestamp?: number;
+    }
+  ): Promise<{
+    success: boolean;
+    transcodeDetected: boolean;
+    detectedTranscodeLength: number | null;
+    paymentRequest: PaymentRequestRecord;
+    idempotent_replay?: boolean;
+    securityToken?: {
+      nonce: string;
+      requestId: string;
+      serverTimestamp: number;
+      expiresAt: string;
+      ttlSeconds: number;
+    };
+  }> {
+    return fetchJson(
+      `/api/payments/requests/${encodeURIComponent(requestId)}/upload-proof`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': payload.idempotencyKey,
+          ...(payload.requestId ? { 'X-Request-Id': payload.requestId } : {}),
+          ...(payload.nonce ? { 'X-Payment-Nonce': payload.nonce } : {}),
+          'X-Client-Timestamp': String(payload.clientTimestamp || Date.now()),
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de l’analyse OCR de la preuve de paiement'
+    );
+  },
+
+  async verifyPaymentTranscodeAndCredit(
+    token: string,
+    requestId: string,
+    payload: {
+      enteredTranscode: string;
+      idempotencyKey: string;
+      requestId?: string;
+      nonce?: string;
+      clientTimestamp?: number;
+      twoFactorVerificationToken?: string;
+      twoFactorChallengeId?: string;
+      twoFactorCode?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    credited: boolean;
+    alreadyProcessed?: boolean;
+    twoFactorRequired?: boolean;
+    twoFactorBlocked?: boolean;
+    errorCode?: string;
+    decision: 'AUTO_APPROVED' | 'MANUAL_REVIEW' | 'AUTO_REJECTED' | 'PENDING';
+    status: 'pending' | 'credited' | 'rejected' | 'refunded' | 'manual_review';
+    reasonCode?: string;
+    message: string;
+    anomalies?: string[];
+    redirectToHome: boolean;
+    transaction?: PaymentTransaction;
+    paymentRequest: PaymentRequestRecord;
+    walletBalance: number;
+    user?: AppUser;
+    idempotent_replay?: boolean;
+  }> {
+    const { res, text } = await fetchWithWarmupRetry(
+      `/api/payments/requests/${encodeURIComponent(requestId)}/verify-transcode`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': payload.idempotencyKey,
+          ...(payload.requestId ? { 'X-Request-Id': payload.requestId } : {}),
+          ...(payload.nonce ? { 'X-Payment-Nonce': payload.nonce } : {}),
+          ...(payload.twoFactorVerificationToken
+            ? { 'X-2FA-Verification-Token': payload.twoFactorVerificationToken }
+            : {}),
+          ...(payload.twoFactorChallengeId
+            ? { 'X-2FA-Challenge-Id': payload.twoFactorChallengeId }
+            : {}),
+          ...(payload.twoFactorCode ? { 'X-2FA-Code': payload.twoFactorCode } : {}),
+          'X-Client-Timestamp': String(payload.clientTimestamp || Date.now()),
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload)
+      }
+    );
+    const data = text ? JSON.parse(text) : {};
+    if (
+      !res.ok &&
+      res.status !== 422 &&
+      res.status !== 202 &&
+      res.status !== 409 &&
+      res.status !== 403
+    ) {
+      throw new Error(data.message || data.error || 'Erreur lors de la vérification du Transcode');
+    }
+    return data;
+  },
+
+  async requestWallet2FAChallenge(
+    token: string,
+    payload: {
+      operationType: 'wallet_credit' | 'wallet_withdrawal';
+      channel: 'sms' | 'email';
+      paymentRequestId?: string;
+      amount: number;
+      currency?: string;
+      destinationOverride?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    challengeId: string;
+    operationType: 'wallet_credit' | 'wallet_withdrawal';
+    channel: 'sms' | 'email';
+    maskedDestination: string;
+    amount: number;
+    currency: string;
+    expiresAt: string;
+    expiresInSeconds: number;
+    maxAttempts: number;
+    deliverySummary: string;
+    demoCode?: string;
+  }> {
+    return fetchJson(
+      '/api/wallet/2fa/challenge',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de l’envoi du code 2FA SMS/Email'
+    );
+  },
+
+  async verifyWallet2FAChallenge(
+    token: string,
+    payload: {
+      challengeId: string;
+      code: string;
+    }
+  ): Promise<{
+    verified: boolean;
+    twoFactorBlocked?: boolean;
+    errorCode?: string;
+    message: string;
+    verificationToken?: string;
+    remainingAttempts?: number;
+    challenge?: {
+      id: string;
+      operationType: 'wallet_credit' | 'wallet_withdrawal';
+      channel: 'sms' | 'email';
+      maskedDestination: string;
+      amount: number;
+      currency: string;
+      status: string;
+      verifiedAt?: string;
+    };
+  }> {
+    const { res, text } = await fetchWithWarmupRetry('/api/wallet/2fa/verify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(token)
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok && res.status !== 403) {
+      throw new Error(data.message || data.error || 'Erreur lors de la vérification du code 2FA');
+    }
+    return data;
+  },
+
+  async withdrawWalletFunds(
+    token: string,
+    payload: {
+      amount: number;
+      currency?: string;
+      payoutMethod: 'moncash' | 'natcash';
+      destinationPhone: string;
+      idempotencyKey: string;
+      twoFactorVerificationToken?: string;
+      twoFactorChallengeId?: string;
+      twoFactorCode?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    withdrawn: boolean;
+    twoFactorRequired?: boolean;
+    twoFactorBlocked?: boolean;
+    errorCode?: string;
+    message: string;
+    walletBalance: number;
+    user?: AppUser;
+    paymentTransaction?: PaymentTransaction;
+  }> {
+    const { res, text } = await fetchWithWarmupRetry('/api/wallet/withdraw', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': payload.idempotencyKey,
+        ...(payload.twoFactorVerificationToken
+          ? { 'X-2FA-Verification-Token': payload.twoFactorVerificationToken }
+          : {}),
+        ...(payload.twoFactorChallengeId
+          ? { 'X-2FA-Challenge-Id': payload.twoFactorChallengeId }
+          : {}),
+        ...(payload.twoFactorCode ? { 'X-2FA-Code': payload.twoFactorCode } : {}),
+        'X-Client-Timestamp': String(Date.now()),
+        ...getAuthHeaders(token)
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok && res.status !== 403 && res.status !== 400 && res.status !== 409) {
+      throw new Error(data.message || data.error || 'Erreur lors du retrait Wallet');
+    }
+    return data;
+  },
+
+  async generateSamplePaymentReceiptImage(
+    token: string,
+    requestId: string,
+    payload?: {
+      scenario?: 'valid' | 'wrong_amount' | 'wrong_method' | 'manipulated_image';
+      customTranscode?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    scenario: string;
+    imageDataUrl: string;
+    sampleTranscodeForUserEntry: string;
+    transcodeLength: number;
+    receiptSummary: {
+      method: 'moncash' | 'natcash';
+      recipientNumber: string;
+      amountUsd: number;
+      amountHtg: number;
+      dateTime: string;
+    };
+  }> {
+    return fetchJson(
+      `/api/payments/requests/${encodeURIComponent(requestId)}/generate-receipt-image`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify(payload || { scenario: 'valid' })
+      },
+      'Erreur lors de la génération du reçu de test OCR'
+    );
+  },
+
+  async runPaymentConcurrencyAndReplaySelfTest(
+    token: string,
+    concurrentRequests = 25
+  ): Promise<{
+    allPassed: boolean;
+    summary: {
+      concurrentRequestsSent: number;
+      uniquePaymentRequestsCreated: number;
+      timesWalletCredited: number;
+      expectedDeltaUsd: number;
+      actualDeltaUsdDuringTest: number;
+      expiredReplayBlockedStatus: number;
+      idempotencyKeyMismatchBlockedStatus: number;
+      irreversibleStateProtected: boolean;
+      finalRefundedLockState: string;
+    };
+  }> {
+    return fetchJson(
+      '/api/payments/security/concurrency-self-test',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-PlayUp-Concurrency-Selftest': 'true',
+          ...getAuthHeaders(token)
+        },
+        body: JSON.stringify({ concurrentRequests })
+      },
+      'Erreur lors du test de concurrence et anti-replay'
     );
   }
 };

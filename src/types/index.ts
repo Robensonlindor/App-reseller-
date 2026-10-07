@@ -1,5 +1,43 @@
-export type OrderStatus = 'pending' | 'paid' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'refunded';
-export type PaymentStatus = 'unconfigured' | 'pending' | 'paid' | 'failed';
+export type PaymentLifecycleStatus =
+  | 'payment_pending'
+  | 'payment_processing'
+  | 'payment_verified'
+  | 'payment_succeeded'
+  | 'payment_failed'
+  | 'payment_cancelled'
+  | 'payment_refunded';
+
+export type RefundLifecycleStatus =
+  | 'none'
+  | 'refund_pending'
+  | 'refunded'
+  | 'refund_failed';
+
+export type OrderLifecycleStatus =
+  | PaymentLifecycleStatus
+  | 'order_pending'
+  | 'sent_to_rechargegames'
+  | 'order_delivered'
+  | 'order_failed'
+  | 'manual_review';
+
+export type OrderStatus =
+  | 'pending'
+  | 'paid'
+  | 'processing'
+  | 'sent_to_rechargegames'
+  | 'completed'
+  | 'delivered'
+  | 'failed'
+  | 'manual_review'
+  | 'cancelled'
+  | 'refunded'
+  | PaymentLifecycleStatus
+  | 'order_pending'
+  | 'order_delivered'
+  | 'order_failed';
+
+export type PaymentStatus = 'unconfigured' | 'pending' | 'paid' | 'failed' | PaymentLifecycleStatus;
 export type ServiceCategory = 'diamonds' | 'uc' | 'points' | 'robux' | 'coins' | 'pass' | 'voucher';
 
 export type ProviderEnvironment = 'production' | 'sandbox';
@@ -374,7 +412,17 @@ export interface Order {
   supplierCost: number;        // GoXtop cost
   margin: number;              // PlayUp margin
   currency: string;
-  status: OrderStatus;         // pending | paid | processing | completed | failed | cancelled | refunded
+  status: OrderStatus;         // pending | paid | processing | completed | failed | cancelled | refunded | manual_review
+  payment_status?: PaymentLifecycleStatus;
+  lifecycle_status?: OrderLifecycleStatus;
+  refund_status?: RefundLifecycleStatus;
+  user_status_message?: string;
+  dispatch_status?: 'awaiting_payment' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
+  retry_count?: number;
+  max_retries?: number;
+  next_retry_at?: string | null;
+  last_real_status_check_at?: string;
+  last_real_status_observed?: string;
   paymentMethod?: PaymentMethodType;
   paymentTransactionId?: string;
   paymentReference?: string;
@@ -387,6 +435,8 @@ export interface Order {
   createdAt: string;
   updatedAt: string;
   statusHistory: OrderStatusHistoryItem[];
+  orderTrackerPushAlerts?: boolean;
+  orderTrackerEmailAlerts?: boolean;
 }
 
 export interface Transaction {
@@ -485,6 +535,8 @@ export interface AppUser {
   twoFactorEnabled: boolean;
   emailNotifications: boolean;
   pushNotificationsEnabled?: boolean;
+  orderTrackerPushAlerts?: boolean;
+  orderTrackerEmailAlerts?: boolean;
   walletBalance: number;
   ordersCount: number;
   totalSpent: number;
@@ -526,7 +578,24 @@ export interface PaymentTransaction {
   currency: string;
   feeAmount: number;
   totalCharged: number;
-  status: 'initiated' | 'authorized' | 'completed' | 'failed' | 'refunded';
+  status:
+    | PaymentLifecycleStatus
+    | 'initiated'
+    | 'authorized'
+    | 'completed'
+    | 'credited'
+    | 'rejected'
+    | 'manual_review'
+    | 'failed'
+    | 'cancelled'
+    | 'refunded';
+  payment_status?: PaymentLifecycleStatus;
+  credit_status?: PaymentFinalCreditStatus;
+  payment_request_id?: string;
+  transcode?: string;
+  proof_hash?: string;
+  proof_preview_url?: string;
+  anti_fraud_decision?: PaymentAntiFraudDecision;
   externalReference?: string;
   payerIdentifier?: string; // e.g. masked card last4 or MonCash/NatCash phone number
   statusMessage: string;
@@ -534,12 +603,74 @@ export interface PaymentTransaction {
   updatedAt: string;
 }
 
+export interface RefundRecord {
+  id: string;
+  refund_id?: string;
+  orderId: string;
+  buyerRef: string;
+  userId: string;
+  userEmail?: string;
+  amount: number;
+  currency: string;
+  reason: string;
+  admin_id?: string;
+  adminEmail?: string;
+  refundMethod?: PaymentMethodType | string;
+  ruleApplied: 'order_definitively_failed' | 'provider_confirmed_refunded' | 'playup_policy_refund' | 'admin_manual_approval';
+  status: 'refund_pending' | 'refunded' | 'refund_failed' | 'completed' | 'pending' | 'failed';
+  refund_status?: RefundLifecycleStatus;
+  paymentTransactionReference?: string;
+  refundTransactionReference: string;
+  createdAt: string;
+  confirmedAt?: string;
+}
+
+export interface ManualPaymentValidationRecord {
+  id: string;
+  order_id: string;
+  buyer_ref: string;
+  admin_id: string;
+  admin_email?: string;
+  amount: number;
+  currency: string;
+  previous_status: string;
+  new_status: string;
+  payment_status: 'payment_verified';
+  provider_order_id?: string;
+  timestamp: string;
+  note?: string;
+}
+
+export interface OrderRetryAttemptRecord {
+  id: string;
+  order_id: string;
+  buyer_ref: string;
+  attempt_number: number;
+  trigger_type: 'automatic' | 'manual_admin';
+  admin_id?: string;
+  timestamp: string;
+  reason: string;
+  status: 'succeeded' | 'failed' | 'blocked_already_executed' | 'escalated_manual_review';
+  result: string;
+  real_status_checked_before: boolean;
+  observed_provider_status?: string;
+  next_retry_delay_minutes?: number | null;
+  next_retry_at?: string | null;
+}
+
 // ============================================================================
 // RECHARGEGAMES OFFICIAL INTEGRATION DATA STRUCTURES
 // ============================================================================
 
 export type RechargeGamesMode = 'TEST' | 'PRODUCTION';
-export type RechargeGamesOrderStatus = 'pending' | 'delivered' | 'failed' | 'refunded';
+export type RechargeGamesOrderStatus =
+  | 'pending'
+  | 'order_pending'
+  | 'sent_to_rechargegames'
+  | 'delivered'
+  | 'failed'
+  | 'refunded'
+  | 'manual_review';
 
 /**
  * Table: products (RechargeGames synchronized catalog)
@@ -586,19 +717,35 @@ export interface RechargeGamesOrderRecord {
   customer_price: number;     // Final PlayUp price charged to customer
   profit: number;             // customer_price - provider_price
   currency: string;           // 'USD'
-  status: RechargeGamesOrderStatus; // 'pending' | 'delivered' | 'failed' | 'refunded'
+  status: RechargeGamesOrderStatus; // 'pending' | 'order_pending' | 'sent_to_rechargegames' | 'delivered' | 'failed' | 'refunded' | 'manual_review'
+  payment_status?: PaymentLifecycleStatus;
+  lifecycle_status?: OrderLifecycleStatus;
+  refund_status?: RefundLifecycleStatus;
+  user_status_message?: string;
+  dispatch_status?: 'awaiting_payment' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
+  quantity?: number;
   test_mode: boolean;         // true if created in TEST mode
   payment_method?: string;
   payment_reference?: string;
+  payment_transaction_id?: string;
+  validated_by_admin_id?: string;
+  validated_at?: string;
   created_at: string;
   updated_at: string;
   delivered_at?: string;
   refunded_at?: string;
   refund_reason?: string;
   refund_transaction_id?: string;
+  refund_admin_id?: string;
   failure_reason?: string;
   poll_attempts?: number;
   last_polled_at?: string;
+  retry_count?: number;
+  max_retries?: number;
+  next_retry_at?: string | null;
+  last_retry_at?: string;
+  real_status_verified_before_manual_retry_at?: string;
+  real_status_verified_value?: string;
 }
 
 /**
@@ -761,6 +908,393 @@ export interface AppPackageMetadata {
   exists: boolean;
   publishedAt: string;
 }
+
+// ============================================================================
+// REAL MONCASH & NATCASH OCR PAYMENT WORKFLOW & ANTI-FRAUD ENGINE TYPES
+// ============================================================================
+
+export const PLAYUP_OFFICIAL_PAYMENT_NUMBERS: Record<'moncash' | 'natcash', string> = {
+  moncash: '+509 48 03 9151',
+  natcash: '+509 55964606'
+};
+
+export type PaymentFinalCreditStatus =
+  | 'pending'
+  | 'verifying'
+  | 'verified'
+  | 'credited'
+  | 'rejected'
+  | 'refunded'
+  | 'manual_review';
+
+export type PaymentAntiFraudDecision =
+  | 'PENDING'
+  | 'AUTO_APPROVED'
+  | 'MANUAL_REVIEW'
+  | 'AUTO_REJECTED';
+
+export type PaymentRequestStage =
+  | 'select_method'
+  | 'awaiting_copy'
+  | 'countdown_active'
+  | 'awaiting_proof'
+  | 'proof_analyzed'
+  | 'verifying'
+  | 'verified'
+  | 'credited'
+  | 'manual_review'
+  | 'rejected';
+
+export interface PaymentProofOcrExtraction {
+  success: boolean;
+  engineUsed: string;
+  rawText: string;
+  detectedTranscode: string | null;
+  detectedTranscodeLength: number | null;
+  detectedAmount: number | null;
+  detectedCurrency: 'USD' | 'HTG' | null;
+  detectedMethod: 'moncash' | 'natcash' | 'unknown';
+  detectedRecipientNumber: string | null;
+  detectedDateTime: string | null;
+  detectedSenderPhone: string | null;
+  detectedReferenceInfo: string | null;
+  confidence: number;
+}
+
+export interface PaymentProofForensicAnalysis {
+  sha256Hash: string;
+  perceptualHash: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  width?: number;
+  height?: number;
+  isManipulatedOrEdited: boolean;
+  editingSoftwareDetected?: string;
+  missingTransactionElements: string[];
+  visualAnomalies: string[];
+  isDuplicateProof: boolean;
+  duplicateOfRequestId?: string;
+  duplicateOfTransactionId?: string;
+}
+
+export interface PaymentRequestRecord {
+  id: string;
+  user_id: string;
+  user_email: string;
+  purpose: 'service_order' | 'wallet_topup';
+  order_id?: string;
+  partner_order_id?: string;
+  game_id?: string;
+  game_name?: string;
+  service_id?: string;
+  service_name?: string;
+  package_id?: string;
+  package_name?: string;
+  product_key?: string;
+  region?: string;
+  player_id?: string;
+  player_name?: string;
+  server_id?: string;
+  game_profile_data?: Record<string, string>;
+  payment_method: 'moncash' | 'natcash';
+  recipient_number: string;
+  expected_amount: number;
+  expected_amount_htg: number;
+  currency: string;
+  stage: PaymentRequestStage;
+  status: PaymentFinalCreditStatus;
+  idempotency_key?: string;
+  request_hash?: string;
+  expires_at?: string;
+  number_copied: boolean;
+  copied_at?: string;
+  countdown_duration_seconds: number;
+  countdown_ends_at?: string;
+  countdown_remaining_seconds?: number;
+  countdown_completed: boolean;
+  proof_uploaded: boolean;
+  proof_uploaded_at?: string;
+  proof_hash?: string;
+  proof_perceptual_hash?: string;
+  proof_file_path?: string;
+  proof_preview_data_url?: string;
+  ocr_extraction?: Omit<PaymentProofOcrExtraction, 'detectedTranscode'> & {
+    detectedTranscode?: string;
+    transcodeMasked?: string;
+    transcodeDetected: boolean;
+  };
+  forensic_analysis?: PaymentProofForensicAnalysis;
+  detected_transcode_length?: number;
+  entered_transcode?: string;
+  transcode?: string;
+  anti_fraud_score?: number;
+  anti_fraud_decision: PaymentAntiFraudDecision;
+  rejection_reason?: string;
+  user_message?: string;
+  credited_transaction_id?: string;
+  credited_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Table 2: "payment_proofs" (Preuves reçues uniquement — jamais un paiement validé)
+ * Contraintes: UNIQUE(file_hash), UNIQUE(transcode) WHERE verification_status IN ('verified', 'credited')
+ */
+export interface PaymentProofRecord {
+  id: string;
+  payment_request_id: string;
+  user_id: string;
+  file_hash: string;
+  perceptual_hash?: string | null;
+  transcode: string | null;
+  detected_amount: number | null;
+  detected_method: string | null;
+  detected_datetime: string | null;
+  ocr_result: string;
+  fraud_score: number;
+  verification_status: 'received' | 'pending' | 'verifying' | 'verified' | 'credited' | 'rejected' | 'manual_review';
+  rejection_reason?: string | null;
+  created_at: string;
+}
+
+/**
+ * Table 3: "validated_payments" (Paiements réellement validés — séparés des preuves reçues)
+ * Contraintes: UNIQUE(payment_request_id), UNIQUE(payment_proof_id), UNIQUE(transcode), UNIQUE(payment_method, transcode)
+ */
+export interface ValidatedPaymentRecord {
+  id: string;
+  payment_request_id: string;
+  payment_proof_id: string;
+  user_id: string;
+  payment_method: 'moncash' | 'natcash';
+  transcode: string;
+  validated_amount: number;
+  currency: string;
+  validation_source: 'ocr_antifraud' | 'manual_admin';
+  validated_by_user_id: string | null;
+  status: 'validated' | 'credited' | 'refunded' | 'revoked';
+  validated_at: string;
+  created_at: string;
+}
+
+/**
+ * Table 4: "idempotency_keys"
+ * Contrainte: UNIQUE(user_id, endpoint, idempotency_key)
+ */
+export interface IdempotencyKeyRecord {
+  id: string;
+  user_id: string;
+  endpoint: string;
+  idempotency_key: string;
+  request_hash: string;
+  response_status: number | null;
+  response_body: string | null;
+  resource_id: string | null;
+  status: 'processing' | 'completed' | 'failed';
+  expires_at: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+/**
+ * Table 5: "wallet_transactions"
+ * Contraintes: UNIQUE(idempotency_key), UNIQUE(reference), partial UNIQUE per payment_request_id & validated_payment_id
+ */
+export type WalletTransactionType = 'deposit' | 'debit' | 'refund' | 'adjustment';
+
+export interface WalletTransactionRecord {
+  id: string;
+  user_id: string;
+  payment_request_id: string | null;
+  validated_payment_id?: string | null;
+  type: WalletTransactionType;
+  amount: number;
+  currency: string;
+  status: 'pending' | 'completed' | 'failed' | 'reversed';
+  idempotency_key: string;
+  reference: string;
+  created_at: string;
+}
+
+/**
+ * Table 6: "audit_logs"
+ */
+export interface AuditLogRecord {
+  id: string;
+  user_id: string | null;
+  payment_request_id?: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  idempotency_key: string | null;
+  request_id: string | null;
+  ip: string | null;
+  user_agent: string | null;
+  metadata: string;
+  created_at: string;
+}
+
+export interface WalletLedgerReconciliation {
+  user_id: string;
+  current_wallet_balance: number;
+  reconciled_ledger_balance: number;
+  is_consistent: boolean;
+  total_deposits: number;
+  total_debits: number;
+  total_refunds: number;
+  total_adjustments: number;
+  transactions_count: number;
+  transactions: WalletTransactionRecord[];
+}
+
+export type PaymentAuditEventType =
+  | 'PAYMENT_CREATED'
+  | 'METHOD_SELECTED'
+  | 'NUMBER_COPIED'
+  | 'PROOF_UPLOADED'
+  | 'OCR_COMPLETED'
+  | 'TRANSCODE_DETECTED'
+  | 'AMOUNT_DETECTED'
+  | 'TRANSCODE_COMPARED'
+  | 'ANTIFRAUD_RESULT'
+  | 'PAYMENT_VALIDATED'
+  | 'PAYMENT_REJECTED'
+  | 'PAYMENT_MANUAL_REVIEW'
+  | 'WALLET_CREDITED'
+  | 'PAYMENT_REFUNDED'
+  | 'IDEMPOTENT_REPLAY_RETURNED'
+  | 'REPLAY_ATTACK_BLOCKED'
+  | 'RATE_LIMIT_EXCEEDED'
+  | 'INVALID_STATE_TRANSITION_BLOCKED'
+  | 'CONCURRENT_LOCK_CONTENTION'
+  | 'WALLET_2FA_CHALLENGE_ISSUED'
+  | 'WALLET_2FA_VERIFIED'
+  | 'WALLET_2FA_FAILED'
+  | 'WALLET_WITHDRAWAL_COMPLETED';
+
+export type PaymentIdempotentOperationType =
+  | 'payment_creation'
+  | 'method_selection'
+  | 'number_copy'
+  | 'proof_upload'
+  | 'payment_verification'
+  | 'wallet_credit'
+  | 'wallet_withdrawal'
+  | 'payment_refund';
+
+export type Wallet2FAChannel = 'sms' | 'email';
+export type Wallet2FAOperationType = 'wallet_credit' | 'wallet_withdrawal';
+
+export interface Wallet2FAChallengeRecord {
+  id: string;
+  user_id: string;
+  operation_type: Wallet2FAOperationType;
+  channel: Wallet2FAChannel;
+  destination: string;
+  masked_destination: string;
+  payment_request_id: string | null;
+  amount: number;
+  currency: string;
+  code_hash: string;
+  status: 'pending' | 'verified' | 'consumed' | 'expired' | 'locked';
+  attempts: number;
+  max_attempts: number;
+  verification_token: string | null;
+  expires_at: string;
+  verified_at: string | null;
+  consumed_at: string | null;
+  created_at: string;
+}
+
+export interface PaymentIdempotencyRecord {
+  idempotency_key: string;
+  operation_type: PaymentIdempotentOperationType;
+  user_id: string;
+  payment_request_id?: string;
+  request_id: string;
+  nonce?: string;
+  payload_hash: string;
+  status: 'in_progress' | 'completed' | 'failed';
+  http_status: number;
+  response_json: string;
+  created_at: string;
+  completed_at?: string;
+  expires_at: string;
+  replay_count: number;
+}
+
+export interface PaymentSecurityNonceRecord {
+  nonce: string;
+  user_id: string;
+  payment_request_id?: string;
+  operation_type: PaymentIdempotentOperationType;
+  request_id: string;
+  idempotency_key: string;
+  client_timestamp: number;
+  server_timestamp: number;
+  ip_address: string;
+  consumed_at: string;
+  expires_at: string;
+}
+
+export interface PaymentSecurityRateLimitLog {
+  id: string;
+  user_id?: string;
+  ip_address: string;
+  session_id?: string;
+  api_key_id?: string;
+  endpoint: string;
+  bucket_type: 'user' | 'ip' | 'session' | 'endpoint' | 'api_key';
+  request_count: number;
+  limit_max: number;
+  window_ms: number;
+  blocked: boolean;
+  created_at: string;
+}
+
+export interface PaymentAuditLogEntry {
+  id: string;
+  payment_request_id: string;
+  user_id: string;
+  user_email?: string;
+  order_id?: string;
+  event_type: PaymentAuditEventType;
+  payment_method?: 'moncash' | 'natcash';
+  expected_amount?: number;
+  detected_amount?: number | null;
+  detected_transcode_masked?: string;
+  entered_transcode_masked?: string;
+  proof_hash?: string;
+  anti_fraud_decision?: PaymentAntiFraudDecision;
+  status_after?: string;
+  summary: string;
+  details?: Record<string, any>;
+  immutable_hash: string;
+  created_at: string;
+}
+
+export interface AntiFraudIncidentRecord {
+  id: string;
+  payment_request_id: string;
+  user_id: string;
+  user_email?: string;
+  payment_method: 'moncash' | 'natcash';
+  expected_amount: number;
+  detected_amount?: number | null;
+  detected_transcode?: string | null;
+  entered_transcode?: string | null;
+  proof_hash?: string;
+  duplicate_of_request_id?: string;
+  risk_score: number;
+  decision: PaymentAntiFraudDecision;
+  reason_code: string;
+  reason_message: string;
+  anomalies: string[];
+  created_at: string;
+}
+
+
 
 
 

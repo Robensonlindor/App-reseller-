@@ -2,6 +2,7 @@ import React from 'react';
 import { ShieldCheck, Zap, Download, Terminal, Mail, Phone } from 'lucide-react';
 import { Language, translations } from '../../i18n';
 import { AppUser } from '../../types';
+import { PlayUpSiteLogo } from '../common/PlayUpSiteLogo';
 
 interface FooterProps {
   onNavigate: (tab: string) => void;
@@ -19,13 +20,8 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate, lang, authUser }) =>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-8 mb-12">
           {/* Col 1: Identity */}
           <div className="space-y-4 md:col-span-1">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-orange-600 flex items-center justify-center text-white font-black text-lg">
-                P
-              </div>
-              <span className="font-display font-extrabold text-white text-lg tracking-tight">
-                PlayUp <span className="text-orange-500 font-semibold text-base">Reseller</span>
-              </span>
+            <div className="flex items-center">
+              <PlayUpSiteLogo className="w-12 h-12" />
             </div>
             <p className="text-xs text-slate-400 leading-relaxed">
               Infrastructure centrale et API de distribution de monnaies gaming officielles. Connectivité directe aux éditeurs et passerelles de pointe.

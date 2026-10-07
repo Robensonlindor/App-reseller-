@@ -94,6 +94,9 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
   };
 
   const handleLogout = () => {
+    if (token) {
+      apiClient.logoutUser(token).catch(() => {});
+    }
     safeStorage.removeItem('playup_admin_token');
     safeStorage.removeItem('playup_user_token');
     safeStorage.removeItem('playup_user_profile');
@@ -336,7 +339,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       setNewResellerKeyModal(null);
       setAdminFeedback({
         type: 'success',
-        text: `Nouvelle clé API générée pour ${newResellerKeyModal.reseller.company} : ${created.key}`
+        text: `Nouvelle clé API générée pour ${newResellerKeyModal.reseller.company} (${created.maskedKey || 'Masquée'})`
       });
       loadAllAdminData();
     } catch (e: any) {
@@ -1112,7 +1115,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                     Gestion des Utilisateurs PlayUp
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Consultez les profils joueurs, ajustez leur portefeuille PlayUp Wallet, réinitialisez les mots de passe ou suspendez un compte.
+                    Consultez les profils joueurs, activez ou désactivez un compte utilisateur, ajustez leur portefeuille PlayUp Wallet ou modifiez votre propre mot de passe administrateur.
                   </p>
                 </div>
                 <input
@@ -1124,13 +1127,25 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                 />
               </div>
 
+              <div className="bg-slate-900 text-slate-200 rounded-2xl p-4 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="font-bold text-white flex items-center gap-1.5">
+                    <Shield className="w-4 h-4 text-orange-500" />
+                    <span>Politique de Sécurité — Premier Administrateur Unique</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Seul le premier utilisateur inscrit détient le rôle <strong className="text-orange-400">ADMIN</strong>. Tous les comptes suivants reçoivent automatiquement le rôle <strong className="text-white">USER</strong>. Les mots de passe, tokens privés, clés API et secrets d’environnement ne sont jamais affichés en clair.
+                  </p>
+                </div>
+              </div>
+
               <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-6 overflow-x-auto shadow-xs">
                 <table className="w-full text-left text-xs">
                   <thead>
                     <tr className="border-b border-slate-100 text-slate-400 font-semibold">
                       <th className="py-2.5 px-3">Utilisateur</th>
+                      <th className="py-2.5 px-3">Rôle Serveur (Immuable)</th>
                       <th className="py-2.5 px-3">Méthode Auth</th>
-                      <th className="py-2.5 px-3">Téléphone</th>
                       <th className="py-2.5 px-3">PlayUp Wallet</th>
                       <th className="py-2.5 px-3">Commandes / Dépensé</th>
                       <th className="py-2.5 px-3">Statut</th>
@@ -1143,14 +1158,25 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                         u =>
                           !userSearch ||
                           (u.name || '').toLowerCase().includes(userSearch.toLowerCase()) ||
-                          (u.email || '').toLowerCase().includes(userSearch.toLowerCase()) ||
-                          (u.phone && u.phone.toLowerCase().includes(userSearch.toLowerCase()))
+                          (u.email || '').toLowerCase().includes(userSearch.toLowerCase())
                       )
                       .map(u => (
                         <tr key={u.id} className="hover:bg-slate-50">
                           <td className="py-3 px-3">
                             <div className="font-bold text-slate-900">{u.name}</div>
                             <div className="text-[11px] text-slate-500">{u.email}</div>
+                          </td>
+                          <td className="py-3 px-3">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                u.role === 'ADMIN'
+                                  ? 'bg-orange-100 text-orange-800 border border-orange-200'
+                                  : 'bg-slate-100 text-slate-700'
+                              }`}
+                            >
+                              <Lock className="w-2.5 h-2.5" />
+                              <span>{u.role === 'ADMIN' ? 'ADMIN (Unique)' : 'USER'}</span>
+                            </span>
                           </td>
                           <td className="py-3 px-3">
                             <span className="px-2 py-0.5 bg-slate-100 text-slate-700 rounded text-[10px] font-bold uppercase">
@@ -1161,9 +1187,6 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                                 2FA
                               </span>
                             )}
-                          </td>
-                          <td className="py-3 px-3 font-mono text-[11px] text-slate-600">
-                            {u.phone || '—'}
                           </td>
                           <td className="py-3 px-3 font-mono font-bold text-orange-600">
                             ${u.walletBalance.toFixed(2)} {u.preferredCurrency || 'USD'}
@@ -1185,22 +1208,26 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                             >
                               Wallet +/-
                             </button>
-                            <button
-                              onClick={() => setUserPasswordModal({ user: u, newPassword: '' })}
-                              className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold text-[11px]"
-                            >
-                              Mot de passe
-                            </button>
-                            <button
-                              onClick={() => handleToggleUserStatus(u)}
-                              className={`px-2.5 py-1 rounded-lg font-semibold text-[11px] ${
-                                u.status === 'active'
-                                  ? 'bg-red-50 text-red-700 hover:bg-red-100'
-                                  : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                              }`}
-                            >
-                              {u.status === 'active' ? 'Suspendre' : 'Activer'}
-                            </button>
+                            {u.role === 'ADMIN' ? (
+                              <button
+                                onClick={() => setUserPasswordModal({ user: u, newPassword: '' })}
+                                className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold text-[11px]"
+                                title="Modifier votre propre mot de passe administrateur"
+                              >
+                                Mon mot de passe
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => handleToggleUserStatus(u)}
+                                className={`px-2.5 py-1 rounded-lg font-semibold text-[11px] ${
+                                  u.status === 'active'
+                                    ? 'bg-red-50 text-red-700 hover:bg-red-100'
+                                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                                }`}
+                              >
+                                {u.status === 'active' ? 'Désactiver' : 'Activer'}
+                              </button>
+                            )}
                           </td>
                         </tr>
                       ))}

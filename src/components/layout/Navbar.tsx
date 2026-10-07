@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { Language, translations } from '../../i18n';
 import { AppUser } from '../../types';
+import { PlayUpSiteLogo } from '../common/PlayUpSiteLogo';
 
 interface NavbarProps {
   currentTab: string;
@@ -45,20 +46,14 @@ export const Navbar: React.FC<NavbarProps> = ({
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/80">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between h-16">
-          {/* Zone 1: Single text element wordmark */}
-          <div className="flex items-center gap-3">
+          {/* Zone 1: Exact PlayUp Logo placed at the top of the page without modification */}
+          <div className="flex items-center">
             <button 
               onClick={() => onNavigate('home')}
-              className="flex items-center gap-2 group text-left focus:outline-none"
+              className="flex items-center focus:outline-none transition-transform hover:scale-105"
+              aria-label="PlayUp Reseller"
             >
-              <div className="w-9 h-9 rounded-lg bg-orange-600 flex items-center justify-center text-white font-black text-xl tracking-tighter shadow-sm transition-transform group-hover:scale-105">
-                P
-              </div>
-              <div className="flex flex-col">
-                <span className="font-display font-extrabold text-lg tracking-tight text-slate-900 group-hover:text-orange-600 transition-colors">
-                  PlayUp <span className="text-orange-600 font-semibold text-base">Reseller</span>
-                </span>
-              </div>
+              <PlayUpSiteLogo className="w-12 h-12" />
             </button>
           </div>
 

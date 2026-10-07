@@ -4,7 +4,7 @@ import {
   Check, CheckCircle2, AlertCircle, RefreshCw, Smartphone, 
   CreditCard, ShieldCheck, Zap, Bell, ChevronRight, Search, 
   ExternalLink, Sparkles, Lock, Mail, Key, Wallet, LogOut, Settings,
-  Activity, Clock
+  Activity, Clock, X
 } from 'lucide-react';
 import {
   Game, Service, ServicePackage, Order, PlayerCheckResult, UserNotification,
@@ -20,6 +20,9 @@ import {
   requestAndSubscribePushNotifications
 } from '../../lib/pushNotifications';
 import { ProductPriceHistoryChart } from '../../components/ProductPriceHistoryChart';
+import { MonCashNatCashOcrPaymentFlow } from '../../components/MonCashNatCashOcrPaymentFlow';
+import { PlayUpSplashLogo } from '../../components/common/PlayUpSplashLogo';
+import { PlayUpSiteLogo } from '../../components/common/PlayUpSiteLogo';
 
 interface PlayUpMobileAppProps {
   games: Game[];
@@ -43,6 +46,17 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
 
   // Device frame toggle (Phone Frame vs Expanded View)
   const [deviceFrameMode, setDeviceFrameMode] = useState<boolean>(true);
+
+  // Dedicated Splash Screen state (displays only the exact PlayUp logo centered on the phone screen and disappears automatically after 2s)
+  const [showSplashScreen, setShowSplashScreen] = useState<boolean>(true);
+
+  useEffect(() => {
+    if (!showSplashScreen) return;
+    const timer = setTimeout(() => {
+      setShowSplashScreen(false);
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [showSplashScreen]);
 
   // Purchase Flow State
   const [selectedGame, setSelectedGame] = useState<Game | null>(null);
@@ -510,9 +524,52 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
       }
     }
 
+    // Rule 1: Run backend pre-payment validation (authenticated user, service, product, game/region, Player ID, server-side price)
+    const extractedPlayerId =
+      gameProfileInputs.playerId ||
+      gameProfileInputs.userId ||
+      gameProfileInputs.characterId ||
+      Object.values(gameProfileInputs)[0] ||
+      '';
+    const extractedServerId = gameProfileInputs.serverId || gameProfileInputs.zoneId || undefined;
+
+    setIsCheckingPlayer(true);
+    try {
+      const preVal = await apiClient.validateBeforePayment(
+        {
+          productKey: selectedPackage.productKey || selectedPackage.externalProductId,
+          packageId: selectedPackage.id,
+          gameId: selectedGame.id,
+          region: selectedPackage.region || selectedRegion,
+          playerId: String(extractedPlayerId),
+          serverId: extractedServerId ? String(extractedServerId) : undefined,
+          quantity: 1,
+          paymentMethod: selectedPaymentMethod
+        },
+        userToken
+      );
+
+      if (!preVal.valid) {
+        setOrderError(preVal.message || 'Validation avant paiement refusée par le serveur PlayUp.');
+        return;
+      }
+
+      if (preVal.playerVerificationStatus === 'NON SUPPORTÉ') {
+        setPlayerCheckResult({
+          supported: false,
+          verified: false,
+          status: 'NON SUPPORTÉ',
+          provider: 'RechargeGames',
+          message: preVal.message
+        });
+      }
+    } finally {
+      setIsCheckingPlayer(false);
+    }
+
     setOrderError(null);
     if (!pendingPartnerOrderId) {
-      setPendingPartnerOrderId(`PTNR-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`);
+      setPendingPartnerOrderId(`playup_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`);
     }
     setShowPaymentStep(true);
   };
@@ -525,13 +582,28 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setOrderError(null);
 
     try {
-      // 1. Process Payment through selected Payment Gateway (Card, MonCash, NatCash, or PlayUp Wallet)
+      const productKeyToUse = selectedPackage.productKey || selectedPackage.externalProductId || '';
+      const extractedPlayerId =
+        gameProfileInputs.playerId ||
+        gameProfileInputs.characterId ||
+        Object.values(gameProfileInputs)[0] ||
+        'VOUCHER_PIN';
+      const extractedServerId = gameProfileInputs.serverId || gameProfileInputs.zoneId;
+
+      // 1. Process Payment through selected Payment Gateway (Backend validates & calculates authoritative price, transitions payment_pending -> payment_processing -> payment_succeeded)
       const paymentRes = await apiClient.processPayment({
         userId: authUser?.id,
         paymentMethod: selectedPaymentMethod,
         amount: selectedPackage.publicPrice,
         currency: selectedPackage.currency || 'USD',
         purpose: 'order',
+        productKey: productKeyToUse || undefined,
+        packageId: selectedPackage.id,
+        gameId: selectedGame.id,
+        region: selectedPackage.region || selectedRegion,
+        playerId: String(extractedPlayerId),
+        serverId: extractedServerId,
+        quantity: 1,
         cardDetails: selectedPaymentMethod === 'card' ? {
           cardNumber,
           expiry: cardExpiry,
@@ -549,8 +621,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
         setAuthUser(paymentRes.user);
       }
 
-      // 2. Create PlayUp Order & Dispatch to RechargeGames (or GoXtop fallback) with verified payment reference
-      const productKeyToUse = selectedPackage.productKey || selectedPackage.externalProductId || '';
+      const confirmedPaymentStatus =
+        paymentRes.payment_status || paymentRes.transaction?.payment_status || 'payment_succeeded';
+      const isPaymentSucceeded = confirmedPaymentStatus === 'payment_succeeded';
+
+      // 2. Create PlayUp Order & Dispatch to RechargeGames ONLY when payment_succeeded is confirmed on backend
       const isRechargeGamesProduct =
         selectedPackage.providerSlug === 'rechargegames' ||
         rgCatalog.some(p => p.product_key === productKeyToUse);
@@ -561,16 +636,16 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
           userId: authUser?.id || 'usr_player_01',
           product_key: productKeyToUse,
           region: selectedPackage.region || selectedRegion,
-          player_id:
-            gameProfileInputs.playerId ||
-            gameProfileInputs.characterId ||
-            Object.values(gameProfileInputs)[0] ||
-            'VOUCHER_PIN',
+          player_id: extractedPlayerId,
           player_name: playerCheckResult?.verified ? playerCheckResult.playerName : gameProfileInputs.playerName,
-          server_id: gameProfileInputs.serverId || gameProfileInputs.zoneId,
-          paymentConfirmed: true,
+          server_id: extractedServerId,
+          quantity: 1,
+          buyer_ref: pendingPartnerOrderId || undefined,
+          paymentConfirmed: isPaymentSucceeded,
+          paymentStatus: confirmedPaymentStatus,
           paymentMethod: selectedPaymentMethod,
-          paymentReference: paymentRes.transaction.transactionReference
+          paymentReference: paymentRes.transaction.transactionReference,
+          paymentTransactionId: paymentRes.transaction.id
         });
         order = rgRes.playupOrder || {
           id: rgRes.order.id,
@@ -597,7 +672,18 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
           supplierCost: rgRes.order.provider_price,
           margin: rgRes.order.profit,
           currency: rgRes.order.currency,
-          status: 'pending',
+          status:
+            rgRes.order.status === 'delivered'
+              ? 'completed'
+              : rgRes.order.status === 'refunded'
+              ? 'refunded'
+              : rgRes.order.status === 'failed'
+              ? 'failed'
+              : 'pending',
+          payment_status: rgRes.order.payment_status || confirmedPaymentStatus,
+          lifecycle_status: rgRes.order.lifecycle_status || 'order_pending',
+          dispatch_status: rgRes.order.dispatch_status || 'sent',
+          user_status_message: rgRes.order.user_status_message || rgRes.message,
           paymentMethod: selectedPaymentMethod,
           paymentReference: paymentRes.transaction.transactionReference,
           providerId: 'prov_rechargegames',
@@ -607,9 +693,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
           updatedAt: rgRes.order.updated_at,
           statusHistory: [
             {
-              status: 'pending',
+              status: rgRes.order.lifecycle_status || 'order_pending',
               timestamp: rgRes.order.created_at,
-              note: `En traitement... (${rgRes.order.buyer_ref})`
+              note: rgRes.order.user_status_message || `En traitement... (${rgRes.order.buyer_ref})`
             }
           ]
         };
@@ -852,9 +938,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
           </button>
           <button
             onClick={onClose}
-            className="px-3 py-1 bg-white/10 hover:bg-white/20 rounded-lg text-white font-semibold transition-colors"
+            aria-label="Fermer l'application"
+            title="Fermer l'application"
+            className="w-8 h-8 flex items-center justify-center bg-white/10 hover:bg-white/20 rounded-full text-white font-semibold transition-colors cursor-pointer"
           >
-            Quitter le mode App ✕
+            <X className="w-4 h-4" />
           </button>
         </div>
       </div>
@@ -863,8 +951,15 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
       <div className={`w-full transition-all duration-300 ${
         deviceFrameMode 
           ? 'h-[calc(100dvh-44px)] sm:max-w-[420px] sm:h-[860px] sm:max-h-[92vh] sm:rounded-[44px] sm:border-[10px] sm:border-slate-900 shadow-2xl relative overflow-hidden bg-white flex flex-col sm:ring-1 sm:ring-slate-700/50' 
-          : 'max-w-2xl h-[calc(100dvh-44px)] sm:h-[92vh] sm:rounded-3xl sm:border sm:border-slate-700 shadow-2xl bg-white flex flex-col overflow-hidden'
+          : 'max-w-2xl h-[calc(100dvh-44px)] sm:h-[92vh] sm:rounded-3xl sm:border sm:border-slate-700 shadow-2xl relative bg-white flex flex-col overflow-hidden'
       }`}>
+        {/* PlayUp Official Splash Screen — Disappears automatically after 2 seconds without pressing any button */}
+        {showSplashScreen && (
+          <div className="absolute inset-0 z-50 bg-[#050302] flex items-center justify-center p-8 select-none pointer-events-none transition-opacity duration-300">
+            <PlayUpSplashLogo className="w-[78%] max-w-[300px] h-auto" />
+          </div>
+        )}
+
         {/* Phone Notch / Dynamic Island (Desktop simulator only) */}
         {deviceFrameMode && (
           <div className="hidden sm:flex w-full bg-slate-900 h-6 justify-center items-center shrink-0">
@@ -886,13 +981,8 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
               <span>Retour</span>
             </button>
           ) : (
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-orange-600 flex items-center justify-center text-white font-black text-sm">
-                P
-              </div>
-              <span className="font-display font-extrabold text-slate-900 text-lg tracking-tight">
-                Play<span className="text-orange-600">Up</span>
-              </span>
+            <div className="flex items-center">
+              <PlayUpSiteLogo className="w-10 h-10" />
             </div>
           )}
 
@@ -1087,6 +1177,102 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     </div>
                   </div>
 
+                  {/* ORDER TRACKER STATUS CHANGE NOTIFICATION OPTIONS (Push & Email) */}
+                  <div className="bg-slate-900 text-white border border-slate-800 rounded-2xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Bell className="w-4 h-4 text-orange-400" />
+                        <span className="text-xs font-bold uppercase tracking-wider">
+                          Alertes de changement de statut
+                        </span>
+                      </div>
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-semibold">
+                        Order Tracker Live
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-300 leading-relaxed">
+                      Recevez automatiquement une notification Push ou un Email dès que le statut de la commande <span className="font-mono font-bold text-orange-400">#{currentOrder.orderNumber}</span> évolue.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const nextVal = currentOrder.orderTrackerPushAlerts === false;
+                          if (nextVal && userToken) {
+                            await requestAndSubscribePushNotifications(userToken).catch(() => {});
+                          }
+                          if (userToken) {
+                            try {
+                              const updated = await apiClient.updateOrderTrackerNotifications(
+                                userToken,
+                                currentOrder.id,
+                                { pushAlerts: nextVal, sendTestStatusAlert: nextVal }
+                              );
+                              setCurrentOrder({
+                                ...currentOrder,
+                                orderTrackerPushAlerts: updated.orderTrackerPushAlerts
+                              });
+                            } catch {
+                              setCurrentOrder({ ...currentOrder, orderTrackerPushAlerts: nextVal });
+                            }
+                          } else {
+                            setCurrentOrder({ ...currentOrder, orderTrackerPushAlerts: nextVal });
+                          }
+                        }}
+                        className={`p-2.5 rounded-xl border text-left text-xs transition-all flex items-center justify-between ${
+                          currentOrder.orderTrackerPushAlerts !== false
+                            ? 'bg-orange-600/20 border-orange-500 text-white'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <Bell className="w-3.5 h-3.5 text-orange-400" />
+                          <span className="font-bold">Notif. Push</span>
+                        </div>
+                        <span className="text-[10px] font-bold uppercase">
+                          {currentOrder.orderTrackerPushAlerts !== false ? 'Activé ✓' : 'Off'}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const nextVal = currentOrder.orderTrackerEmailAlerts === false;
+                          if (userToken) {
+                            try {
+                              const updated = await apiClient.updateOrderTrackerNotifications(
+                                userToken,
+                                currentOrder.id,
+                                { emailAlerts: nextVal, sendTestStatusAlert: nextVal }
+                              );
+                              setCurrentOrder({
+                                ...currentOrder,
+                                orderTrackerEmailAlerts: updated.orderTrackerEmailAlerts
+                              });
+                            } catch {
+                              setCurrentOrder({ ...currentOrder, orderTrackerEmailAlerts: nextVal });
+                            }
+                          } else {
+                            setCurrentOrder({ ...currentOrder, orderTrackerEmailAlerts: nextVal });
+                          }
+                        }}
+                        className={`p-2.5 rounded-xl border text-left text-xs transition-all flex items-center justify-between ${
+                          currentOrder.orderTrackerEmailAlerts !== false
+                            ? 'bg-emerald-600/20 border-emerald-500 text-white'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <Mail className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="font-bold">Alerte Email</span>
+                        </div>
+                        <span className="text-[10px] font-bold uppercase">
+                          {currentOrder.orderTrackerEmailAlerts !== false ? 'Activé ✓' : 'Off'}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
                   {/* Order Status Timeline */}
                   <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
                     <div className="flex justify-between items-center pb-2 border-b border-slate-100 text-xs">
@@ -1156,13 +1342,65 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                         </span>
                       </div>
                     )}
+                    {currentOrder.payment_status && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Statut Paiement / Commande :</span>
+                        <span className="font-mono text-[11px] font-bold text-slate-800">
+                          {currentOrder.payment_status}
+                          {currentOrder.lifecycle_status && currentOrder.lifecycle_status !== currentOrder.payment_status
+                            ? ` → ${currentOrder.lifecycle_status}`
+                            : ''}
+                        </span>
+                      </div>
+                    )}
                     <div className="flex justify-between pt-2 border-t border-slate-100">
-                      <span className="font-bold text-slate-900">Total payé :</span>
+                      <span className="font-bold text-slate-900">
+                        {currentOrder.status === 'refunded' || currentOrder.payment_status === 'payment_refunded'
+                          ? 'Total remboursé :'
+                          : currentOrder.payment_status === 'payment_succeeded' ||
+                            currentOrder.status === 'completed' ||
+                            currentOrder.status === 'paid'
+                          ? 'Total confirmé (payé) :'
+                          : 'Montant de la commande :'}
+                      </span>
                       <span className="font-mono font-bold text-orange-600 text-sm">
                         ${currentOrder.chargedAmount.toFixed(2)} USD
                       </span>
                     </div>
                   </div>
+
+                  {currentOrder.user_status_message && (
+                    <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-[11px] text-slate-700">
+                      {currentOrder.user_status_message}
+                    </div>
+                  )}
+
+                  {(currentOrder.status === 'pending' || currentOrder.status === 'processing') && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const rec = await apiClient.recoverRechargeGamesOrder(
+                            currentOrder.id,
+                            undefined,
+                            userToken || undefined
+                          );
+                          if (rec.playupOrder) {
+                            setCurrentOrder(rec.playupOrder);
+                          } else {
+                            const updated = await apiClient.getMobileOrder(currentOrder.id);
+                            setCurrentOrder(updated);
+                          }
+                        } catch {
+                          // Keep current state on temporary network hiccup
+                        }
+                      }}
+                      className="w-full py-2.5 bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200 font-semibold text-xs rounded-xl transition-colors flex items-center justify-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Vérifier / Reprendre avec le même buyer_ref</span>
+                    </button>
+                  )}
 
                   <div className="space-y-2 pt-1">
                     <button
@@ -1462,7 +1700,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                             )}
                           </div>
                         ) : !playerCheckResult.supported ? (
-                          <div>{playerCheckResult.message}</div>
+                          <div className="flex items-start gap-1.5">
+                            <span className="px-1.5 py-0.5 rounded bg-slate-200 text-slate-800 font-bold text-[10px] shrink-0">
+                              NON SUPPORTÉ
+                            </span>
+                            <span>{playerCheckResult.message}</span>
+                          </div>
                         ) : (
                           <div className="font-semibold">{playerCheckResult.message}</div>
                         )}
@@ -1545,42 +1788,63 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     </div>
                   </div>
 
-                  {/* Dynamic Gateway Form Inputs */}
+                  {/* Dynamic Gateway Form Inputs: Real MonCash (+509 48 03 9151) & NatCash (+509 55964606) OCR + Anti-Fraud + Idempotency Workflow */}
                   {(selectedPaymentMethod === 'moncash' || selectedPaymentMethod === 'natcash') && (
-                    <div className="p-3 bg-slate-800/90 border border-slate-700 rounded-xl space-y-2.5 text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="font-bold text-orange-400">
-                          {selectedPaymentMethod === 'moncash' ? 'Passerelle Digicel MonCash' : 'Passerelle Natcom NatCash'}
-                        </span>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono">
-                          API Sécurisée
-                        </span>
+                    authUser && userToken ? (
+                      <MonCashNatCashOcrPaymentFlow
+                        token={userToken}
+                        user={authUser}
+                        purpose="service_order"
+                        initialMethod={selectedPaymentMethod}
+                        packageId={selectedPackage.id}
+                        packageName={`${selectedGame.name} — ${selectedPackage.name}`}
+                        gameId={selectedGame.id}
+                        gameName={selectedGame.name}
+                        serviceId={selectedService?.id}
+                        serviceName={selectedService?.name}
+                        playerId={
+                          gameProfileInputs.playerId ||
+                          gameProfileInputs.userId ||
+                          Object.values(gameProfileInputs)[0]
+                        }
+                        playerName={playerCheckResult?.playerName}
+                        serverId={gameProfileInputs.serverId || gameProfileInputs.zoneId}
+                        region={selectedRegion}
+                        gameProfileData={gameProfileInputs}
+                        expectedAmountUsd={selectedPackage.publicPrice}
+                        onWalletCredited={async ({ newWalletBalance }) => {
+                          const updatedUser = { ...authUser, walletBalance: newWalletBalance };
+                          setAuthUser(updatedUser);
+                          onAuthChange?.(updatedUser);
+                          setSelectedPaymentMethod('wallet');
+                        }}
+                        onRedirectHome={(reason) => {
+                          setOrderError(reason);
+                          resetPurchaseFlow();
+                          setActiveTab('home');
+                        }}
+                        compact
+                      />
+                    ) : (
+                      <div className="p-3.5 bg-slate-800/90 border border-orange-500/40 rounded-xl space-y-2 text-xs">
+                        <div className="font-bold text-orange-400">
+                          Connexion requise pour le paiement sécurisé {selectedPaymentMethod === 'moncash' ? 'MonCash (+509 48 03 9151)' : 'NatCash (+509 55964606)'}
+                        </div>
+                        <p className="text-[11px] text-slate-300">
+                          Veuillez vous connecter à votre compte PlayUp pour générer votre demande persistante, analyser votre preuve par OCR et créditer votre PlayUp Wallet.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            resetPurchaseFlow();
+                            setActiveTab('profile');
+                          }}
+                          className="w-full py-2 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-lg text-xs"
+                        >
+                          Se connecter / Créer un compte
+                        </button>
                       </div>
-                      <div>
-                        <label className="text-[11px] text-slate-300 block mb-1">
-                          Numéro de téléphone {selectedPaymentMethod === 'moncash' ? 'MonCash' : 'NatCash'}
-                        </label>
-                        <input
-                          type="text"
-                          value={mobilePhone}
-                          onChange={(e) => setMobilePhone(e.target.value)}
-                          placeholder={selectedPaymentMethod === 'moncash' ? '+509 37XX-XXXX' : '+509 40XX-XXXX'}
-                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[11px] text-slate-300 block mb-1">
-                          Code PIN / OTP de confirmation
-                        </label>
-                        <input
-                          type="password"
-                          value={mobileOtp}
-                          onChange={(e) => setMobileOtp(e.target.value)}
-                          placeholder="Code à 4 ou 6 chiffres"
-                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono text-white"
-                        />
-                      </div>
-                    </div>
+                    )
                   )}
 
                   {selectedPaymentMethod === 'card' && (
@@ -2385,13 +2649,27 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                               {authUser.name.charAt(0).toUpperCase()}
                             </div>
                             <div>
-                              <h4 className="font-bold text-sm text-white">{authUser.name}</h4>
+                              <div className="flex items-center gap-1.5">
+                                <h4 className="font-bold text-sm text-white">{authUser.name}</h4>
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                                    authUser.role === 'ADMIN'
+                                      ? 'bg-orange-500/20 text-orange-300 border border-orange-500/40'
+                                      : 'bg-slate-800 text-slate-300'
+                                  }`}
+                                >
+                                  {authUser.role || 'USER'}
+                                </span>
+                              </div>
                               <p className="text-[11px] text-slate-400">{authUser.email}</p>
                             </div>
                           </div>
                           <button
                             type="button"
                             onClick={() => {
+                              if (userToken) {
+                                apiClient.logoutUser(userToken).catch(() => {});
+                              }
                               signOutFirebase().catch(() => {});
                               safeStorage.removeItem('playup_user_token');
                               safeStorage.removeItem('playup_user_profile');
@@ -2425,10 +2703,13 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                           </button>
                         </div>
 
-                        {/* Wallet Top-Up Drawer */}
+                        {/* Wallet Top-Up Drawer with Real MonCash (+509 48 03 9151) & NatCash (+509 55964606) OCR + Anti-Fraud */}
                         {showWalletTopUp && (
-                          <form onSubmit={handleWalletTopUpSubmit} className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl space-y-2.5 text-xs">
-                            <div className="font-bold text-orange-400">Recharger mon PlayUp Wallet</div>
+                          <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3 text-xs">
+                            <div className="flex items-center justify-between">
+                              <span className="font-bold text-orange-400">Recharger mon PlayUp Wallet</span>
+                              <span className="text-[10px] text-emerald-400 font-mono">OCR & Anti-Fraude Actif</span>
+                            </div>
                             <div className="grid grid-cols-2 gap-2">
                               <div>
                                 <label className="text-[11px] text-slate-400 block mb-1">Montant (USD)</label>
@@ -2448,20 +2729,45 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                                   onChange={(e) => setTopUpMethod(e.target.value as PaymentMethodType)}
                                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
                                 >
-                                  <option value="moncash">MonCash (Digicel)</option>
-                                  <option value="natcash">NatCash (Natcom)</option>
+                                  <option value="moncash">MonCash (+509 48 03 9151)</option>
+                                  <option value="natcash">NatCash (+509 55964606)</option>
                                   <option value="card">Carte Bancaire</option>
                                 </select>
                               </div>
                             </div>
-                            <button
-                              type="submit"
-                              disabled={topUpProcessing}
-                              className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg"
-                            >
-                              {topUpProcessing ? 'Traitement en cours...' : `Créditer $${topUpAmount} via ${topUpMethod.toUpperCase()}`}
-                            </button>
-                          </form>
+
+                            {topUpMethod === 'moncash' || topUpMethod === 'natcash' ? (
+                              <MonCashNatCashOcrPaymentFlow
+                                token={userToken}
+                                user={authUser}
+                                purpose="wallet_topup"
+                                initialMethod={topUpMethod}
+                                packageName={`Recharge PlayUp Wallet +$${Number(topUpAmount || 10).toFixed(2)} USD`}
+                                expectedAmountUsd={Math.max(1, Number(topUpAmount || 10))}
+                                onWalletCredited={({ newWalletBalance }) => {
+                                  const updated = { ...authUser, walletBalance: newWalletBalance };
+                                  setAuthUser(updated);
+                                  onAuthChange?.(updated);
+                                  setShowWalletTopUp(false);
+                                }}
+                                onRedirectHome={() => {
+                                  setShowWalletTopUp(false);
+                                  setActiveTab('home');
+                                }}
+                                compact
+                              />
+                            ) : (
+                              <form onSubmit={handleWalletTopUpSubmit}>
+                                <button
+                                  type="submit"
+                                  disabled={topUpProcessing}
+                                  className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg"
+                                >
+                                  {topUpProcessing ? 'Traitement en cours...' : `Créditer $${topUpAmount} via Carte`}
+                                </button>
+                              </form>
+                            )}
+                          </div>
                         )}
                       </div>
 

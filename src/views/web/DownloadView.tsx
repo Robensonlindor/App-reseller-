@@ -7,6 +7,7 @@ import { AppSettings, AppPackageMetadata } from '../../types';
 import { Language, translations } from '../../i18n';
 import { apiClient } from '../../services/apiClient';
 import { detectClientPlatform } from '../../lib/pushNotifications';
+import { PlayUpSplashLogo } from '../../components/common/PlayUpSplashLogo';
 
 interface DownloadViewProps {
   settings: AppSettings | null;
@@ -386,75 +387,14 @@ export const DownloadView: React.FC<DownloadViewProps> = ({
             </div>
           </div>
 
-          {/* Right Column: Interactive Mobile Preview + Direct Platform Cards */}
+          {/* Right Column: Interactive Mobile Splash Screen Preview */}
           <div className="lg:col-span-5 flex flex-col items-center gap-4">
-            <div className="w-72 bg-slate-950 rounded-[36px] p-3 border-4 border-slate-800 shadow-2xl">
-              <div className="bg-slate-900 rounded-[28px] p-5 space-y-5 border border-slate-800">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="w-7 h-7 rounded-lg bg-orange-600 flex items-center justify-center font-black text-xs">
-                      P
-                    </div>
-                    <span className="font-display font-bold text-sm">PlayUp App</span>
-                  </div>
-                  <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-semibold">
-                    v{packagesInfo?.android.version || '2.4.1'}
-                  </span>
-                </div>
-
-                <div className="bg-gradient-to-br from-orange-600 to-amber-600 rounded-2xl p-4 space-y-1">
-                  <span className="text-[10px] uppercase tracking-wider text-orange-100 font-semibold">
-                    Android &amp; iOS
-                  </span>
-                  <div className="font-display font-bold text-base">
-                    Téléchargement Direct
-                  </div>
-                  <p className="text-[11px] text-orange-100 pt-1">
-                    Package vérifié par SHA-256 + Notifications Push &amp; Email après livraison fournisseur.
-                  </p>
-                </div>
-
-                <div className="space-y-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedPlatform('android');
-                      handleRealPackageDownload('android');
-                    }}
-                    className="w-full p-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 flex items-center justify-between text-xs transition-colors cursor-pointer"
-                  >
-                    <span className="font-medium text-slate-200 flex items-center gap-2">
-                      <Download className="w-3.5 h-3.5 text-orange-400" />
-                      <span>Package Android (.APK)</span>
-                    </span>
-                    <span className="text-orange-400 font-mono font-bold">
-                      {packagesInfo?.android.sizeFormatted || '225 KB'}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelectedPlatform('ios');
-                      handleRealPackageDownload('ios');
-                    }}
-                    className="w-full p-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 flex items-center justify-between text-xs transition-colors cursor-pointer"
-                  >
-                    <span className="font-medium text-slate-200 flex items-center gap-2">
-                      <Smartphone className="w-3.5 h-3.5 text-orange-400" />
-                      <span>Profil iPhone (.mobileconfig)</span>
-                    </span>
-                    <span className="text-orange-400 font-mono font-bold">
-                      {packagesInfo?.ios.sizeFormatted || '1.8 KB'}
-                    </span>
-                  </button>
-                </div>
-
-                <button
-                  onClick={onOpenMobileApp}
-                  className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer"
-                >
-                  Lancer PlayUp Mobile
-                </button>
+            <div
+              onClick={onOpenMobileApp}
+              className="w-72 h-[540px] bg-slate-950 rounded-[40px] p-2.5 border-4 border-slate-800 shadow-2xl cursor-pointer transition-transform hover:scale-[1.01]"
+            >
+              <div className="w-full h-full bg-[#050302] rounded-[30px] flex items-center justify-center p-6 border border-slate-900">
+                <PlayUpSplashLogo className="w-[82%] max-w-[220px] h-auto" />
               </div>
             </div>
           </div>

@@ -22,13 +22,16 @@ import {
 } from 'lucide-react';
 import {
   ConnectionTestResult,
+  ManualPaymentValidationRecord,
+  OrderRetryAttemptRecord,
   ProviderApiLog,
   RechargeGamesConfigState,
   RechargeGamesMode,
   RechargeGamesOrderRecord,
   RechargeGamesProduct,
   RechargeGamesTestStepResult,
-  RechargeGamesWebhookEvent
+  RechargeGamesWebhookEvent,
+  RefundRecord
 } from '../../types';
 import { apiClient } from '../../services/apiClient';
 import { syncWebhookEventIdempotencyToFirestore } from '../../lib/firebase';
@@ -60,6 +63,9 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
   });
   const [products, setProducts] = useState<RechargeGamesProduct[]>([]);
   const [orders, setOrders] = useState<RechargeGamesOrderRecord[]>([]);
+  const [refunds, setRefunds] = useState<RefundRecord[]>([]);
+  const [manualValidations, setManualValidations] = useState<ManualPaymentValidationRecord[]>([]);
+  const [retryAttempts, setRetryAttempts] = useState<OrderRetryAttemptRecord[]>([]);
   const [webhookEvents, setWebhookEvents] = useState<RechargeGamesWebhookEvent[]>([]);
   const [apiLogs, setApiLogs] = useState<ProviderApiLog[]>([]);
 
@@ -97,8 +103,24 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [selectedOrderForWebhook, setSelectedOrderForWebhook] = useState<string>('');
 
-  // Order status check
+  // Order status check, Manual Payment Validation, Retry & Strict Refund Modal
   const [checkingOrderId, setCheckingOrderId] = useState<string | null>(null);
+  const [validatingOrderId, setValidatingOrderId] = useState<string | null>(null);
+  const [retryingOrderId, setRetryingOrderId] = useState<string | null>(null);
+  const [refundModalPreview, setRefundModalPreview] = useState<{
+    orderId: string;
+    buyerRef: string;
+    providerOrderId: string;
+    amount: number;
+    currency: string;
+    userId: string;
+    userName: string;
+    userEmail: string;
+    productName: string;
+    reason: string;
+    refundMethod: string;
+  } | null>(null);
+  const [executingRefund, setExecutingRefund] = useState(false);
 
   // Live 12-Test Suite
   const [runningSuite, setRunningSuite] = useState(false);
@@ -111,6 +133,9 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
       setMetrics(data.metrics);
       setProducts(data.products || []);
       setOrders(data.orders || []);
+      setRefunds(data.refunds || []);
+      setManualValidations(data.manualPaymentValidations || []);
+      setRetryAttempts(data.orderRetryAttempts || []);
       setWebhookEvents(data.webhookEvents || []);
       setApiLogs(data.apiLogs || []);
 
@@ -224,13 +249,119 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
       const res = await apiClient.checkRechargeGamesOrderStatus(orderId);
       setStatusBanner({
         type: res.success ? 'success' : 'error',
-        text: `GET /v1/orders/${orderId} → Statut: ${res.status.toUpperCase()} (${res.message})`
+        text: `Statut réel vérifié (GET /v1/orders/${orderId}) → ${res.status.toUpperCase()} (${res.message}). Vous pouvez maintenant déclencher une action manuelle si nécessaire.`
       });
       await loadDashboard();
     } catch (err: any) {
       setStatusBanner({ type: 'error', text: err.message || 'Erreur vérification statut' });
     } finally {
       setCheckingOrderId(null);
+    }
+  };
+
+  const handleValidatePaymentManually = async (orderId: string) => {
+    if (validatingOrderId) return;
+    setValidatingOrderId(orderId);
+    setStatusBanner(null);
+    try {
+      const res = await apiClient.validateRechargeGamesPaymentManually(token, orderId);
+      setStatusBanner({
+        type: res.success ? 'success' : 'error',
+        text: res.message
+      });
+      await loadDashboard();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Erreur lors de la validation manuelle du paiement'
+      });
+    } finally {
+      setValidatingOrderId(null);
+    }
+  };
+
+  const handleManualRetryOrder = async (orderId: string) => {
+    if (retryingOrderId) return;
+    setRetryingOrderId(orderId);
+    setStatusBanner(null);
+    try {
+      const res = await apiClient.retryRechargeGamesOrder(token, orderId, {
+        triggerType: 'manual_admin',
+        requirePriorAdminStatusCheck: true
+      });
+      setStatusBanner({
+        type: res.success ? 'success' : 'error',
+        text: res.message
+      });
+      await loadDashboard();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Erreur lors de la nouvelle tentative manuelle'
+      });
+    } finally {
+      setRetryingOrderId(null);
+    }
+  };
+
+  const handleOpenRefundModal = async (orderId: string) => {
+    setStatusBanner(null);
+    try {
+      const check = await apiClient.getRechargeGamesRefundEligibility(token, orderId);
+      if (!check.eligible) {
+        setStatusBanner({
+          type: 'error',
+          text: check.reason
+        });
+        return;
+      }
+      setRefundModalPreview({
+        orderId: check.preview.orderId,
+        buyerRef: check.preview.buyerRef,
+        providerOrderId: check.preview.providerOrderId,
+        amount: check.preview.amount,
+        currency: check.preview.currency,
+        userId: check.preview.userId,
+        userName: check.preview.userName,
+        userEmail: check.preview.userEmail,
+        productName: check.preview.productName,
+        reason: check.preview.defaultReason,
+        refundMethod: check.preview.refundMethod || 'wallet'
+      });
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Impossible de préparer le remboursement manuel'
+      });
+    }
+  };
+
+  const handleConfirmManualRefund = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!refundModalPreview || executingRefund) return;
+    setExecutingRefund(true);
+    setStatusBanner(null);
+    try {
+      const res = await apiClient.executeRechargeGamesManualRefund(token, refundModalPreview.orderId, {
+        reason: refundModalPreview.reason,
+        refundMethod: refundModalPreview.refundMethod
+      });
+      setStatusBanner({
+        type: res.success ? 'success' : 'error',
+        text: res.message
+      });
+      setRefundModalPreview(null);
+      await loadDashboard();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Échec du remboursement manuel'
+      });
+    } finally {
+      setExecutingRefund(false);
     }
   };
 
@@ -1025,116 +1156,438 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
         </form>
       )}
 
-      {/* TAB 4: COMMANDES & FALLBACK STATUS */}
+      {/* TAB 4: COMMANDES, VALIDATION MANUELLE, RETRIES (MAX 3) & REMBOURSEMENTS STRICTS */}
       {subTab === 'orders' && (
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-base font-bold text-white">
-                Table <code className="text-orange-400">orders</code> RechargeGames & Fallback <code className="text-orange-400">GET /v1/orders/&#123;order_id&#125;</code>
-              </h3>
-              <p className="text-xs text-slate-400">
-                Vérifiez l’état réel de livraison (pending / delivered / failed) et l’identifiant d’idempotence <code className="text-orange-300">buyer_ref</code>.
-              </p>
+        <div className="space-y-6">
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-white">
+                  Commandes PlayUp / RechargeGames — Validation Manuelle, Retries (Max 3) & Remboursements Stricts
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Flux obligatoire : <code className="text-orange-300">Validation manuelle → payment_verified → order_pending → sent_to_rechargegames → suivi réel → delivered/failed</code> • Limite stricte : <code className="text-amber-300">3 tentatives auto (1m, 5m, 15m) → manual_review</code> • Remboursement : <code className="text-sky-300">refund_status != refunded</code>
+                </p>
+              </div>
             </div>
-          </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-800 text-slate-400">
-                  <th className="py-3 px-2.5">Commande</th>
-                  <th className="py-3 px-2.5">buyer_ref</th>
-                  <th className="py-3 px-2.5">provider_order_id</th>
-                  <th className="py-3 px-2.5">Produit & Région</th>
-                  <th className="py-3 px-2.5">Player ID</th>
-                  <th className="py-3 px-2.5">Coût / Client / Profit</th>
-                  <th className="py-3 px-2.5">Statut</th>
-                  <th className="py-3 px-2.5">Action Fallback</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {orders.map(ord => (
-                  <tr key={ord.id} className="hover:bg-slate-800/30">
-                    <td className="py-3 px-2.5 font-mono font-bold text-white">
-                      #{ord.id}
-                      {ord.test_mode && (
-                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px]">
-                          TEST
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-3 px-2.5 font-mono text-orange-300">{ord.buyer_ref}</td>
-                    <td className="py-3 px-2.5 font-mono text-slate-400">{ord.provider_order_id}</td>
-                    <td className="py-3 px-2.5">
-                      <div className="font-semibold text-white">{ord.product_name}</div>
-                      <div className="text-[11px] text-slate-400 font-mono">
-                        {ord.product_key} • {getRegionBadge(ord.region)}
-                      </div>
-                    </td>
-                    <td className="py-3 px-2.5 font-mono text-slate-200">{ord.player_id}</td>
-                    <td className="py-3 px-2.5 font-mono">
-                      <span className="text-slate-400">${ord.provider_price.toFixed(2)}</span> →{' '}
-                      <span className="text-white font-bold">${ord.customer_price.toFixed(2)}</span>{' '}
-                      <span className="text-emerald-400">(+${ord.profit.toFixed(2)})</span>
-                    </td>
-                    <td className="py-3 px-2.5">
-                      {ord.status === 'delivered' ? (
-                        <span className="px-2.5 py-1 rounded-md bg-emerald-500/20 text-emerald-300 font-bold text-[11px]">
-                          Delivered
-                        </span>
-                      ) : ord.status === 'refunded' ? (
-                        <div>
-                          <span className="px-2.5 py-1 rounded-md bg-sky-500/20 text-sky-300 font-bold text-[11px]">
-                            Refunded
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-800 text-slate-400">
+                    <th className="py-3 px-2.5">Commande & buyer_ref</th>
+                    <th className="py-3 px-2.5">provider_order_id</th>
+                    <th className="py-3 px-2.5">Produit & Player ID</th>
+                    <th className="py-3 px-2.5">Montant</th>
+                    <th className="py-3 px-2.5">Paiement</th>
+                    <th className="py-3 px-2.5">Statut Commande & Retries</th>
+                    <th className="py-3 px-2.5">Statut Remboursement</th>
+                    <th className="py-3 px-2.5">Actions Administrateur</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {orders.map(ord => {
+                    const isAwaitingManualPayment =
+                      (ord.payment_status === 'payment_pending' || ord.payment_status === 'payment_processing') &&
+                      ord.dispatch_status === 'awaiting_payment';
+                    const isRefunded = ord.status === 'refunded' || ord.refund_status === 'refunded';
+                    const isDelivered = ord.status === 'delivered' || ord.lifecycle_status === 'order_delivered';
+                    const isEligibleForManualRefund =
+                      !isRefunded &&
+                      !isDelivered &&
+                      (ord.payment_status === 'payment_succeeded' || ord.payment_status === 'payment_verified') &&
+                      (ord.status === 'failed' || ord.status === 'manual_review');
+                    const canRetryManually =
+                      !isDelivered &&
+                      !isRefunded &&
+                      (ord.payment_status === 'payment_succeeded' || ord.payment_status === 'payment_verified') &&
+                      Boolean(ord.real_status_verified_before_manual_retry_at);
+
+                    return (
+                      <tr key={ord.id} className="hover:bg-slate-800/30">
+                        <td className="py-3 px-2.5">
+                          <div className="font-mono font-bold text-white">
+                            #{ord.id}
+                            {ord.test_mode && (
+                              <span className="ml-1.5 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px]">
+                                TEST
+                              </span>
+                            )}
+                          </div>
+                          <div className="font-mono text-[11px] text-orange-300">{ord.buyer_ref}</div>
+                        </td>
+                        <td className="py-3 px-2.5 font-mono text-slate-400 text-[11px]">
+                          {ord.provider_order_id}
+                        </td>
+                        <td className="py-3 px-2.5">
+                          <div className="font-semibold text-white">{ord.product_name}</div>
+                          <div className="text-[11px] text-slate-400 font-mono">
+                            {ord.product_key} • {getRegionBadge(ord.region)} • ID: {ord.player_id}
+                          </div>
+                        </td>
+                        <td className="py-3 px-2.5 font-mono">
+                          <div className="text-white font-bold">
+                            ${ord.customer_price.toFixed(2)} {ord.currency}
+                          </div>
+                          <div className="text-[10px] text-emerald-400">
+                            Profit: +${ord.profit.toFixed(2)}
+                          </div>
+                        </td>
+                        <td className="py-3 px-2.5">
+                          <span
+                            className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold ${
+                              ord.payment_status === 'payment_verified' ||
+                              ord.payment_status === 'payment_succeeded'
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : ord.payment_status === 'payment_refunded'
+                                ? 'bg-sky-500/20 text-sky-300'
+                                : ord.payment_status === 'payment_failed' ||
+                                  ord.payment_status === 'payment_cancelled'
+                                ? 'bg-rose-500/20 text-rose-300'
+                                : 'bg-amber-500/20 text-amber-300'
+                            }`}
+                          >
+                            {ord.payment_status || 'payment_succeeded'}
+                          </span>
+                        </td>
+                        <td className="py-3 px-2.5">
+                          {ord.status === 'delivered' ? (
+                            <span className="px-2.5 py-1 rounded-md bg-emerald-500/20 text-emerald-300 font-bold text-[11px]">
+                              delivered
+                            </span>
+                          ) : ord.status === 'manual_review' ? (
+                            <div>
+                              <span className="px-2.5 py-1 rounded-md bg-purple-500/20 text-purple-300 font-bold text-[11px] border border-purple-500/40">
+                                manual_review (3/3 échecs)
+                              </span>
+                              <div className="text-[10px] text-purple-300 mt-1">
+                                Retries auto arrêtés
+                              </div>
+                            </div>
+                          ) : ord.status === 'sent_to_rechargegames' ? (
+                            <span className="px-2.5 py-1 rounded-md bg-blue-500/20 text-blue-300 font-bold text-[11px]">
+                              sent_to_rechargegames
+                            </span>
+                          ) : ord.status === 'refunded' ? (
+                            <span className="px-2.5 py-1 rounded-md bg-sky-500/20 text-sky-300 font-bold text-[11px]">
+                              refunded
+                            </span>
+                          ) : ord.status === 'failed' ? (
+                            <div>
+                              <span className="px-2.5 py-1 rounded-md bg-rose-500/20 text-rose-300 font-bold text-[11px]">
+                                failed
+                              </span>
+                              {ord.failure_reason && (
+                                <div className="text-[10px] text-rose-400 mt-1 max-w-[160px] truncate">
+                                  {ord.failure_reason}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="px-2.5 py-1 rounded-md bg-amber-500/20 text-amber-300 font-bold text-[11px]">
+                              {ord.status}
+                            </span>
+                          )}
+                          <div className="text-[10px] font-mono text-slate-400 mt-1">
+                            Tentatives: {ord.retry_count ?? 0}/{ord.max_retries ?? 3}
+                            {ord.real_status_verified_before_manual_retry_at && (
+                              <span className="ml-1.5 text-emerald-400">• Statut vérifié ✓</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-3 px-2.5">
+                          <span
+                            className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold ${
+                              ord.refund_status === 'refunded' || ord.status === 'refunded'
+                                ? 'bg-sky-500/20 text-sky-300'
+                                : ord.refund_status === 'refund_pending'
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : ord.refund_status === 'refund_failed'
+                                ? 'bg-rose-500/20 text-rose-300'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {ord.refund_status || (ord.status === 'refunded' ? 'refunded' : 'none')}
                           </span>
                           {ord.refund_transaction_id && (
-                            <div className="text-[10px] text-sky-400 font-mono mt-1">
+                            <div className="text-[10px] text-sky-400 font-mono mt-0.5">
                               {ord.refund_transaction_id}
                             </div>
                           )}
-                        </div>
-                      ) : ord.status === 'failed' ? (
-                        <div>
-                          <span className="px-2.5 py-1 rounded-md bg-rose-500/20 text-rose-300 font-bold text-[11px]">
-                            Failed
-                          </span>
-                          {ord.failure_reason && (
-                            <div className="text-[10px] text-rose-400 mt-1 max-w-[180px] truncate">
-                              {ord.failure_reason}
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <span className="px-2.5 py-1 rounded-md bg-amber-500/20 text-amber-300 font-bold text-[11px]">
-                          Pending
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-3 px-2.5">
-                      <button
-                        onClick={() => handleCheckOrderStatus(ord.id)}
-                        disabled={checkingOrderId === ord.id}
-                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-[11px] font-mono flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <RefreshCw
-                          className={`w-3 h-3 ${checkingOrderId === ord.id ? 'animate-spin' : ''}`}
-                        />
-                        <span>GET /v1/orders</span>
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {orders.length === 0 && (
-                  <tr>
-                    <td colSpan={8} className="py-8 text-center text-slate-500">
-                      Aucune commande RechargeGames enregistrée.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                        </td>
+                        <td className="py-3 px-2.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {/* 1. Vérifier statut réel auprès de RechargeGames */}
+                            <button
+                              onClick={() => handleCheckOrderStatus(ord.id)}
+                              disabled={checkingOrderId === ord.id}
+                              title="Vérifier l'état réel de la commande auprès de RechargeGames"
+                              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-[11px] font-mono flex items-center gap-1 cursor-pointer"
+                            >
+                              <RefreshCw
+                                className={`w-3 h-3 ${checkingOrderId === ord.id ? 'animate-spin' : ''}`}
+                              />
+                              <span>Vérifier statut</span>
+                            </button>
+
+                            {/* 2. Valider le paiement manuellement (Request #9) */}
+                            {isAwaitingManualPayment && (
+                              <button
+                                onClick={() => handleValidatePaymentManually(ord.id)}
+                                disabled={validatingOrderId === ord.id}
+                                className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold cursor-pointer"
+                              >
+                                {validatingOrderId === ord.id ? 'Validation...' : 'Valider le paiement'}
+                              </button>
+                            )}
+
+                            {/* 3. Nouvelle tentative manuelle (Request #10: uniquement après vérification du statut réel) */}
+                            {!isDelivered && !isRefunded && !isAwaitingManualPayment && (
+                              <button
+                                onClick={() => handleManualRetryOrder(ord.id)}
+                                disabled={!canRetryManually || retryingOrderId === ord.id}
+                                title={
+                                  canRetryManually
+                                    ? 'Relancer manuellement avec le même buyer_ref'
+                                    : 'Cliquez d’abord sur « Vérifier statut » avant de relancer manuellement'
+                                }
+                                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold ${
+                                  canRetryManually
+                                    ? 'bg-orange-500 hover:bg-orange-600 text-white cursor-pointer'
+                                    : 'bg-slate-800/50 text-slate-500 cursor-not-allowed'
+                                }`}
+                              >
+                                {retryingOrderId === ord.id ? 'Retry...' : 'Retry manuel'}
+                              </button>
+                            )}
+
+                            {/* 4. Rembourser manuellement (Request #8: uniquement si les conditions strictes sont respectées) */}
+                            {isEligibleForManualRefund && (
+                              <button
+                                onClick={() => handleOpenRefundModal(ord.id)}
+                                className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-bold cursor-pointer"
+                              >
+                                Rembourser
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {orders.length === 0 && (
+                    <tr>
+                      <td colSpan={8} className="py-8 text-center text-slate-500">
+                        Aucune commande RechargeGames enregistrée.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
+
+          {/* Historique des Tentatives de Commande (Request #10) & Remboursements Vérifiables (Request #8) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 space-y-3">
+              <h4 className="text-sm font-bold text-white flex items-center justify-between">
+                <span>Historique des Tentatives (Max 3 • 1 min, 5 min, 15 min)</span>
+                <span className="text-xs font-mono text-orange-400">{retryAttempts.length} tentatives</span>
+              </h4>
+              <div className="max-h-64 overflow-y-auto space-y-2">
+                {retryAttempts.slice(0, 12).map(att => (
+                  <div
+                    key={att.id}
+                    className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between font-mono">
+                      <span className="text-orange-300 font-bold">
+                        #{att.order_id} ({att.buyer_ref}) — Tentative #{att.attempt_number} ({att.trigger_type})
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          att.status === 'succeeded'
+                            ? 'bg-emerald-500/20 text-emerald-300'
+                            : att.status === 'escalated_manual_review'
+                            ? 'bg-purple-500/20 text-purple-300'
+                            : 'bg-rose-500/20 text-rose-300'
+                        }`}
+                      >
+                        {att.status}
+                      </span>
+                    </div>
+                    <div className="text-slate-300">{att.result}</div>
+                    <div className="text-[10px] text-slate-500 font-mono flex justify-between">
+                      <span>Motif: {att.reason}</span>
+                      <span>{new Date(att.timestamp).toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+                {retryAttempts.length === 0 && (
+                  <div className="text-xs text-slate-500 py-4 text-center">
+                    Aucune tentative enregistrée.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 space-y-3">
+              <h4 className="text-sm font-bold text-white flex items-center justify-between">
+                <span>Registre des Remboursements & Validations Manuelles</span>
+                <span className="text-xs font-mono text-sky-400">{refunds.length} remboursements</span>
+              </h4>
+              <div className="max-h-64 overflow-y-auto space-y-2">
+                {refunds.slice(0, 8).map(rf => (
+                  <div
+                    key={rf.id}
+                    className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between font-mono">
+                      <span className="text-sky-300 font-bold">
+                        refund_id: {rf.refund_id || rf.id} • Commande #{rf.orderId}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 text-[10px] font-bold">
+                        {rf.refund_status || rf.status} (${rf.amount.toFixed(2)} {rf.currency})
+                      </span>
+                    </div>
+                    <div className="text-slate-300">Raison : {rf.reason}</div>
+                    <div className="text-[10px] text-slate-500 font-mono flex justify-between">
+                      <span>
+                        admin_id: {rf.admin_id || 'system_auto'} • Méthode: {rf.refundMethod || 'wallet'}
+                      </span>
+                      <span>{new Date(rf.createdAt).toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+                {manualValidations.slice(0, 5).map(mv => (
+                  <div
+                    key={mv.id}
+                    className="p-3 rounded-xl bg-slate-950 border border-emerald-500/30 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between font-mono">
+                      <span className="text-emerald-300 font-bold">
+                        Validation manuelle #{mv.order_id} ({mv.buyer_ref})
+                      </span>
+                      <span className="text-white font-bold">
+                        ${mv.amount.toFixed(2)} {mv.currency}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-300 font-mono">
+                      {mv.previous_status} → {mv.payment_status} → {mv.new_status} ({mv.provider_order_id})
+                    </div>
+                    <div className="text-[10px] text-slate-500 font-mono flex justify-between">
+                      <span>Admin: {mv.admin_email || mv.admin_id}</span>
+                      <span>{new Date(mv.timestamp).toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Modale de Confirmation de Remboursement Manuel (Request #8) */}
+          {refundModalPreview && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <form
+                onSubmit={handleConfirmManualRefund}
+                className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl"
+              >
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                  <h3 className="text-base font-black text-white">
+                    Confirmer le Remboursement Manuel PlayUp
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => setRefundModalPreview(null)}
+                    className="text-slate-400 hover:text-white text-sm"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Montant à rembourser :</span>
+                    <span className="font-mono font-black text-emerald-400 text-sm">
+                      ${refundModalPreview.amount.toFixed(2)} {refundModalPreview.currency}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Commande concernée :</span>
+                    <span className="font-mono font-bold text-white">
+                      #{refundModalPreview.orderId} ({refundModalPreview.buyerRef})
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Utilisateur :</span>
+                    <span className="text-slate-200 font-semibold">
+                      {refundModalPreview.userName} ({refundModalPreview.userEmail})
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Produit :</span>
+                    <span className="text-slate-300">{refundModalPreview.productName}</span>
+                  </div>
+                </div>
+
+                <div className="space-y-3 text-xs">
+                  <div>
+                    <label className="block font-bold text-slate-300 mb-1">
+                      Méthode de remboursement
+                    </label>
+                    <select
+                      value={refundModalPreview.refundMethod}
+                      onChange={e =>
+                        setRefundModalPreview(prev =>
+                          prev ? { ...prev, refundMethod: e.target.value } : null
+                        )
+                      }
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white"
+                    >
+                      <option value="wallet">Solde Portefeuille PlayUp (wallet)</option>
+                      <option value="moncash">MonCash Digicel</option>
+                      <option value="natcash">NatCash Natcom</option>
+                      <option value="card">Carte Bancaire d’origine</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-bold text-slate-300 mb-1">
+                      Raison du remboursement (obligatoire)
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={refundModalPreview.reason}
+                      onChange={e =>
+                        setRefundModalPreview(prev =>
+                          prev ? { ...prev, reason: e.target.value } : null
+                        )
+                      }
+                      className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setRefundModalPreview(null)}
+                    className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-bold cursor-pointer"
+                  >
+                    Annuler
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={executingRefund}
+                    className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold cursor-pointer"
+                  >
+                    {executingRefund ? 'Remboursement en cours...' : 'Confirmer et Exécuter le Remboursement'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
         </div>
       )}
 

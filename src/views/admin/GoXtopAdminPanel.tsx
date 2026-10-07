@@ -245,52 +245,6 @@ export const GoXtopAdminPanel: React.FC<GoXtopAdminPanelProps> = ({
 
   const fullWebhookUrl = `${window.location.origin}${currentProvider?.webhookUrl || '/api/webhooks/goxtop'}`;
 
-  const handleToggleRevealApiKey = async () => {
-    if (!currentProvider) return;
-    if (isApiKeyRevealed) {
-      setIsApiKeyRevealed(false);
-      if (currentProvider.hasApiKey && (!apiKeyInput || apiKeyInput === '')) {
-        setApiKeyInput('••••••••••••••••');
-      }
-      return;
-    }
-
-    if (currentProvider.hasApiKey && apiKeyInput.includes('••••')) {
-      try {
-        const res = await apiClient.revealProviderSecret(token, currentProvider.id, 'apiKey');
-        setApiKeyInput(res.value);
-        setIsApiKeyRevealed(true);
-      } catch (err: any) {
-        setSaveErrorMsg(err.message || 'Impossible de révéler la clé');
-      }
-    } else {
-      setIsApiKeyRevealed(true);
-    }
-  };
-
-  const handleToggleRevealWebhookSecret = async () => {
-    if (!currentProvider) return;
-    if (isWebhookSecretRevealed) {
-      setIsWebhookSecretRevealed(false);
-      if (currentProvider.hasWebhookSecret && (!webhookSecretInput || webhookSecretInput === '')) {
-        setWebhookSecretInput('••••••••••••••••');
-      }
-      return;
-    }
-
-    if (currentProvider.hasWebhookSecret && webhookSecretInput.includes('••••')) {
-      try {
-        const res = await apiClient.revealProviderSecret(token, currentProvider.id, 'webhookSecret');
-        setWebhookSecretInput(res.value);
-        setIsWebhookSecretRevealed(true);
-      } catch (err: any) {
-        setSaveErrorMsg(err.message || 'Impossible de révéler le secret webhook');
-      }
-    } else {
-      setIsWebhookSecretRevealed(true);
-    }
-  };
-
   const handleSaveConfig = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!currentProvider) return;
@@ -867,33 +821,19 @@ export const GoXtopAdminPanel: React.FC<GoXtopAdminPanelProps> = ({
 
                 <div className="flex items-center gap-2">
                   <input
-                    type={isApiKeyRevealed ? 'text' : 'password'}
+                    type="password"
                     value={apiKeyInput}
                     onChange={(e) => setApiKeyInput(e.target.value)}
-                    placeholder="Collez votre API Key GoXtop ici..."
+                    placeholder="Collez une nouvelle API Key pour remplacer celle du serveur..."
                     className="flex-1 bg-white border border-slate-300 rounded-xl px-3 py-2.5 text-xs font-mono text-slate-900 focus:outline-none focus:border-orange-500"
                   />
-                  <button
-                    type="button"
-                    onClick={handleToggleRevealApiKey}
-                    className="px-3 py-2.5 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl text-xs font-semibold text-slate-700 flex items-center gap-1.5 shrink-0 transition-colors"
-                    title="Afficher / Masquer la clé (Réservé Admin)"
-                  >
-                    {isApiKeyRevealed ? (
-                      <>
-                        <EyeOff className="w-3.5 h-3.5 text-slate-600" />
-                        <span>Masquer</span>
-                      </>
-                    ) : (
-                      <>
-                        <Eye className="w-3.5 h-3.5 text-orange-600" />
-                        <span>Afficher</span>
-                      </>
-                    )}
-                  </button>
+                  <span className="px-3 py-2.5 bg-slate-100 border border-slate-200 rounded-xl text-[11px] font-semibold text-slate-600 flex items-center gap-1.5 shrink-0">
+                    <Lock className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Masqué en permanence</span>
+                  </span>
                 </div>
                 <span className="text-[11px] text-slate-500 mt-1 block">
-                  Stockée uniquement dans le coffre serveur. Jamais transmise au frontend public.
+                  Politique de sécurité PlayUp : les clés API ne peuvent jamais être affichées en clair une fois enregistrées.
                 </span>
               </div>
 
@@ -956,23 +896,19 @@ export const GoXtopAdminPanel: React.FC<GoXtopAdminPanelProps> = ({
                   </div>
                   <div className="flex items-center gap-2">
                     <input
-                      type={isWebhookSecretRevealed ? 'text' : 'password'}
+                      type="password"
                       value={webhookSecretInput}
                       onChange={(e) => setWebhookSecretInput(e.target.value)}
-                      placeholder="Laisser vide si GoXtop ne fournit pas de secret configurable dans votre dashboard"
+                      placeholder="Laisser vide ou saisir un nouveau Webhook Secret (écriture seule)"
                       className="flex-1 bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-900 focus:outline-none focus:border-orange-500"
                     />
-                    <button
-                      type="button"
-                      onClick={handleToggleRevealWebhookSecret}
-                      className="px-3 py-2 bg-white border border-slate-300 hover:bg-slate-100 rounded-xl text-xs font-semibold text-slate-700 flex items-center gap-1.5 shrink-0"
-                    >
-                      {isWebhookSecretRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5 text-orange-600" />}
-                      <span>{isWebhookSecretRevealed ? 'Masquer' : 'Afficher'}</span>
-                    </button>
+                    <span className="px-3 py-2 bg-slate-100 border border-slate-200 rounded-xl text-[11px] font-semibold text-slate-600 flex items-center gap-1.5 shrink-0">
+                      <Lock className="w-3.5 h-3.5 text-slate-500" />
+                      <span>Masqué en permanence</span>
+                    </span>
                   </div>
                   <span className="text-[11px] text-slate-500 mt-1 block">
-                    Ne bloque jamais l’intégration GoXtop si laissé vide. Si renseigné, la signature HMAC-SHA256 est vérifiée sur le <code className="font-mono">rawBody</code> brut avec <code className="font-mono">crypto.timingSafeEqual</code>.
+                    Politique de sécurité PlayUp : le Webhook Secret est stocké côté serveur uniquement et ne peut jamais être affiché en clair.
                   </span>
                 </div>
               </div>

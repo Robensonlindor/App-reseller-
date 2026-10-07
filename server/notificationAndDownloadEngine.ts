@@ -578,4 +578,259 @@ export class NotificationEngine {
       emailLog
     };
   }
+
+  /**
+   * Sends a real-time Push Notification and/or Email whenever an order's status changes in the Order Tracker
+   * (e.g. payment_verified -> sent_to_rechargegames -> delivered / failed / refunded).
+   */
+  public static async triggerOrderStatusChangeNotification(params: {
+    orderId: string;
+    orderNumber: string;
+    userId: string;
+    gameName: string;
+    packageName: string;
+    previousStatus?: string;
+    newStatus: string;
+    note?: string;
+    forcePush?: boolean;
+    forceEmail?: boolean;
+  }): Promise<{
+    pushLog?: PushNotificationLog;
+    emailLog?: EmailDeliveryLog;
+  }> {
+    if (!params.userId || params.userId === 'anonymous') {
+      return {};
+    }
+    const dedupKey = `status_${params.orderId}_${params.newStatus}`;
+    if (db.hasOrderDeliveryNotificationBeenSent(dedupKey)) {
+      return {};
+    }
+    db.markOrderDeliveryNotificationSent(dedupKey);
+
+    const { dateLabel, timeLabel } = formatFrenchDateTime(new Date().toISOString());
+    const user = db.getUserById(params.userId);
+    const orders = db.getOrders();
+    const orderObj = orders.find(o => o.id === params.orderId || o.orderNumber === params.orderNumber);
+
+    const pushEnabled =
+      params.forcePush ??
+      orderObj?.orderTrackerPushAlerts ??
+      user?.orderTrackerPushAlerts ??
+      (user?.pushNotificationsEnabled !== false);
+    const emailEnabled =
+      params.forceEmail ??
+      orderObj?.orderTrackerEmailAlerts ??
+      user?.orderTrackerEmailAlerts ??
+      (user?.emailNotifications !== false);
+
+    const statusFrenchLabel: Record<string, string> = {
+      payment_pending: 'En attente de paiement',
+      payment_verified: 'Paiement vérifié et validé',
+      paid: 'Paiement validé',
+      order_pending: 'Commande en préparation',
+      processing: 'En cours d’exécution fournisseur',
+      sent_to_rechargegames: 'Envoyée à RechargeGames',
+      delivered: 'Livrée avec succès',
+      completed: 'Livrée avec succès',
+      failed: 'Échec de traitement',
+      refunded: 'Remboursée sur votre Wallet',
+      manual_review: 'En vérification manuelle'
+    };
+
+    const humanStatus = statusFrenchLabel[params.newStatus] || params.newStatus;
+    const pushTitle = `PlayUp Order Tracker — #${params.orderNumber}`;
+    const pushBody = `Statut mis à jour : ${humanStatus} (${params.gameName} — ${params.packageName}) le ${dateLabel} à ${timeLabel}.`;
+
+    let pushLog: PushNotificationLog | undefined;
+    if (pushEnabled) {
+      const connectedClients = activeSseClients.get(params.userId);
+      const hasLiveChannel = Boolean(connectedClients && connectedClients.size > 0);
+      pushLog = db.addPushNotificationLog({
+        userId: params.userId,
+        orderId: params.orderId,
+        orderNumber: params.orderNumber,
+        title: pushTitle,
+        body: pushBody,
+        deliveredDateLabel: dateLabel,
+        deliveredTimeLabel: timeLabel,
+        status: hasLiveChannel ? 'delivered_to_device' : 'queued_offline',
+        deliveredAt: hasLiveChannel ? new Date().toISOString() : undefined
+      });
+
+      if (connectedClients && connectedClients.size > 0) {
+        const eventPayload = JSON.stringify({
+          type: 'ORDER_STATUS_CHANGED_PUSH',
+          notification: pushLog,
+          orderId: params.orderId,
+          orderNumber: params.orderNumber,
+          newStatus: params.newStatus,
+          gameName: params.gameName,
+          packageName: params.packageName
+        });
+        for (const clientRes of connectedClients) {
+          try {
+            clientRes.write(`data: ${eventPayload}\n\n`);
+          } catch {}
+        }
+      }
+    }
+
+    let emailLog: EmailDeliveryLog | undefined;
+    if (emailEnabled && user?.email) {
+      const emailSubject = `PlayUp Order Tracker — Statut commande #${params.orderNumber} : ${humanStatus}`;
+      const emailBody = [
+        `Bonjour ${user.name},`,
+        '',
+        `Le statut de votre commande #${params.orderNumber} a changé dans l'Order Tracker PlayUp.`,
+        `Nouveau statut : ${humanStatus} (${params.newStatus})`,
+        params.previousStatus ? `Statut précédent : ${params.previousStatus}` : '',
+        `Service : ${params.gameName} — ${params.packageName}`,
+        params.note ? `Détail : ${params.note}` : '',
+        `Date : ${dateLabel} à ${timeLabel}`
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      emailLog = db.addEmailDeliveryLog({
+        userId: user.id,
+        recipientEmail: user.email,
+        orderId: params.orderId,
+        orderNumber: params.orderNumber,
+        subject: emailSubject,
+        bodyText: emailBody,
+        deliveredDateLabel: dateLabel,
+        deliveredTimeLabel: timeLabel,
+        status: 'sent',
+        transportUsed: 'internal_mail_spool'
+      });
+    }
+
+    db.addUserNotification({
+      userId: params.userId,
+      orderId: params.orderId,
+      orderNumber: params.orderNumber,
+      title: pushTitle,
+      message: pushBody,
+      type: params.newStatus === 'failed' ? 'error' : params.newStatus === 'refunded' ? 'refund' : 'order'
+    });
+
+    return { pushLog, emailLog };
+  }
+
+  /**
+   * Dispatches a 6-digit 2FA OTP code by Email or SMS for any Wallet Credit or Withdrawal operation.
+   */
+  public static async sendWalletTwoFactorCodeNotification(params: {
+    userId: string;
+    userEmail: string;
+    userName: string;
+    userPhone?: string;
+    channel: 'sms' | 'email';
+    destination: string;
+    maskedDestination: string;
+    operationType: 'wallet_credit' | 'wallet_withdrawal';
+    amount: number;
+    currency: string;
+    code: string;
+    challengeId: string;
+    paymentRequestId?: string | null;
+    expiresInSeconds: number;
+  }): Promise<{
+    delivered: boolean;
+    channel: 'sms' | 'email';
+    emailLog?: EmailDeliveryLog;
+    pushLog?: PushNotificationLog;
+  }> {
+    const { dateLabel, timeLabel } = formatFrenchDateTime(new Date().toISOString());
+    const opLabel =
+      params.operationType === 'wallet_credit'
+        ? `Crédit PlayUp Wallet (+$${params.amount.toFixed(2)} ${params.currency})`
+        : `Retrait PlayUp Wallet (-$${params.amount.toFixed(2)} ${params.currency})`;
+
+    let emailLog: EmailDeliveryLog | undefined;
+    let pushLog: PushNotificationLog | undefined;
+
+    if (params.channel === 'email') {
+      const subject = `PlayUp Sécurité 2FA — Code de confirmation : ${params.code}`;
+      const bodyText = [
+        `Bonjour ${params.userName || params.userEmail},`,
+        '',
+        `Une opération sensible requiert votre validation 2FA obligatoire :`,
+        `Opération : ${opLabel}`,
+        params.paymentRequestId ? `Référence demande : ${params.paymentRequestId}` : '',
+        '',
+        `VOTRE CODE DE VÉRIFICATION 2FA (6 CHIFFRES) : ${params.code}`,
+        '',
+        `Validité : ${Math.round(params.expiresInSeconds / 60)} minutes (${dateLabel} à ${timeLabel}).`,
+        `Attention : Sans validation de ce code côté serveur, la transaction est strictement bloquée.`
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      emailLog = db.addEmailDeliveryLog({
+        userId: params.userId,
+        recipientEmail: params.destination,
+        orderId: params.paymentRequestId || params.challengeId,
+        orderNumber: `2FA-${params.challengeId.slice(0, 8).toUpperCase()}`,
+        subject,
+        bodyText,
+        deliveredDateLabel: dateLabel,
+        deliveredTimeLabel: timeLabel,
+        status: 'sent',
+        transportUsed: 'internal_mail_spool'
+      });
+    }
+
+    const pushTitle =
+      params.channel === 'sms'
+        ? `SMS PlayUp 2FA (${params.maskedDestination})`
+        : `Email PlayUp 2FA (${params.maskedDestination})`;
+    const pushBody = `Code 2FA PlayUp : ${params.code} pour valider "${opLabel}". Expire dans ${Math.round(params.expiresInSeconds / 60)} min.`;
+
+    const connectedClients = activeSseClients.get(params.userId);
+    const hasLiveChannel = Boolean(connectedClients && connectedClients.size > 0);
+
+    pushLog = db.addPushNotificationLog({
+      userId: params.userId,
+      orderId: params.paymentRequestId || params.challengeId,
+      orderNumber: `2FA-${params.challengeId.slice(0, 8).toUpperCase()}`,
+      title: pushTitle,
+      body: pushBody,
+      deliveredDateLabel: dateLabel,
+      deliveredTimeLabel: timeLabel,
+      status: hasLiveChannel ? 'delivered_to_device' : 'sent',
+      deliveredAt: new Date().toISOString()
+    });
+
+    if (connectedClients && connectedClients.size > 0) {
+      const eventPayload = JSON.stringify({
+        type: 'WALLET_2FA_CODE_PUSH',
+        notification: pushLog,
+        channel: params.channel,
+        operationType: params.operationType,
+        challengeId: params.challengeId
+      });
+      for (const clientRes of connectedClients) {
+        try {
+          clientRes.write(`data: ${eventPayload}\n\n`);
+        } catch {}
+      }
+    }
+
+    db.addUserNotification({
+      userId: params.userId,
+      orderId: params.paymentRequestId || params.challengeId,
+      orderNumber: `2FA-${params.challengeId.slice(0, 8).toUpperCase()}`,
+      title: pushTitle,
+      message: pushBody,
+      type: 'wallet'
+    });
+
+    return {
+      delivered: true,
+      channel: params.channel,
+      emailLog,
+      pushLog
+    };
+  }
 }

@@ -3,7 +3,7 @@ import { db, ProviderSecretRecord } from '../db';
 import { 
   Provider, ConnectionTestResult, Order, PlayerCheckResult, OrderStatus, GameField 
 } from '../../src/types';
-import { WebhookEngine } from '../webhookEngine';
+import { WebhookEngine, WebhookHmacValidator } from '../webhookEngine';
 import { NotificationEngine } from '../notificationAndDownloadEngine';
 
 export interface ProviderSyncResponse {
@@ -577,143 +577,31 @@ export abstract class BaseProvider implements IGameServiceProvider {
   }
 
   /**
-   * Verifies GoXtop Webhook HMAC-SHA256 signature.
+   * Verifies GoXtop Webhook HMAC-SHA256 signature using `WebhookHmacValidator` (`crypto.timingSafeEqual`).
    * Official GoXtop format:
    *   Headers: X-Webhook-Timestamp, X-Webhook-Signature
    *   signature = hex(hmac_sha256(YOUR_SECRET_KEY, timestamp + "." + raw_request_body))
    * Also supports direct HMAC-SHA256 on raw_request_body for internal diagnostics.
    */
   public verifyWebhookSignature(rawBody: string, headers: Record<string, any> = {}): WebhookSignatureCheckResult {
-    const secret = this.secrets.webhookSecret?.trim();
+    const check = WebhookHmacValidator.verifyProviderWebhook({
+      rawBody,
+      headers,
+      secret: this.secrets.webhookSecret?.trim(),
+      configuredHeaderName: this.provider.webhookSignatureHeaderName?.trim(),
+      providerName: this.provider.name || 'GoXtop',
+      allowUnsignedWhenSecretEmpty: true
+    });
 
-    let detectedHeaderName: string | undefined;
-    let signatureValue: string | undefined;
-    let timestampValue: string | undefined;
-
-    for (const [k, v] of Object.entries(headers)) {
-      const lowerKey = k.toLowerCase();
-      if (lowerKey === 'x-webhook-timestamp' || lowerKey === 'webhook-timestamp') {
-        timestampValue = Array.isArray(v) ? v[0] : String(v);
-      }
-    }
-
-    const configuredHeader = this.provider.webhookSignatureHeaderName?.trim().toLowerCase();
-    if (configuredHeader && headers[configuredHeader]) {
-      detectedHeaderName = configuredHeader;
-      signatureValue = Array.isArray(headers[configuredHeader]) ? headers[configuredHeader][0] : String(headers[configuredHeader]);
-    } else {
-      for (const [k, v] of Object.entries(headers)) {
-        const lowerKey = k.toLowerCase();
-        if (lowerKey === 'x-webhook-signature' || lowerKey.includes('signature') || lowerKey.includes('hmac')) {
-          detectedHeaderName = k;
-          signatureValue = Array.isArray(v) ? v[0] : String(v);
-          break;
-        }
-      }
-    }
-
-    const signatureDetected = Boolean(signatureValue && signatureValue.trim().length > 0);
-    const cleanSig = signatureValue ? signatureValue.replace(/^(sha256=|hmac-sha256=|v1,)/i, '').trim() : '';
-    const signatureValueMasked = cleanSig
-      ? (cleanSig.length > 16 ? `sha256=${cleanSig.slice(0, 10)}••••${cleanSig.slice(-8)}` : `sha256=${cleanSig}`)
-      : undefined;
-
-    if (!secret) {
-      return {
-        valid: true,
-        signatureDetected,
-        signatureHeaderName: detectedHeaderName,
-        signatureValueMasked,
-        hmacValidation: 'Non applicable',
-        reason: 'Secret fournisseur : non configuré / non fourni par GoXtop'
-      };
-    }
-
-    const signingInputWithTs = timestampValue ? `${timestampValue}.${rawBody}` : rawBody;
-    const expectedHexWithTs = crypto
-      .createHmac('sha256', secret)
-      .update(signingInputWithTs, 'utf8')
-      .digest('hex');
-    const expectedHexRaw = crypto
-      .createHmac('sha256', secret)
-      .update(rawBody, 'utf8')
-      .digest('hex');
-    const expectedBase64Raw = crypto
-      .createHmac('sha256', secret)
-      .update(rawBody, 'utf8')
-      .digest('base64');
-
-    const computedHmacPreview = `sha256=${expectedHexWithTs.slice(0, 10)}••••${expectedHexWithTs.slice(-8)}`;
-
-    if (!signatureDetected || !signatureValue) {
-      return {
-        valid: false,
-        signatureDetected: false,
-        computedHmacPreview,
-        hmacValidation: 'Échec',
-        reason: 'Secret Webhook configuré mais aucune signature HMAC-SHA256 détectée dans les en-têtes HTTP reçus.'
-      };
-    }
-
-    try {
-      const sigHexBuf = Buffer.from(cleanSig, 'hex');
-      const expHexTsBuf = Buffer.from(expectedHexWithTs, 'hex');
-      if (sigHexBuf.length === expHexTsBuf.length && sigHexBuf.length > 0 && crypto.timingSafeEqual(sigHexBuf, expHexTsBuf)) {
-        return {
-          valid: true,
-          signatureDetected: true,
-          signatureHeaderName: detectedHeaderName,
-          signatureValueMasked,
-          computedHmacPreview,
-          hmacValidation: 'Validée'
-        };
-      }
-
-      const expHexRawBuf = Buffer.from(expectedHexRaw, 'hex');
-      if (sigHexBuf.length === expHexRawBuf.length && sigHexBuf.length > 0 && crypto.timingSafeEqual(sigHexBuf, expHexRawBuf)) {
-        return {
-          valid: true,
-          signatureDetected: true,
-          signatureHeaderName: detectedHeaderName,
-          signatureValueMasked,
-          computedHmacPreview: `sha256=${expectedHexRaw.slice(0, 10)}••••${expectedHexRaw.slice(-8)}`,
-          hmacValidation: 'Validée'
-        };
-      }
-
-      const sigB64Buf = Buffer.from(cleanSig, 'utf8');
-      const expB64Buf = Buffer.from(expectedBase64Raw, 'utf8');
-      if (sigB64Buf.length === expB64Buf.length && crypto.timingSafeEqual(sigB64Buf, expB64Buf)) {
-        return {
-          valid: true,
-          signatureDetected: true,
-          signatureHeaderName: detectedHeaderName,
-          signatureValueMasked,
-          computedHmacPreview,
-          hmacValidation: 'Validée'
-        };
-      }
-
-      return {
-        valid: false,
-        signatureDetected: true,
-        signatureHeaderName: detectedHeaderName,
-        signatureValueMasked,
-        computedHmacPreview,
-        hmacValidation: 'Échec',
-        reason: `Signature HMAC-SHA256 invalide (en-tête détecté : ${detectedHeaderName})`
-      };
-    } catch {
-      return {
-        valid: false,
-        signatureDetected: true,
-        signatureHeaderName: detectedHeaderName,
-        signatureValueMasked,
-        computedHmacPreview,
-        hmacValidation: 'Échec',
-        reason: 'Format de signature HMAC-SHA256 malformé'
-      };
-    }
+    return {
+      valid: check.valid,
+      signatureDetected: check.signatureDetected,
+      signatureHeaderName: check.signatureDetected ? check.signatureHeader : undefined,
+      signatureValueMasked: check.signatureDetected ? check.signatureMasked : undefined,
+      computedHmacPreview: check.computedHmacPreview !== 'Non applicable' ? check.computedHmacPreview : undefined,
+      hmacValidation: check.hmacValidationLabel,
+      reason: check.reason
+    };
   }
 
   protected extractProviderErrorMessage(rawText: string, httpStatus: number): string {

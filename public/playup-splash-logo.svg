@@ -1,0 +1,309 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 620" width="100%" height="100%">
+  <defs>
+    <!-- Ambient orange-gold glow behind the P emblem and U arrow -->
+    <filter id="ambientGlow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="22" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="135%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.75" />
+    </filter>
+
+    <filter id="glintGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="blur1" />
+      <feGaussianBlur stdDeviation="12" result="blur2" />
+      <feMerge>
+        <feMergeNode in="blur2" />
+        <feMergeNode in="blur1" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- Main P Bowl Outer Metallic Gradient -->
+    <linearGradient id="pBowlOuterGrad" x1="15%" y1="5%" x2="88%" y2="92%">
+      <stop offset="0%" stop-color="#FFF066" />
+      <stop offset="18%" stop-color="#FFBE1A" />
+      <stop offset="52%" stop-color="#FF8000" />
+      <stop offset="82%" stop-color="#FF4D00" />
+      <stop offset="100%" stop-color="#C82800" />
+    </linearGradient>
+
+    <!-- Main P Bowl Inner Face Satin Gradient -->
+    <linearGradient id="pBowlFaceGrad" x1="18%" y1="0%" x2="82%" y2="95%">
+      <stop offset="0%" stop-color="#FFD426" />
+      <stop offset="28%" stop-color="#FFA200" />
+      <stop offset="68%" stop-color="#FF6200" />
+      <stop offset="100%" stop-color="#E03500" />
+    </linearGradient>
+
+    <!-- P Lower Ribbon Sweep Gradient -->
+    <linearGradient id="pRibbonSweepGrad" x1="10%" y1="85%" x2="85%" y2="10%">
+      <stop offset="0%" stop-color="#FF4500" />
+      <stop offset="35%" stop-color="#FF8800" />
+      <stop offset="72%" stop-color="#FFB718" />
+      <stop offset="100%" stop-color="#FF6A00" />
+    </linearGradient>
+
+    <!-- Left Lightning Wing Upper Bright Gold-Orange Facet -->
+    <linearGradient id="wingLeftFacetGrad" x1="85%" y1="10%" x2="10%" y2="90%">
+      <stop offset="0%" stop-color="#FFE855" />
+      <stop offset="32%" stop-color="#FFB300" />
+      <stop offset="72%" stop-color="#FF6D00" />
+      <stop offset="100%" stop-color="#FF3D00" />
+    </linearGradient>
+
+    <!-- Left Lightning Wing Inner Deep Orange Bevel Facet -->
+    <linearGradient id="wingRightFacetGrad" x1="30%" y1="5%" x2="70%" y2="95%">
+      <stop offset="0%" stop-color="#FF9000" />
+      <stop offset="45%" stop-color="#EE4800" />
+      <stop offset="100%" stop-color="#B82000" />
+    </linearGradient>
+
+    <!-- Play Triangle Outer Bevel -->
+    <linearGradient id="playTriBevelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFE04D" />
+      <stop offset="45%" stop-color="#FF8800" />
+      <stop offset="100%" stop-color="#CC2900" />
+    </linearGradient>
+
+    <!-- Play Triangle Inner Face -->
+    <linearGradient id="playTriFaceGrad" x1="15%" y1="10%" x2="85%" y2="90%">
+      <stop offset="0%" stop-color="#FFBA14" />
+      <stop offset="55%" stop-color="#FF6A00" />
+      <stop offset="100%" stop-color="#E63900" />
+    </linearGradient>
+
+    <!-- "Up" Wordmark Gradient -->
+    <linearGradient id="upTextGrad" x1="35%" y1="0%" x2="55%" y2="100%">
+      <stop offset="0%" stop-color="#FFE44D" />
+      <stop offset="22%" stop-color="#FFB314" />
+      <stop offset="58%" stop-color="#FF6E00" />
+      <stop offset="100%" stop-color="#E63600" />
+    </linearGradient>
+
+    <!-- "Play" White Wordmark Subtle Vertical Sheen -->
+    <linearGradient id="playWhiteGrad" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="78%" stop-color="#F7F7FA" />
+      <stop offset="100%" stop-color="#DADBDF" />
+    </linearGradient>
+
+    <!-- Reseller Side Lines Gradient -->
+    <linearGradient id="resellerLineGrad" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#FF6A00" />
+      <stop offset="50%" stop-color="#FF941A" />
+      <stop offset="100%" stop-color="#FF6A00" />
+    </linearGradient>
+  </defs>
+
+  <!-- Subtle warm ambient backlight matching the logo's natural glow -->
+  <ellipse cx="340" cy="185" rx="185" ry="135" fill="#FF6A00" opacity="0.16" filter="url(#ambientGlow)" />
+  <circle cx="476" cy="348" r="34" fill="#FFA000" opacity="0.22" filter="url(#ambientGlow)" />
+
+  <!-- ===================================================================== -->
+  <!-- 1. 3D METALLIC "P" EMBLEM WITH LIGHTNING WING & PLAY TRIANGLE         -->
+  <!-- ===================================================================== -->
+  <g filter="url(#softShadow)">
+    <!-- A. Upper-Left Wedge + Top Bar + Right Loop of the "P" -->
+    <!-- Outer 3D Bevel Rim -->
+    <path
+      d="M 244 36
+         L 404 36
+         C 496 36, 542 82, 534 148
+         C 526 212, 470 256, 378 256
+         L 284 256
+         C 264 256, 252 268, 240 318
+         C 237 328, 229 334, 216 334
+         L 182 334
+         C 170 334, 164 326, 168 312
+         C 192 234, 228 196, 294 196
+         L 372 196
+         C 426 196, 456 176, 460 144
+         C 464 110, 438 90, 386 90
+         L 286 90
+         L 206 146
+         L 244 36 Z"
+      fill="url(#pBowlOuterGrad)"
+    />
+
+    <!-- Inner Satin Face of P Bowl -->
+    <path
+      d="M 250 43
+         L 402 43
+         C 486 43, 528 85, 521 147
+         C 514 205, 462 246, 376 246
+         L 278 246
+         C 254 246, 242 262, 229 322
+         L 186 324
+         C 208 242, 242 204, 304 204
+         L 374 204
+         C 432 204, 466 180, 470 144
+         C 474 105, 444 82, 388 82
+         L 282 82
+         L 217 128
+         L 250 43 Z"
+      fill="url(#pBowlFaceGrad)"
+    />
+
+    <!-- Lower Ribbon 3D Fold Highlight Sweep (from P foot up into the loop) -->
+    <path
+      d="M 176 328
+         C 198 244, 238 196, 308 196
+         L 378 196
+         C 430 196, 462 174, 466 142
+         C 464 182, 428 210, 372 210
+         L 300 210
+         C 246 210, 218 248, 198 326
+         Z"
+      fill="#FFD23F"
+      opacity="0.75"
+    />
+
+    <!-- Crisp Top Specular Highlight on P Bar -->
+    <path
+      d="M 245 38 L 406 38 C 472 38, 514 64, 526 106 C 510 68, 468 44, 402 44 L 248 44 Z"
+      fill="#FFF7B8"
+      opacity="0.9"
+    />
+
+    <!-- B. Left Lightning / Arrow Stem of the "P" -->
+    <!-- Right/Inner Deep Orange 3D Facet of Lightning Stem -->
+    <path
+      d="M 292 102
+         L 202 204
+         L 168 316
+         C 166 326, 172 334, 184 334
+         C 198 310, 222 256, 248 214
+         L 292 102 Z"
+      fill="url(#wingRightFacetGrad)"
+    />
+
+    <!-- Left/Upper Bright Gold-Orange Lightning Spike Facet -->
+    <path
+      d="M 292 102
+         L 90 238
+         L 202 200
+         L 168 316
+         L 232 212
+         L 292 102 Z"
+      fill="url(#wingLeftFacetGrad)"
+    />
+
+    <!-- Sharp Ridge Highlight Dividing the Two Lightning Facets -->
+    <path
+      d="M 292 102 L 172 324 L 166 318 L 288 100 Z"
+      fill="#FFAE19"
+      opacity="0.65"
+    />
+
+    <!-- Bright Gold Specular Edge Along the Lightning Spike Upper Edge -->
+    <path
+      d="M 292 102 L 90 238 L 104 234 L 290 107 Z"
+      fill="#FFF5A8"
+      opacity="0.92"
+    />
+
+    <!-- Subtle Light Glint on Top-Left Corner of P & Lightning Tip -->
+    <circle cx="246" cy="39" r="4" fill="#FFFFFF" filter="url(#glintGlow)" opacity="0.9" />
+    <circle cx="96" cy="234" r="3.5" fill="#FFE875" filter="url(#glintGlow)" opacity="0.85" />
+
+    <!-- C. Central Play Triangle Inside the "P" Counter -->
+    <!-- Outer Beveled Play Triangle -->
+    <path
+      d="M 320 109
+         C 320 101, 329 97, 336 101
+         L 402 140
+         C 409 144, 409 154, 402 158
+         L 336 195
+         C 329 199, 320 195, 320 187
+         Z"
+      fill="url(#playTriBevelGrad)"
+    />
+    <!-- Inner Play Triangle Face -->
+    <path
+      d="M 327 115
+         C 327 110, 333 107, 338 110
+         L 394 143
+         C 399 146, 399 152, 394 155
+         L 338 187
+         C 333 190, 327 187, 327 182
+         Z"
+      fill="url(#playTriFaceGrad)"
+    />
+    <!-- Play Triangle Upper Edge Specular Highlight -->
+    <path
+      d="M 332 110 L 395 146 L 391 149 L 330 114 Z"
+      fill="#FFF099"
+      opacity="0.8"
+    />
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- 2. "PlayUp" WORDMARK (EXACT TYPOGRAPHY & INTEGRATED U-ARROW)          -->
+  <!-- ===================================================================== -->
+  <g filter="url(#softShadow)">
+    <!-- 3D Extrusion / Bottom Depth Layer for "Play" -->
+    <g transform="translate(0, 5) skewX(-10)" fill="#9FA4B4" opacity="0.85">
+      <!-- P -->
+      <path d="M 140 374 L 198 374 C 226 374, 242 388, 242 410 C 242 434, 224 448, 194 448 L 168 448 L 168 478 L 140 478 Z M 168 396 L 168 426 L 192 426 C 206 426, 214 420, 214 411 C 214 402, 206 396, 192 396 Z" />
+      <!-- l -->
+      <path d="M 254 370 L 280 370 L 280 478 L 254 478 Z" />
+      <!-- a -->
+      <path d="M 332 398 C 356 398, 370 409, 370 430 L 370 478 L 345 478 L 345 468 C 338 476, 327 480, 314 480 C 296 480, 284 469, 284 454 C 284 438, 298 429, 324 429 L 344 429 L 344 426 C 344 418, 338 414, 326 414 C 316 414, 309 417, 304 422 L 288 408 C 298 401, 313 398, 332 398 Z M 323 463 C 335 463, 344 456, 344 446 L 344 442 L 326 442 C 314 442, 309 446, 309 453 C 309 459, 314 463, 323 463 Z" />
+      <!-- y -->
+      <path d="M 376 400 L 404 400 L 420 448 L 438 400 L 465 400 L 424 494 C 417 509, 406 515, 388 515 L 375 515 L 375 495 L 385 495 C 394 495, 399 492, 402 484 L 405 477 Z" />
+    </g>
+
+    <!-- Main Crisp White Layer for "Play" -->
+    <g transform="skewX(-10)" fill="url(#playWhiteGrad)">
+      <!-- P -->
+      <path d="M 140 374 L 198 374 C 226 374, 242 388, 242 410 C 242 434, 224 448, 194 448 L 168 448 L 168 478 L 140 478 Z M 168 396 L 168 426 L 192 426 C 206 426, 214 420, 214 411 C 214 402, 206 396, 192 396 Z" />
+      <!-- l -->
+      <path d="M 254 370 L 280 370 L 280 478 L 254 478 Z" />
+      <!-- a -->
+      <path d="M 332 398 C 356 398, 370 409, 370 430 L 370 478 L 345 478 L 345 468 C 338 476, 327 480, 314 480 C 296 480, 284 469, 284 454 C 284 438, 298 429, 324 429 L 344 429 L 344 426 C 344 418, 338 414, 326 414 C 316 414, 309 417, 304 422 L 288 408 C 298 401, 313 398, 332 398 Z M 323 463 C 335 463, 344 456, 344 446 L 344 442 L 326 442 C 314 442, 309 446, 309 453 C 309 459, 314 463, 323 463 Z" />
+      <!-- y -->
+      <path d="M 376 400 L 404 400 L 420 448 L 438 400 L 465 400 L 424 494 C 417 509, 406 515, 388 515 L 375 515 L 375 495 L 385 495 C 394 495, 399 492, 402 484 L 405 477 Z" />
+    </g>
+
+    <!-- 3D Extrusion / Bottom Depth Layer for "Up" -->
+    <g transform="translate(0, 5) skewX(-10)" fill="#8F1D00" opacity="0.9">
+      <!-- U with integrated upward arrow on the right/upper stem matching the PlayUp logo -->
+      <path d="M 472 374 L 500 374 L 500 436 C 500 451, 508 459, 522 459 C 536 459, 544 451, 544 436 L 544 374 L 533 374 L 558 344 L 583 374 L 572 374 L 572 436 C 572 465, 552 481, 522 481 C 492 481, 472 465, 472 436 Z" />
+      <!-- p -->
+      <path d="M 586 400 L 612 400 L 612 410 C 619 402, 629 398, 642 398 C 664 398, 679 415, 679 439 C 679 463, 664 480, 642 480 C 630 480, 620 476, 613 468 L 613 512 L 586 512 Z M 632 459 C 645 459, 653 451, 653 439 C 653 427, 645 419, 632 419 C 620 419, 612 427, 612 439 C 612 451, 620 459, 632 459 Z" />
+    </g>
+
+    <!-- Main Vibrant Orange-Gold Gradient Layer for "Up" -->
+    <g transform="skewX(-10)" fill="url(#upTextGrad)">
+      <!-- U with integrated upward arrow on top of the second stem -->
+      <path d="M 472 374 L 500 374 L 500 436 C 500 451, 508 459, 522 459 C 536 459, 544 451, 544 436 L 544 374 L 533 374 L 558 344 L 583 374 L 572 374 L 572 436 C 572 465, 552 481, 522 481 C 492 481, 472 465, 472 436 Z" />
+      <!-- p -->
+      <path d="M 586 400 L 612 400 L 612 410 C 619 402, 629 398, 642 398 C 664 398, 679 415, 679 439 C 679 463, 664 480, 642 480 C 630 480, 620 476, 613 468 L 613 512 L 586 512 Z M 632 459 C 645 459, 653 451, 653 439 C 653 427, 645 419, 632 419 C 620 419, 612 427, 612 439 C 612 451, 620 459, 632 459 Z" />
+    </g>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- 3. "— R E S E L L E R —" SUBLINE                                      -->
+  <!-- ===================================================================== -->
+  <g filter="url(#softShadow)">
+    <!-- Left Orange Horizontal Line -->
+    <rect x="98" y="554" width="76" height="4.5" rx="2.25" fill="url(#resellerLineGrad)" />
+
+    <!-- "RESELLER" Spaced White Letters -->
+    <text
+      x="344"
+      y="565"
+      text-anchor="middle"
+      fill="#FFFFFF"
+      font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+      font-size="25"
+      font-weight="600"
+      letter-spacing="10"
+    >RESELLER</text>
+
+    <!-- Right Orange Horizontal Line -->
+    <rect x="506" y="554" width="76" height="4.5" rx="2.25" fill="url(#resellerLineGrad)" />
+  </g>
+</svg>

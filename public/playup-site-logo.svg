@@ -1,69 +1,173 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="100%" height="100%">
   <defs>
+    <!-- Rounded Square App Icon Background Gradient -->
     <linearGradient id="bgGrad" x1="8%" y1="6%" x2="92%" y2="94%">
       <stop offset="0%" stop-color="#FF7A00" />
       <stop offset="48%" stop-color="#F45600" />
       <stop offset="100%" stop-color="#D93600" />
     </linearGradient>
+
+    <!-- Inner P Counter Subtle Depth Gradient -->
     <radialGradient id="counterDepth" cx="55%" cy="29%" r="24%">
       <stop offset="0%" stop-color="#B82600" stop-opacity="0.45" />
       <stop offset="100%" stop-color="#D93600" stop-opacity="0" />
     </radialGradient>
+
+    <!-- Lightning Wing Golden-Yellow to Orange Gradient -->
     <linearGradient id="wingGrad" x1="78%" y1="8%" x2="18%" y2="92%">
       <stop offset="0%" stop-color="#FFDA1A" />
       <stop offset="42%" stop-color="#FFA400" />
       <stop offset="82%" stop-color="#FF7300" />
       <stop offset="100%" stop-color="#F04E00" />
     </linearGradient>
+
+    <!-- Lightning Wing Lower Fold Shadow Gradient -->
     <linearGradient id="wingFoldGrad" x1="20%" y1="100%" x2="85%" y2="10%">
       <stop offset="0%" stop-color="#E04000" />
       <stop offset="60%" stop-color="#FF6D00" />
       <stop offset="100%" stop-color="#FF9A00" />
     </linearGradient>
+
+    <!-- Play Triangle Outer Bevel Gradient -->
     <linearGradient id="playBevelGrad" x1="10%" y1="10%" x2="90%" y2="90%">
       <stop offset="0%" stop-color="#FFE226" />
       <stop offset="50%" stop-color="#FF9800" />
       <stop offset="100%" stop-color="#E64800" />
     </linearGradient>
+
+    <!-- Play Triangle Inner Face Gradient -->
     <linearGradient id="playFaceGrad" x1="15%" y1="15%" x2="85%" y2="85%">
       <stop offset="0%" stop-color="#FFD414" />
       <stop offset="55%" stop-color="#FF8C00" />
       <stop offset="100%" stop-color="#FF5500" />
     </linearGradient>
+
+    <!-- "Up" Wordmark Golden-Yellow to Orange Gradient -->
     <linearGradient id="upGrad" x1="50%" y1="0%" x2="50%" y2="100%">
       <stop offset="0%" stop-color="#FFDE1A" />
       <stop offset="45%" stop-color="#FFA800" />
       <stop offset="85%" stop-color="#FF7B00" />
       <stop offset="100%" stop-color="#F25C00" />
     </linearGradient>
+
+    <!-- Soft Subtle Shadow for Emblem & Typography -->
     <filter id="logoShadow" x="-10%" y="-10%" width="120%" height="125%">
       <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#8A1C00" flood-opacity="0.38" />
     </filter>
   </defs>
+
+  <!-- 1. Rounded Square App Icon Background -->
   <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#bgGrad)" />
   <circle cx="555" cy="295" r="220" fill="url(#counterDepth)" />
+
+  <!-- 2. Central "P" Emblem (Lightning Wing + Play Triangle + Pure White "P") -->
   <g filter="url(#logoShadow)">
-    <path d="M 432 240 L 142 462 L 288 405 L 262 538 C 316 456, 366 414, 410 396 L 432 240 Z" fill="url(#wingGrad)" />
-    <path d="M 288 405 L 262 538 C 306 472, 348 432, 392 406 L 336 422 Z" fill="url(#wingFoldGrad)" opacity="0.72" />
-    <path d="M 476 232 C 476 218, 491 210, 503 217 L 606 276 C 618 283, 618 300, 606 307 L 503 366 C 491 373, 476 365, 476 351 Z" fill="url(#playBevelGrad)" />
-    <path d="M 485 240 C 485 230, 496 224, 505 229 L 596 281 C 605 286, 605 297, 596 302 L 505 354 C 496 359, 485 353, 485 343 Z" fill="url(#playFaceGrad)" />
-    <path d="M 342 118 L 582 118 C 718 118, 804 182, 804 288 C 804 396, 716 468, 578 468 L 404 468 L 382 602 L 316 602 C 272 602, 254 570, 262 538 C 324 446, 398 390, 478 390 L 558 390 C 634 390, 678 348, 678 288 C 678 228, 634 188, 558 188 L 516 188 C 476 188, 444 198, 410 222 L 304 316 L 342 118 Z" fill="#FFFFFF" />
+    <!-- A. Golden-Orange Lightning Wing (Tucks behind the lower white ribbon of the P) -->
+    <path
+      d="M 432 240
+         L 142 462
+         L 288 405
+         L 262 538
+         C 316 456, 366 414, 410 396
+         L 432 240 Z"
+      fill="url(#wingGrad)"
+    />
+
+    <!-- Subtle Lower Fold Facet on the Lightning Stem (where it meets the white foot) -->
+    <path
+      d="M 288 405
+         L 262 538
+         C 306 472, 348 432, 392 406
+         L 336 422 Z"
+      fill="url(#wingFoldGrad)"
+      opacity="0.72"
+    />
+
+    <!-- B. Central Play Triangle Inside the "P" Counter -->
+    <path
+      d="M 476 232
+         C 476 218, 491 210, 503 217
+         L 606 276
+         C 618 283, 618 300, 606 307
+         L 503 366
+         C 491 373, 476 365, 476 351
+         Z"
+      fill="url(#playBevelGrad)"
+    />
+    <path
+      d="M 485 240
+         C 485 230, 496 224, 505 229
+         L 596 281
+         C 605 286, 605 297, 596 302
+         L 505 354
+         C 496 359, 485 353, 485 343
+         Z"
+      fill="url(#playFaceGrad)"
+    />
+
+    <!-- C. Main Pure White "P" Loop & Curved Lower Foot -->
+    <path
+      d="M 342 118
+         L 582 118
+         C 718 118, 804 182, 804 288
+         C 804 396, 716 468, 578 468
+         L 404 468
+         L 382 602
+         L 316 602
+         C 272 602, 254 570, 262 538
+         C 324 446, 398 390, 478 390
+         L 558 390
+         C 634 390, 678 348, 678 288
+         C 678 228, 634 188, 558 188
+         L 516 188
+         C 476 188, 444 198, 410 222
+         L 304 316
+         L 342 118 Z"
+      fill="#FFFFFF"
+    />
   </g>
+
+  <!-- 3. "PlayUp" Wordmark (Pure White "Play" + Golden-Orange "Up" with Arrow on U) -->
   <g filter="url(#logoShadow)">
+    <!-- "Play" in Crisp Pure White -->
     <g transform="skewX(-6)" fill="#FFFFFF">
+      <!-- P -->
       <path d="M 206 604 L 296 604 C 340 604, 366 626, 366 660 C 366 696, 338 718, 290 718 L 250 718 L 250 766 L 206 766 Z M 250 638 L 250 684 L 286 684 C 308 684, 320 675, 320 661 C 320 647, 308 638, 286 638 Z" />
+      <!-- l -->
       <path d="M 380 598 L 422 598 L 422 766 L 380 766 Z" />
+      <!-- a (single-story bold geometric rounded a) -->
       <path d="M 492 636 C 514 636, 530 644, 539 656 L 539 640 L 580 640 L 580 766 L 539 766 L 539 750 C 529 762, 513 770, 492 770 C 456 770, 430 742, 430 703 C 430 664, 456 636, 492 636 Z M 506 672 C 486 672, 472 685, 472 703 C 472 721, 486 734, 506 734 C 525 734, 539 721, 539 703 C 539 685, 525 672, 506 672 Z" />
+      <!-- y -->
       <path d="M 588 640 L 632 640 L 656 716 L 684 640 L 726 640 L 664 786 C 653 810, 636 820, 608 820 L 588 820 L 588 788 L 604 788 C 618 788, 625 783, 630 770 L 634 760 Z" />
     </g>
+
+    <!-- "Up" in Golden-Yellow to Orange Gradient with Integrated Upward Arrow on U -->
     <g transform="skewX(-6)" fill="url(#upGrad)">
+      <!-- U with upward arrow on top of the right stem -->
       <path d="M 664 604 L 708 604 L 708 700 C 708 723, 720 735, 741 735 C 762 735, 774 723, 774 700 L 774 612 L 755 612 L 795 560 L 835 612 L 816 612 L 816 700 C 816 745, 786 770, 741 770 C 696 770, 664 745, 664 700 Z" />
+      <!-- p -->
       <path d="M 832 640 L 873 640 L 873 656 C 883 643, 899 636, 920 636 C 955 636, 980 664, 980 703 C 980 742, 955 770, 920 770 C 900 770, 884 763, 874 751 L 874 816 L 832 816 Z M 906 734 C 925 734, 938 721, 938 703 C 938 685, 925 672, 906 672 C 887 672, 873 685, 873 703 C 873 721, 887 734, 906 734 Z" />
     </g>
   </g>
+
+  <!-- 4. "— R E S E L L E R —" Sub-label in Pure White -->
   <g>
+    <!-- Left White Line -->
     <rect x="172" y="852" width="96" height="5.5" rx="2.75" fill="#FFFFFF" />
-    <text x="518" y="868" text-anchor="middle" fill="#FFFFFF" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="42" font-weight="700" letter-spacing="18">RESELLER</text>
+
+    <!-- "RESELLER" Spaced White Letters -->
+    <text
+      x="518"
+      y="868"
+      text-anchor="middle"
+      fill="#FFFFFF"
+      font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+      font-size="42"
+      font-weight="700"
+      letter-spacing="18"
+    >RESELLER</text>
+
+    <!-- Right White Line -->
     <rect x="756" y="852" width="96" height="5.5" rx="2.75" fill="#FFFFFF" />
   </g>
 </svg>

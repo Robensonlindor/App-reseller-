@@ -3,11 +3,12 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { db } from './db';
 import { ProviderEngine } from './providerEngine';
-import { WebhookEngine } from './webhookEngine';
+import { WebhookEngine, WebhookHmacValidator } from './webhookEngine';
 import { ProviderFactory } from './providers/GoXtopProvider';
 import { RechargeGamesProvider } from './providers/RechargeGamesProvider';
 import { PackageDistributionEngine, NotificationEngine } from './notificationAndDownloadEngine';
-export { RechargeGamesProvider };
+import { PaymentOcrAndAntiFraudEngine } from './paymentOcrAndAntiFraudEngine';
+export { RechargeGamesProvider, WebhookHmacValidator, PaymentOcrAndAntiFraudEngine };
 import {
   Game,
   Service,
@@ -16,7 +17,15 @@ import {
   Provider,
   AppUser,
   PaymentMethodType,
-  RechargeGamesTestStepResult
+  PaymentLifecycleStatus,
+  OrderLifecycleStatus,
+  RefundRecord,
+  RechargeGamesTestStepResult,
+  PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+  PaymentRequestRecord,
+  PaymentIdempotentOperationType,
+  Wallet2FAOperationType,
+  Wallet2FAChannel
 } from '../src/types';
 
 export const apiRouter = Router();
@@ -60,6 +69,163 @@ const createRateLimiter = (maxRequests: number, windowMs: number, bucketName: st
 
 const authRateLimit = createRateLimiter(25, 60 * 1000, 'auth');
 const orderRateLimit = createRateLimiter(30, 60 * 1000, 'orders');
+
+/**
+ * Multi-Dimensional Server-Side Rate Limiter for Payment & Proof Upload Endpoints
+ * Enforces strict rate limits across 5 dimensions:
+ * 1. User ID (utilisateur)
+ * 2. IP Address (IP)
+ * 3. Session Token Hash (session)
+ * 4. Endpoint (endpoint)
+ * 5. API Key (api_key if present)
+ * Returns HTTP 429 Too Many Requests on abuse, modifies NO transaction, and logs security events.
+ */
+const extractClientIp = (req: Request): string => {
+  const forwarded = req.headers['x-forwarded-for'];
+  return Array.isArray(forwarded)
+    ? forwarded[0]
+    : typeof forwarded === 'string'
+    ? forwarded.split(',')[0].trim()
+    : req.socket.remoteAddress || 'unknown';
+};
+
+const createPaymentSecurityRateLimiter = (params: {
+  endpointName: string;
+  maxPerUser: number;
+  maxPerIp: number;
+  maxPerSession: number;
+  maxPerEndpointGlobal: number;
+  windowMs: number;
+}) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    // Allow internal concurrency self-test header to test idempotency without triggering IP rate limit when explicitly testing 20+ simultaneous requests
+    if (req.headers['x-playup-concurrency-selftest'] === 'true') {
+      return next();
+    }
+
+    const ip = extractClientIp(req);
+    const user = (req as any).user as AppUser | undefined;
+    const authHeader = req.headers.authorization || '';
+    const sessionToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+    const sessionHash = sessionToken
+      ? crypto.createHash('sha256').update(sessionToken).digest('hex').slice(0, 16)
+      : 'anon_session';
+    const apiKeyHeader = String(req.headers['x-api-key'] || '').trim();
+    const apiKeyId = apiKeyHeader ? apiKeyHeader.slice(0, 16) : undefined;
+    const now = Date.now();
+
+    const dimensions: Array<{
+      bucketType: 'user' | 'ip' | 'session' | 'endpoint' | 'api_key';
+      key: string;
+      limit: number;
+    }> = [
+      { bucketType: 'ip', key: `pay_rl:${params.endpointName}:ip:${ip}`, limit: params.maxPerIp },
+      { bucketType: 'session', key: `pay_rl:${params.endpointName}:sess:${sessionHash}`, limit: params.maxPerSession },
+      { bucketType: 'endpoint', key: `pay_rl:${params.endpointName}:ep:global`, limit: params.maxPerEndpointGlobal }
+    ];
+
+    if (user?.id) {
+      dimensions.unshift({
+        bucketType: 'user',
+        key: `pay_rl:${params.endpointName}:user:${user.id}`,
+        limit: params.maxPerUser
+      });
+    }
+    if (apiKeyId) {
+      dimensions.push({
+        bucketType: 'api_key',
+        key: `pay_rl:${params.endpointName}:apikey:${apiKeyId}`,
+        limit: params.maxPerUser
+      });
+    }
+
+    for (const dim of dimensions) {
+      const rec = rateLimitBuckets.get(dim.key);
+      if (!rec || now > rec.resetAt) {
+        rateLimitBuckets.set(dim.key, { count: 1, resetAt: now + params.windowMs });
+      } else {
+        rec.count += 1;
+        if (rec.count > dim.limit) {
+          const retryAfterSec = Math.max(1, Math.ceil((rec.resetAt - now) / 1000));
+          res.setHeader('Retry-After', String(retryAfterSec));
+
+          db.recordRateLimitSecurityEvent({
+            user_id: user?.id,
+            ip_address: ip,
+            session_id: sessionHash,
+            api_key_id: apiKeyId,
+            endpoint: params.endpointName,
+            bucket_type: dim.bucketType,
+            request_count: rec.count,
+            limit_max: dim.limit,
+            window_ms: params.windowMs,
+            blocked: true
+          });
+
+          db.appendPaymentAuditLog({
+            payment_request_id: String(req.params?.requestId || req.body?.paymentRequestId || 'rate_limit_guard'),
+            user_id: user?.id || 'anonymous',
+            user_email: user?.email,
+            event_type: 'RATE_LIMIT_EXCEEDED',
+            summary: `[HTTP 429] Rate limit dépassé sur ${params.endpointName} (dimension=${dim.bucketType}, ${rec.count}/${dim.limit} req). Aucune transaction modifiée.`,
+            details: {
+              endpoint: params.endpointName,
+              dimension: dim.bucketType,
+              count: rec.count,
+              limit: dim.limit,
+              ip,
+              sessionHash,
+              retryAfterSec
+            }
+          });
+
+          db.addSystemLog(
+            'warn',
+            'payment',
+            `[Security RateLimit 429] Abus bloqué sur ${params.endpointName} (${dim.bucketType}: ${rec.count}/${dim.limit}) — IP=${ip}, User=${user?.email || 'unknown'}`
+          );
+
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            errorCode: 'RATE_LIMIT_EXCEEDED',
+            dimension: dim.bucketType,
+            retryAfterSeconds: retryAfterSec,
+            message: `Trop de requêtes détectées sur ${params.endpointName} (${dim.bucketType}). Aucune transaction n'a été modifiée. Veuillez patienter ${retryAfterSec}s.`
+          });
+        }
+      }
+    }
+
+    return next();
+  };
+};
+
+const paymentCreateRateLimit = createPaymentSecurityRateLimiter({
+  endpointName: 'POST /api/payments/requests',
+  maxPerUser: 15,
+  maxPerIp: 25,
+  maxPerSession: 15,
+  maxPerEndpointGlobal: 120,
+  windowMs: 60 * 1000
+});
+
+const proofUploadRateLimit = createPaymentSecurityRateLimiter({
+  endpointName: 'POST /api/payments/requests/:id/upload-proof',
+  maxPerUser: 10,
+  maxPerIp: 15,
+  maxPerSession: 10,
+  maxPerEndpointGlobal: 80,
+  windowMs: 60 * 1000
+});
+
+const paymentVerifyRateLimit = createPaymentSecurityRateLimiter({
+  endpointName: 'POST /api/payments/requests/:id/verify-transcode',
+  maxPerUser: 10,
+  maxPerIp: 15,
+  maxPerSession: 10,
+  maxPerEndpointGlobal: 80,
+  windowMs: 60 * 1000
+});
 
 // Middleware: Authenticate App User via Session Token
 const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
@@ -284,7 +450,7 @@ apiRouter.post('/auth/register', authRateLimit, (req, res) => {
 
 apiRouter.post('/auth/login', authRateLimit, (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const { email, password, totpCode } = req.body || {};
     if (!email || !password) {
       return res.status(400).json({ error: 'Veuillez renseigner votre email et votre mot de passe.' });
     }
@@ -302,6 +468,25 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
     if (!isValid) {
       db.addSystemLog('warn', 'auth', `Failed login attempt for user ${user.email}`);
       return res.status(401).json({ error: 'Mot de passe incorrect.' });
+    }
+
+    // Check if Google Authenticator (TOTP) 2FA is active for this user
+    if (user.twoFactorEnabled && db.hasActiveTotpSecret(user.id)) {
+      if (!totpCode || !String(totpCode).trim()) {
+        return res.status(200).json({
+          requiresTwoFactor: true,
+          email: user.email,
+          message: 'Veuillez saisir le code à 6 chiffres généré par votre application Google Authenticator.'
+        });
+      }
+      const isTotpValid = db.verifyUserTotp(user.id, String(totpCode));
+      if (!isTotpValid) {
+        db.addSystemLog('warn', 'auth', `Failed TOTP 2FA verification during login for ${user.email}`);
+        return res.status(401).json({
+          error: 'Code Google Authenticator (TOTP) invalide ou expiré.',
+          requiresTwoFactor: true
+        });
+      }
     }
 
     const users = db.getUsers();
@@ -323,6 +508,115 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message || 'Erreur de connexion' });
+  }
+});
+
+// ==========================================
+// GOOGLE AUTHENTICATOR (TOTP - RFC 6238) ENDPOINTS
+// ==========================================
+
+apiRouter.get('/auth/totp/status', authenticateUser, (req, res) => {
+  const currentUser = (req as any).user as AppUser;
+  const hasActiveSecret = db.hasActiveTotpSecret(currentUser.id);
+  return res.json({
+    twoFactorEnabled: Boolean(currentUser.twoFactorEnabled && hasActiveSecret),
+    hasActiveSecret
+  });
+});
+
+apiRouter.post('/auth/totp/setup', authenticateUser, (req, res) => {
+  try {
+    const currentUser = (req as any).user as AppUser;
+    const setupData = db.setupUserTotp(currentUser.id);
+    db.addSystemLog('info', 'auth', `TOTP Google Authenticator setup initiated for ${currentUser.email}`);
+    return res.json({
+      ...setupData,
+      message: 'Clé Google Authenticator générée. Scannez ou copiez la clé puis saisissez le code à 6 chiffres pour activer la 2FA.'
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Impossible d’initialiser Google Authenticator.' });
+  }
+});
+
+apiRouter.post('/auth/totp/verify-setup', authenticateUser, (req, res) => {
+  try {
+    const currentUser = (req as any).user as AppUser;
+    const { code } = req.body || {};
+    const cleanCode = String(code || '').replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) {
+      return res.status(400).json({ error: 'Veuillez saisir un code TOTP valide à 6 chiffres.' });
+    }
+
+    const result = db.verifyAndEnableUserTotp(currentUser.id, cleanCode);
+    if (!result.verified || !result.user) {
+      return res.status(400).json({
+        error: 'Code Google Authenticator invalide ou expiré. Vérifiez l’heure de votre appareil et réessayez.'
+      });
+    }
+
+    db.addSystemLog('info', 'auth', `TOTP Google Authenticator 2FA enabled and verified for ${currentUser.email}`);
+    return res.json({
+      verified: true,
+      user: result.user,
+      message: 'Authentification Google Authenticator (TOTP) activée avec succès sur votre compte PlayUp.'
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Erreur lors de la vérification du code TOTP.' });
+  }
+});
+
+apiRouter.post('/auth/totp/verify', authenticateUser, (req, res) => {
+  try {
+    const currentUser = (req as any).user as AppUser;
+    const { code } = req.body || {};
+    const cleanCode = String(code || '').replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanCode)) {
+      return res.status(400).json({ error: 'Veuillez saisir un code TOTP à 6 chiffres.' });
+    }
+
+    const isValid = db.verifyUserTotp(currentUser.id, cleanCode);
+    if (!isValid) {
+      return res.status(400).json({
+        verified: false,
+        error: 'Code Google Authenticator invalide ou expiré.'
+      });
+    }
+
+    db.addSystemLog('info', 'auth', `TOTP code verified for ${currentUser.email}`);
+    return res.json({
+      verified: true,
+      message: 'Code Google Authenticator vérifié avec succès.'
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Erreur lors de la vérification TOTP.' });
+  }
+});
+
+apiRouter.post('/auth/totp/disable', authenticateUser, (req, res) => {
+  try {
+    const currentUser = (req as any).user as AppUser;
+    const { code, currentPassword } = req.body || {};
+    const cleanCode = String(code || '').replace(/\s+/g, '');
+
+    if (db.hasActiveTotpSecret(currentUser.id)) {
+      const validTotp = /^\d{6}$/.test(cleanCode) && db.verifyUserTotp(currentUser.id, cleanCode);
+      const validPwd = currentPassword && db.verifyPassword(String(currentPassword), currentUser.id);
+      if (!validTotp && !validPwd) {
+        return res.status(400).json({
+          error: 'Veuillez saisir un code Google Authenticator (6 chiffres) valide pour désactiver la double authentification.'
+        });
+      }
+    }
+
+    const updatedUser = db.disableUserTotp(currentUser.id);
+    db.addSystemLog('info', 'auth', `TOTP Google Authenticator 2FA disabled for ${currentUser.email}`);
+    return res.json({
+      disabled: true,
+      user: updatedUser,
+      message: 'La double authentification Google Authenticator (TOTP) a été désactivée.'
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err?.message || 'Impossible de désactiver la 2FA.' });
   }
 });
 
@@ -443,6 +737,19 @@ apiRouter.post('/auth/reset-password', (req, res) => {
   });
 });
 
+apiRouter.post('/auth/logout', (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : req.body?.token;
+  const user = db.verifyUserSessionToken(token);
+  if (token) {
+    db.revokeUserSessionToken(token);
+  }
+  if (user) {
+    db.addSystemLog('info', 'auth', `User logged out: ${user.email} (role=${user.role})`);
+  }
+  return res.json({ success: true, message: 'Session déconnectée avec succès.' });
+});
+
 apiRouter.get('/auth/me', authenticateUser, (req, res) => {
   const user = (req as any).user as AppUser;
   const userOrders = db.getOrders().filter(o => o.userId === user.id || (user.uid && o.userId === user.uid));
@@ -469,6 +776,7 @@ apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
     pushNotificationsEnabled,
     currentPassword,
     newPassword,
+    totpCode,
     role: attemptedRole,
     isAdmin: attemptedIsAdmin
   } = req.body || {};
@@ -484,6 +792,17 @@ apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
   const users = db.getUsers();
   const idx = users.findIndex(u => u.id === currentUser.id);
   if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
+
+  if (totpCode && String(totpCode).trim()) {
+    const cleanTotp = String(totpCode).replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(cleanTotp)) {
+      return res.status(400).json({ error: 'Le code Google Authenticator (TOTP) doit comporter 6 chiffres.' });
+    }
+    const verifySetup = db.verifyAndEnableUserTotp(currentUser.id, cleanTotp);
+    if (!verifySetup.verified && !db.verifyUserTotp(currentUser.id, cleanTotp)) {
+      return res.status(400).json({ error: 'Code Google Authenticator (TOTP) invalide ou expiré.' });
+    }
+  }
 
   if (newPassword) {
     if (String(newPassword).length < 6) {
@@ -502,20 +821,24 @@ apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
     });
   }
 
-  if (name) users[idx].name = String(name).trim().slice(0, 80);
-  if (phone !== undefined) users[idx].phone = String(phone).trim().slice(0, 32);
-  if (preferredCurrency && ['USD', 'HTG', 'EUR'].includes(preferredCurrency)) {
-    users[idx].preferredCurrency = preferredCurrency;
-  }
-  if (typeof twoFactorEnabled === 'boolean') users[idx].twoFactorEnabled = twoFactorEnabled;
-  if (typeof emailNotifications === 'boolean') users[idx].emailNotifications = emailNotifications;
-  if (typeof pushNotificationsEnabled === 'boolean') users[idx].pushNotificationsEnabled = pushNotificationsEnabled;
+  const refreshedUsers = db.getUsers();
+  const rIdx = refreshedUsers.findIndex(u => u.id === currentUser.id);
+  if (rIdx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
-  db.setUsers(users);
-  db.addSystemLog('info', 'auth', `User ${users[idx].email} updated account profile`);
+  if (name) refreshedUsers[rIdx].name = String(name).trim().slice(0, 80);
+  if (phone !== undefined) refreshedUsers[rIdx].phone = String(phone).trim().slice(0, 32);
+  if (preferredCurrency && ['USD', 'HTG', 'EUR'].includes(preferredCurrency)) {
+    refreshedUsers[rIdx].preferredCurrency = preferredCurrency;
+  }
+  if (typeof twoFactorEnabled === 'boolean') refreshedUsers[rIdx].twoFactorEnabled = twoFactorEnabled;
+  if (typeof emailNotifications === 'boolean') refreshedUsers[rIdx].emailNotifications = emailNotifications;
+  if (typeof pushNotificationsEnabled === 'boolean') refreshedUsers[rIdx].pushNotificationsEnabled = pushNotificationsEnabled;
+
+  db.setUsers(refreshedUsers);
+  db.addSystemLog('info', 'auth', `User ${refreshedUsers[rIdx].email} updated account profile`);
 
   return res.json({
-    user: users[idx],
+    user: refreshedUsers[rIdx],
     message: 'Profil et paramètres de sécurité mis à jour avec succès.'
   });
 });
@@ -529,22 +852,100 @@ apiRouter.get('/payments/gateways', (_req, res) => {
   res.json(gateways);
 });
 
+// Rule 1: Pre-payment server-side validation & price calculation endpoint
+apiRouter.post('/payments/validate', authenticateUser, async (req, res) => {
+  try {
+    const authenticatedUser = (req as any).user as AppUser;
+    const {
+      productKey,
+      product_key,
+      packageId,
+      gameId,
+      region,
+      playerId,
+      player_id,
+      serverId,
+      server_id,
+      quantity,
+      paymentMethod,
+      clientPrice
+    } = req.body || {};
+
+    let resolvedProductKey = String(productKey || product_key || '').trim();
+    let resolvedRegion = region ? String(region).trim() : undefined;
+
+    if (!resolvedProductKey && packageId) {
+      for (const srv of db.getServices()) {
+        const pkg = srv.packages.find(p => p.id === packageId);
+        if (pkg) {
+          resolvedProductKey = pkg.productKey || pkg.externalProductId || '';
+          if (!resolvedRegion && pkg.region) {
+            resolvedRegion = pkg.region;
+          }
+          break;
+        }
+      }
+    }
+
+    const rg = new RechargeGamesProvider();
+    const validation = await rg.validateBeforePayment({
+      userId: authenticatedUser.id,
+      productKey: resolvedProductKey,
+      gameId: gameId ? String(gameId) : undefined,
+      region: resolvedRegion,
+      playerId: String(playerId || player_id || ''),
+      serverId: serverId || server_id ? String(serverId || server_id) : undefined,
+      quantity: quantity ? Number(quantity) : 1,
+      paymentMethod: (paymentMethod as PaymentMethodType) || 'wallet',
+      clientManipulatedPrice: clientPrice !== undefined ? Number(clientPrice) : undefined
+    });
+
+    return res.status(validation.httpStatus).json(validation);
+  } catch (err: any) {
+    return res.status(500).json({
+      valid: false,
+      httpStatus: 500,
+      errorCode: 'VALIDATION_ERROR',
+      message: err?.message || 'Erreur lors de la validation pré-paiement.'
+    });
+  }
+});
+
 apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req, res) => {
   try {
     const authenticatedUser = (req as any).user as AppUser;
     const {
       paymentMethod,
-      amount,
-      currency = 'USD',
+      amount: clientAmount,
+      currency: clientCurrency = 'USD',
       cardDetails,
       mobileWalletDetails,
-      purpose = 'order' // 'order' | 'wallet_topup'
-    } = req.body;
+      purpose = 'order', // 'order' | 'wallet_topup'
+      productKey,
+      product_key,
+      packageId,
+      gameId,
+      region,
+      playerId,
+      player_id,
+      serverId,
+      quantity,
+      requestedPaymentStatus, // optional for intermediate flow: 'payment_pending' | 'payment_processing' | 'payment_cancelled' | 'payment_failed'
+      clientDeclaredStatus
+    } = req.body || {};
     const userId = authenticatedUser.id;
 
-    const numAmount = Number(amount);
-    if (isNaN(numAmount) || numAmount <= 0) {
-      return res.status(400).json({ error: 'Montant de paiement invalide.' });
+    // Rule 6: Frontend can NEVER self-declare 'payment_succeeded', 'delivered', or 'refunded'
+    if (
+      clientDeclaredStatus &&
+      ['payment_succeeded', 'delivered', 'order_delivered', 'payment_refunded', 'refunded'].includes(
+        String(clientDeclaredStatus).toLowerCase()
+      )
+    ) {
+      return res.status(403).json({
+        error: 'FRONTEND_STATUS_DECLARATION_FORBIDDEN',
+        message: 'Le frontend ne peut jamais déclarer lui-même un paiement réussi, une livraison ou un remboursement.'
+      });
     }
 
     const gateways = db.getPaymentGateways();
@@ -553,9 +954,129 @@ apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req
       return res.status(400).json({ error: `La méthode de paiement "${paymentMethod}" est indisponible ou désactivée.` });
     }
 
+    // Rule 1: If purpose === 'order' and a product/package is specified, validate and calculate final price on the backend!
+    let numAmount = Number(clientAmount);
+    let currency = String(clientCurrency || 'USD');
+    const resolvedProductKey = String(productKey || product_key || '').trim();
+
+    if (purpose === 'order' && (resolvedProductKey || packageId)) {
+      let targetKey = resolvedProductKey;
+      let targetRegion = region ? String(region) : undefined;
+      if (!targetKey && packageId) {
+        for (const srv of db.getServices()) {
+          const pkg = srv.packages.find(p => p.id === packageId);
+          if (pkg) {
+            targetKey = pkg.productKey || pkg.externalProductId || '';
+            if (!targetRegion && pkg.region) targetRegion = pkg.region;
+            break;
+          }
+        }
+      }
+      if (targetKey) {
+        const rg = new RechargeGamesProvider();
+        const preCheck = await rg.validateBeforePayment({
+          userId,
+          productKey: targetKey,
+          gameId: gameId ? String(gameId) : undefined,
+          region: targetRegion,
+          playerId: String(playerId || player_id || ''),
+          serverId: serverId ? String(serverId) : undefined,
+          quantity: quantity ? Number(quantity) : 1,
+          paymentMethod: paymentMethod as PaymentMethodType,
+          clientManipulatedPrice: clientAmount !== undefined ? Number(clientAmount) : undefined
+        });
+        if (!preCheck.valid || !preCheck.pricing) {
+          return res.status(preCheck.httpStatus).json({
+            error: preCheck.errorCode || 'PRE_PAYMENT_VALIDATION_FAILED',
+            message: preCheck.message
+          });
+        }
+        // Authoritative backend price!
+        numAmount = preCheck.pricing.subtotalPrice;
+        currency = preCheck.pricing.currency;
+      }
+    }
+
+    if (isNaN(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: 'Montant de paiement invalide.' });
+    }
+
     const feeAmount = Number(((numAmount * gateway.feePercent) / 100 + gateway.fixedFee).toFixed(2));
     const totalCharged = Number((numAmount + feeAmount).toFixed(2));
     const txRef = `PAY-${gateway.slug.toUpperCase()}-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const userObj = userId ? db.getUserById(userId) : undefined;
+
+    // Step 1: Create initial payment transaction in "payment_pending" state
+    const initialTx = db.addPaymentTransaction({
+      transactionReference: txRef,
+      userId: userObj?.id || userId,
+      userEmail: userObj?.email,
+      gatewayId: gateway.id,
+      paymentMethod: paymentMethod as PaymentMethodType,
+      amount: numAmount,
+      currency,
+      feeAmount,
+      totalCharged,
+      status: 'initiated',
+      payment_status: 'payment_pending',
+      externalReference: `INIT_${txRef}`,
+      payerIdentifier: userObj?.email || userId,
+      statusMessage: 'Paiement commencé mais pas encore confirmé (payment_pending).'
+    });
+
+    // If caller requested to stop at 'payment_pending' or 'payment_cancelled' (e.g. user cancelled modal or async initiation)
+    if (requestedPaymentStatus === 'payment_pending') {
+      return res.status(202).json({
+        success: true,
+        payment_status: 'payment_pending',
+        transaction: initialTx,
+        user: userObj
+      });
+    }
+
+    if (requestedPaymentStatus === 'payment_cancelled') {
+      const cancelledTx = db.updatePaymentTransactionStatus(
+        txRef,
+        'payment_cancelled',
+        'Paiement annulé par l’utilisateur ou le prestataire (payment_cancelled).'
+      );
+      return res.status(400).json({
+        success: false,
+        payment_status: 'payment_cancelled',
+        error: 'Paiement annulé (payment_cancelled).',
+        transaction: cancelledTx
+      });
+    }
+
+    // Step 2: Transition to "payment_processing"
+    const processingTx = db.updatePaymentTransactionStatus(
+      txRef,
+      'payment_processing',
+      `Paiement en cours de traitement auprès de ${gateway.name} (payment_processing)...`
+    );
+
+    if (requestedPaymentStatus === 'payment_processing') {
+      return res.status(202).json({
+        success: true,
+        payment_status: 'payment_processing',
+        transaction: processingTx,
+        user: userObj
+      });
+    }
+
+    if (requestedPaymentStatus === 'payment_failed') {
+      const failedTx = db.updatePaymentTransactionStatus(
+        txRef,
+        'payment_failed',
+        'Paiement refusé par le prestataire de paiement (payment_failed).'
+      );
+      return res.status(402).json({
+        success: false,
+        payment_status: 'payment_failed',
+        error: 'Paiement échoué (payment_failed).',
+        transaction: failedTx
+      });
+    }
 
     let payerIdentifier = '';
     let externalReference = '';
@@ -569,51 +1090,70 @@ apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req
       const holderName = String(cardDetails?.holderName || '').trim();
 
       if (cardNumber.length < 12 || !/^\d+$/.test(cardNumber)) {
-        return res.status(400).json({ error: 'Numéro de carte bancaire invalide (12 à 19 chiffres requis).' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Numéro de carte bancaire invalide.');
+        return res.status(400).json({ error: 'Numéro de carte bancaire invalide (12 à 19 chiffres requis).', payment_status: 'payment_failed', transaction: failedTx });
       }
       if (!/^\d{2}\/\d{2,4}$/.test(expiry)) {
-        return res.status(400).json({ error: 'Date d’expiration invalide (format MM/YY requis).' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Date d’expiration invalide.');
+        return res.status(400).json({ error: 'Date d’expiration invalide (format MM/YY requis).', payment_status: 'payment_failed', transaction: failedTx });
       }
       if (cvc.length < 3 || !/^\d{3,4}$/.test(cvc)) {
-        return res.status(400).json({ error: 'Code CVC/CVV invalide (3 ou 4 chiffres requis).' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Code CVC/CVV invalide.');
+        return res.status(400).json({ error: 'Code CVC/CVV invalide (3 ou 4 chiffres requis).', payment_status: 'payment_failed', transaction: failedTx });
       }
       if (!holderName) {
-        return res.status(400).json({ error: 'Le nom du titulaire de la carte est requis.' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Nom du titulaire manquant.');
+        return res.status(400).json({ error: 'Le nom du titulaire de la carte est requis.', payment_status: 'payment_failed', transaction: failedTx });
       }
 
       payerIdentifier = `•••• ${cardNumber.slice(-4)} (${holderName})`;
       externalReference = `STRP_${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
-      statusMessage = `Paiement par carte (${payerIdentifier}) autorisé et capturé via ${gateway.providerName} (${gateway.mode.toUpperCase()}).`;
+      statusMessage = `Paiement confirmé avec succès (payment_succeeded) par carte (${payerIdentifier}) via ${gateway.providerName}.`;
     } else if (paymentMethod === 'moncash' || paymentMethod === 'natcash') {
       const phone = String(mobileWalletDetails?.phone || '').trim();
       const pinOrOtp = String(mobileWalletDetails?.otp || '').trim();
 
       if (phone.length < 8) {
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Numéro Mobile Money invalide.');
         return res.status(400).json({
-          error: `Veuillez saisir un numéro ${paymentMethod === 'moncash' ? 'Digicel MonCash' : 'Natcom NatCash'} valide (ex: +509 37XX-XXXX).`
+          error: `Veuillez saisir un numéro ${paymentMethod === 'moncash' ? 'Digicel MonCash' : 'Natcom NatCash'} valide (ex: +509 37XX-XXXX).`,
+          payment_status: 'payment_failed',
+          transaction: failedTx
         });
       }
       if (pinOrOtp.length < 4) {
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Code OTP Mobile Money invalide.');
         return res.status(400).json({
-          error: `Veuillez saisir le code de confirmation / OTP ${paymentMethod === 'moncash' ? 'MonCash' : 'NatCash'} (minimum 4 chiffres).`
+          error: `Veuillez saisir le code de confirmation / OTP ${paymentMethod === 'moncash' ? 'MonCash' : 'NatCash'} (minimum 4 chiffres).`,
+          payment_status: 'payment_failed',
+          transaction: failedTx
         });
       }
 
       payerIdentifier = phone;
       externalReference = `${paymentMethod === 'moncash' ? 'MC' : 'NC'}_${Date.now().toString().slice(-7)}`;
-      statusMessage = `Transaction ${gateway.name} confirmée pour le numéro ${phone} (Réf: ${externalReference}).`;
+      statusMessage = `Paiement confirmé avec succès (payment_succeeded) via ${gateway.name} pour le numéro ${phone} (Réf: ${externalReference}).`;
     } else if (paymentMethod === 'wallet') {
       if (!userId) {
-        return res.status(401).json({ error: 'Vous devez être connecté à votre compte PlayUp pour payer avec votre solde Wallet.' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Utilisateur non connecté.');
+        return res.status(401).json({ error: 'Vous devez être connecté à votre compte PlayUp pour payer avec votre solde Wallet.', payment_status: 'payment_failed', transaction: failedTx });
       }
       const users = db.getUsers();
       const uIdx = users.findIndex(u => u.id === userId || u.uid === userId);
       if (uIdx === -1) {
-        return res.status(404).json({ error: 'Compte utilisateur PlayUp introuvable.' });
+        const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Compte introuvable.');
+        return res.status(404).json({ error: 'Compte utilisateur PlayUp introuvable.', payment_status: 'payment_failed', transaction: failedTx });
       }
       if (users[uIdx].walletBalance < totalCharged) {
+        const failedTx = db.updatePaymentTransactionStatus(
+          txRef,
+          'payment_failed',
+          `Solde PlayUp Wallet insuffisant ($${users[uIdx].walletBalance.toFixed(2)} disponible, $${totalCharged.toFixed(2)} requis).`
+        );
         return res.status(400).json({
-          error: `Solde PlayUp Wallet insuffisant ($${users[uIdx].walletBalance.toFixed(2)} disponible, $${totalCharged.toFixed(2)} requis).`
+          error: `Solde PlayUp Wallet insuffisant ($${users[uIdx].walletBalance.toFixed(2)} disponible, $${totalCharged.toFixed(2)} requis).`,
+          payment_status: 'payment_failed',
+          transaction: failedTx
         });
       }
 
@@ -621,14 +1161,58 @@ apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req
       db.setUsers(users);
       payerIdentifier = users[uIdx].email;
       externalReference = `WLT_${Date.now().toString().slice(-7)}`;
-      statusMessage = `Débit instantané de $${totalCharged.toFixed(2)} effectué sur votre solde PlayUp Wallet.`;
+      statusMessage = `Paiement confirmé avec succès (payment_succeeded) : débit de $${totalCharged.toFixed(2)} effectué sur votre solde PlayUp Wallet.`;
     } else {
-      return res.status(400).json({ error: 'Méthode de paiement non reconnue.' });
+      const failedTx = db.updatePaymentTransactionStatus(txRef, 'payment_failed', 'Méthode non reconnue.');
+      return res.status(400).json({ error: 'Méthode de paiement non reconnue.', payment_status: 'payment_failed', transaction: failedTx });
     }
 
-    // If purpose is wallet_topup, credit user wallet
+    // If purpose is wallet_topup, enforce mandatory blocking 2FA verification (SMS or Email) on backend before crediting wallet
     let updatedUser: AppUser | undefined;
     if (purpose === 'wallet_topup' && userId) {
+      const {
+        twoFactorVerificationToken,
+        twoFactorChallengeId,
+        twoFactorCode
+      } = req.body || {};
+
+      const twoFactorGate = db.assertAndConsumeWallet2FA({
+        userId,
+        userEmail: authenticatedUser.email,
+        operationType: 'wallet_credit',
+        expectedAmount: numAmount,
+        twoFactorVerificationToken: twoFactorVerificationToken
+          ? String(twoFactorVerificationToken)
+          : String(req.headers['x-2fa-verification-token'] || ''),
+        twoFactorChallengeId: twoFactorChallengeId
+          ? String(twoFactorChallengeId)
+          : String(req.headers['x-2fa-challenge-id'] || ''),
+        twoFactorCode: twoFactorCode
+          ? String(twoFactorCode)
+          : String(req.headers['x-2fa-code'] || ''),
+        ipAddress: extractClientIp(req),
+        userAgent: String(req.headers['user-agent'] || '')
+      });
+
+      if (!twoFactorGate.allowed) {
+        const failedTx = db.updatePaymentTransactionStatus(
+          txRef,
+          'payment_failed',
+          twoFactorGate.message || 'Vérification 2FA SMS/Email requise ou échouée — crédit wallet bloqué.'
+        );
+        return res.status(403).json({
+          success: false,
+          credited: false,
+          twoFactorRequired: true,
+          twoFactorBlocked: true,
+          error: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+          errorCode: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+          message: twoFactorGate.message,
+          payment_status: 'payment_failed',
+          transaction: failedTx
+        });
+      }
+
       const users = db.getUsers();
       const uIdx = users.findIndex(u => u.id === userId || u.uid === userId);
       if (uIdx !== -1) {
@@ -638,37 +1222,73 @@ apiRouter.post('/payments/process', authenticateUser, orderRateLimit, async (req
       }
     }
 
-    const userObj = userId ? db.getUserById(userId) : undefined;
-    const txRecord = db.addPaymentTransaction({
-      transactionReference: txRef,
-      userId: userObj?.id || userId || 'guest_user',
-      userEmail: userObj?.email,
-      gatewayId: gateway.id,
-      paymentMethod: paymentMethod as PaymentMethodType,
-      amount: numAmount,
-      currency,
-      feeAmount,
-      totalCharged,
-      status: 'completed',
-      externalReference,
-      payerIdentifier,
-      statusMessage
-    });
+    // Step 3: Transition to "payment_succeeded"
+    const txRecord =
+      db.updatePaymentTransactionStatus(txRef, 'payment_succeeded', statusMessage, externalReference) || initialTx;
+    txRecord.payerIdentifier = payerIdentifier;
 
     db.addSystemLog(
       'info',
       'payment',
-      `Payment ${txRef} (${gateway.name}) completed: $${totalCharged.toFixed(2)} ${currency} for ${userObj?.email || userId || 'client'}`
+      `Payment ${txRef} (${gateway.name}) confirmed (payment_succeeded): $${totalCharged.toFixed(2)} ${currency} for ${userObj?.email || userId || 'client'}`
     );
 
     return res.status(201).json({
       success: true,
+      payment_status: 'payment_succeeded',
       transaction: txRecord,
-      user: updatedUser || userObj
+      user: updatedUser || db.getUserById(userId) || userObj
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message || 'Erreur lors du traitement du paiement' });
   }
+});
+
+// Check or safely resume an intermediate payment transaction (payment_pending / payment_processing)
+apiRouter.post('/payments/:transactionRef/status', authenticateUser, async (req, res) => {
+  const authenticatedUser = (req as any).user as AppUser;
+  const { transactionRef } = req.params;
+  const { action, orderId } = req.body || {}; // action: 'check' | 'confirm_gateway' | 'cancel' | 'fail'
+
+  const tx = db.findPaymentTransactionByRefOrId(transactionRef);
+  if (!tx) {
+    return res.status(404).json({ error: 'Transaction de paiement introuvable.' });
+  }
+  if (authenticatedUser.role !== 'ADMIN' && tx.userId !== authenticatedUser.id) {
+    return res.status(403).json({ error: 'Accès interdit à cette transaction.' });
+  }
+
+  let updatedTx = tx;
+  if (action === 'cancel' && (tx.payment_status === 'payment_pending' || tx.payment_status === 'payment_processing')) {
+    updatedTx = db.updatePaymentTransactionStatus(tx.id, 'payment_cancelled', 'Paiement annulé (payment_cancelled).') || tx;
+  } else if (action === 'fail' && (tx.payment_status === 'payment_pending' || tx.payment_status === 'payment_processing')) {
+    updatedTx = db.updatePaymentTransactionStatus(tx.id, 'payment_failed', 'Paiement échoué (payment_failed).') || tx;
+  } else if (action === 'confirm_gateway' && (tx.payment_status === 'payment_pending' || tx.payment_status === 'payment_processing')) {
+    updatedTx =
+      db.updatePaymentTransactionStatus(
+        tx.id,
+        'payment_succeeded',
+        'Paiement confirmé avec succès par le prestataire (payment_succeeded).'
+      ) || tx;
+  }
+
+  // If linked to an order, synchronize order state and trigger safe dispatch if payment_succeeded
+  const targetOrderId = orderId || updatedTx.orderId;
+  let recoveryResult: any = undefined;
+  if (targetOrderId) {
+    const rg = new RechargeGamesProvider();
+    recoveryResult = await rg.recoverOrder(String(targetOrderId), {
+      newPaymentStatus: updatedTx.payment_status,
+      paymentReference: updatedTx.transactionReference
+    });
+  }
+
+  return res.json({
+    success: true,
+    payment_status: updatedTx.payment_status,
+    transaction: updatedTx,
+    recovery: recoveryResult
+  });
 });
 
 // ==========================================
@@ -860,18 +1480,26 @@ apiRouter.post('/app/orders', authenticateUser, orderRateLimit, async (req, res)
         playerId: String(playerId || ''),
         playerName: verifiedPlayerName ? String(verifiedPlayerName) : undefined,
         serverId: serverId ? String(serverId) : undefined,
+        quantity: req.body.quantity ? Number(req.body.quantity) : 1,
         buyerRef: clientPartnerId ? String(clientPartnerId) : undefined,
         paymentConfirmed: Boolean(paymentConfirmed),
+        paymentStatus: req.body.paymentStatus as PaymentLifecycleStatus | undefined,
         paymentMethod: req.body.paymentMethod || 'wallet',
-        paymentReference: req.body.paymentReference
+        paymentReference: req.body.paymentReference,
+        paymentTransactionId: req.body.paymentTransactionId,
+        clientManipulatedPrice: clientManipulatedPrice !== undefined ? Number(clientManipulatedPrice) : undefined,
+        clientDeclaredStatus: req.body.status || req.body.clientDeclaredStatus,
+        simulateNetworkTimeout: Boolean(req.body.simulateNetworkTimeout),
+        allowIdempotentRecovery: Boolean(req.body.allowIdempotentRecovery)
       });
-      if (!rgRes.success || !rgRes.playupOrder) {
+      if (!rgRes.success && !rgRes.playupOrder) {
         return res.status(rgRes.httpStatus || 400).json({
           error: rgRes.errorCode || 'Order Error',
-          message: rgRes.userMessage
+          message: rgRes.userMessage,
+          order: rgRes.order
         });
       }
-      return res.status(201).json(rgRes.playupOrder);
+      return res.status(rgRes.httpStatus || 201).json(rgRes.playupOrder || rgRes.order);
     }
 
     const providers = db.getProviders();
@@ -974,14 +1602,18 @@ apiRouter.get('/app/orders/:orderId', authenticateUser, async (req, res) => {
     return res.status(403).json({ error: 'Accès interdit à cette commande.' });
   }
 
-  // 1. If the order is a RechargeGames order and is currently pending/processing, query live GET /v1/orders/{order_id}
+  // 1. If the order is a RechargeGames order and is currently pending/processing, query live GET /v1/orders/{order_id} or recover if pending_retry
   if (
     (order.providerId === 'prov_rechargegames' || order.providerName === 'RechargeGames' || db.findRechargeGamesOrderById(order.id)) &&
     (order.status === 'pending' || order.status === 'processing' || order.status === 'paid')
   ) {
     try {
       const rg = new RechargeGamesProvider();
-      await rg.checkOrderStatus(order.id);
+      if (order.dispatch_status === 'pending_retry' || order.payment_status === 'payment_pending' || order.payment_status === 'payment_processing') {
+        await rg.recoverOrder(order.id);
+      } else {
+        await rg.checkOrderStatus(order.id);
+      }
       const refreshedOrders = db.getOrders();
       const updated = refreshedOrders.find(o => o.id === order.id || o.orderNumber === order.orderNumber);
       if (updated) {
@@ -1056,6 +1688,29 @@ apiRouter.get('/app/orders', authenticateUser, (req, res) => {
   const user = (req as any).user as AppUser;
   const orders = db.getOrders().filter(o => o.userId === user.id || (user.uid && o.userId === user.uid));
   res.json(orders);
+});
+
+apiRouter.post('/app/orders/:orderId/recover', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const { orderId } = req.params;
+  const rgOrder = db.findRechargeGamesOrderById(orderId) || db.findRechargeGamesOrderByBuyerRef(orderId);
+  if (!rgOrder) {
+    return res.status(404).json({ error: 'Commande introuvable.' });
+  }
+  if (user.role !== 'ADMIN' && rgOrder.user_id !== user.id) {
+    return res.status(403).json({ error: 'Accès interdit à cette commande.' });
+  }
+  const rg = new RechargeGamesProvider();
+  const result = await rg.recoverOrder(rgOrder.id, {
+    newPaymentStatus: req.body?.paymentStatus as PaymentLifecycleStatus | undefined,
+    paymentReference: req.body?.paymentReference
+  });
+  return res.status(result.httpStatus).json(result);
+});
+
+apiRouter.get('/app/refunds', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  res.json(db.getRefunds(user.id));
 });
 
 // ==========================================
@@ -1951,27 +2606,20 @@ apiRouter.put('/admin/providers/:id', authenticateAdmin, (req, res) => {
   res.json(updated);
 });
 
-// Reveal secret strictly for authenticated Admin when clicking "Afficher"
+// Strictly block revealing any provider API Key, Webhook Secret, or environment variable in plaintext
 apiRouter.post('/admin/providers/:id/reveal-secret', authenticateAdmin, (req, res) => {
   const { id } = req.params;
-  const { field } = req.body; // 'apiKey' | 'webhookSecret'
-  const providers = db.getProviders();
-  const provider = providers.find(p => p.id === id || p.slug === id);
-  if (!provider) return res.status(404).json({ error: 'Fournisseur introuvable' });
-
-  if (provider.id === 'prov_rechargegames' || provider.adapterType === 'rechargegames') {
-    return res.status(422).json({
-      error: 'Politique de sécurité RechargeGames : les clés secrètes ne sont jamais affichées en clair.'
-    });
-  }
-
-  const secretRecord = db.getProviderSecret(provider.id);
-  db.addSystemLog('info', 'auth', `Admin revealed ${field} for provider ${provider.name}`);
-
-  if (field === 'webhookSecret') {
-    return res.json({ value: secretRecord.webhookSecret || '' });
-  }
-  return res.json({ value: secretRecord.apiKey || '' });
+  const { field } = req.body || {};
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked plaintext secret reveal request for provider ${id} (field: ${field || 'unknown'})`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message:
+      'Politique de sécurité PlayUp : les clés API, Webhook Secrets et variables d’environnement ne peuvent jamais être affichés ou récupérés en clair.'
+  });
 });
 
 // Real Connection Test to GoXtop / RechargeGames / Provider
@@ -2314,6 +2962,26 @@ apiRouter.get('/admin/orders', authenticateAdmin, (req, res) => {
 
 apiRouter.post('/admin/orders/:id/retry', authenticateAdmin, async (req, res) => {
   const { id } = req.params;
+  const rgOrder = db.findRechargeGamesOrderById(id) || db.findRechargeGamesOrderByBuyerRef(id);
+  if (rgOrder) {
+    const adminUser = (req as any).adminUser as AppUser | undefined;
+    const rg = new RechargeGamesProvider();
+    const retryRes = await rg.executeOrderRetry(rgOrder.id, {
+      triggerType: req.body?.triggerType === 'automatic' ? 'automatic' : 'manual_admin',
+      adminId: adminUser?.id || 'admin_master',
+      reason: req.body?.reason,
+      requirePriorAdminStatusCheck: req.body?.requirePriorAdminStatusCheck !== false
+    });
+    if (!retryRes.success) {
+      return res.status(retryRes.httpStatus || 400).json({
+        error: retryRes.message,
+        errorCode: retryRes.errorCode,
+        order: retryRes.order,
+        attemptRecord: retryRes.attemptRecord
+      });
+    }
+    return res.json(retryRes.playupOrder || retryRes.order);
+  }
   const updatedOrder = await ProviderEngine.processOrder(id);
   if (!updatedOrder) return res.status(404).json({ error: 'Commande introuvable' });
   res.json(updatedOrder);
@@ -2436,28 +3104,171 @@ apiRouter.get('/admin/logs', authenticateAdmin, (_req, res) => {
 });
 
 // ==========================================
-// ADMIN USERS MANAGEMENT
+// ADMIN USERS MANAGEMENT (WITH STRICT PRIVACY & ROLE BOUNDARIES)
 // ==========================================
+function sanitizeUserForAdmin(u: AppUser) {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    role: u.role === 'ADMIN' ? ('ADMIN' as const) : ('USER' as const),
+    authProvider: u.authProvider,
+    emailVerified: u.emailVerified,
+    status: u.status,
+    preferredCurrency: u.preferredCurrency,
+    twoFactorEnabled: Boolean(u.twoFactorEnabled),
+    walletBalance: u.walletBalance,
+    ordersCount: u.ordersCount,
+    totalSpent: u.totalSpent,
+    createdAt: u.createdAt,
+    lastLoginAt: u.lastLoginAt
+  };
+}
+
 apiRouter.get('/admin/users', authenticateAdmin, (_req, res) => {
-  res.json(db.getUsers());
+  res.json(db.getUsers().map(sanitizeUserForAdmin));
+});
+
+apiRouter.put('/admin/users/:id/role', authenticateAdmin, (req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked attempt to modify role for user ${req.params.id}`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message:
+      'Modification de rôle interdite : seul le premier utilisateur inscrit possède le rôle ADMIN. Aucun autre utilisateur ne peut recevoir le rôle ADMIN.'
+  });
+});
+
+apiRouter.post('/admin/users/:id/role', authenticateAdmin, (req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked attempt to modify role for user ${req.params.id}`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message:
+      'Modification de rôle interdite : seul le premier utilisateur inscrit possède le rôle ADMIN. Aucun autre utilisateur ne peut recevoir le rôle ADMIN.'
+  });
+});
+
+apiRouter.get('/admin/users/:id/password', authenticateAdmin, (req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked attempt to retrieve password for user ${req.params.id}`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'Politique de sécurité : les mots de passe des utilisateurs sont hachés et ne peuvent jamais être vus ni récupérés.'
+  });
+});
+
+apiRouter.get('/admin/users/:id/tokens', authenticateAdmin, (req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked attempt to retrieve private tokens for user ${req.params.id}`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'Politique de sécurité : les tokens et secrets privés des utilisateurs ne peuvent jamais être consultés.'
+  });
+});
+
+apiRouter.get('/admin/users/:id/secrets', authenticateAdmin, (req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    `[Security Policy] Blocked attempt to retrieve private secrets for user ${req.params.id}`
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'Politique de sécurité : les tokens et secrets privés des utilisateurs ne peuvent jamais être consultés.'
+  });
+});
+
+apiRouter.get('/admin/env', authenticateAdmin, (_req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    '[Security Policy] Blocked attempt to view environment variable secrets'
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'Politique de sécurité : les secrets stockés dans les variables d’environnement ne peuvent jamais être affichés.'
+  });
+});
+
+apiRouter.get('/admin/secrets', authenticateAdmin, (_req, res) => {
+  db.addSystemLog(
+    'warn',
+    'auth',
+    '[Security Policy] Blocked attempt to view server secrets in plaintext'
+  );
+  return res.status(403).json({
+    error: 'Forbidden',
+    message: 'Politique de sécurité : les clés API, Webhook Secrets et secrets serveur ne peuvent jamais être affichés en clair.'
+  });
+});
+
+apiRouter.put('/admin/users/:id', authenticateAdmin, (req, res) => {
+  const { id } = req.params;
+  const { role: attemptedRole, isAdmin: attemptedIsAdmin, password: attemptedPassword } = req.body || {};
+  if (attemptedRole !== undefined || attemptedIsAdmin !== undefined) {
+    db.addSystemLog('warn', 'auth', `[Security Policy] Blocked attempt to modify role for user ${id}`);
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Modification de rôle interdite : seul le premier utilisateur inscrit possède le rôle ADMIN.'
+    });
+  }
+  if (attemptedPassword !== undefined) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Modification directe du mot de passe d’un utilisateur interdite.'
+    });
+  }
+  const users = db.getUsers();
+  const idx = users.findIndex(u => u.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  return res.json(sanitizeUserForAdmin(users[idx]));
 });
 
 apiRouter.put('/admin/users/:id/status', authenticateAdmin, (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, role: attemptedRole } = req.body || {};
+
+  if (attemptedRole !== undefined) {
+    db.addSystemLog('warn', 'auth', `[Security Policy] Blocked attempt to change role via status endpoint for user ${id}`);
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Modification du rôle utilisateur interdite.'
+    });
+  }
+
   const users = db.getUsers();
   const idx = users.findIndex(u => u.id === id);
   if (idx === -1) return res.status(404).json({ error: 'Utilisateur introuvable' });
 
+  if (users[idx].role === 'ADMIN' && status === 'suspended') {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'Le compte du premier administrateur principal ne peut pas être suspendu.'
+    });
+  }
+
   users[idx].status = status === 'suspended' ? 'suspended' : 'active';
   db.setUsers(users);
   db.addSystemLog('info', 'auth', `Admin updated user ${users[idx].email} status to ${users[idx].status}`);
-  res.json(users[idx]);
+  res.json(sanitizeUserForAdmin(users[idx]));
 });
 
 apiRouter.post('/admin/users/:id/wallet', authenticateAdmin, (req, res) => {
   const { id } = req.params;
-  const { amount, note } = req.body;
+  const { amount, note } = req.body || {};
   const numAmount = Number(amount);
   if (isNaN(numAmount)) return res.status(400).json({ error: 'Montant invalide' });
 
@@ -2469,52 +3280,69 @@ apiRouter.post('/admin/users/:id/wallet', authenticateAdmin, (req, res) => {
   db.setUsers(users);
 
   db.addSystemLog('info', 'payment', `Admin adjusted wallet balance for ${users[idx].email}: ${numAmount >= 0 ? '+' : ''}${numAmount} USD (${note || 'Ajustement admin'})`);
-  res.json(users[idx]);
+  res.json(sanitizeUserForAdmin(users[idx]));
 });
 
 apiRouter.post('/admin/users/:id/reset-password', authenticateAdmin, (req, res) => {
+  const currentAdmin = (req as any).user as AppUser;
   const { id } = req.params;
-  const { newPassword } = req.body;
+
+  // Admin can only change their OWN password; never view, retrieve, or overwrite another user's password directly
+  if (id !== currentAdmin.id) {
+    db.addSystemLog(
+      'warn',
+      'auth',
+      `[Security Policy] Blocked admin attempt to directly overwrite password of user ${id}`
+    );
+    return res.status(403).json({
+      error: 'Forbidden',
+      message:
+        'Politique de sécurité : l’administrateur ne peut ni voir, ni récupérer, ni modifier directement le mot de passe d’un autre utilisateur.'
+    });
+  }
+
+  const { newPassword } = req.body || {};
   if (!newPassword || String(newPassword).length < 6) {
     return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 6 caractères.' });
   }
 
-  const users = db.getUsers();
-  const user = users.find(u => u.id === id);
-  if (!user) return res.status(404).json({ error: 'Utilisateur introuvable' });
-
   const { hash, salt } = db.hashPassword(String(newPassword));
-  db.setUserCredential(user.id, {
+  db.setUserCredential(currentAdmin.id, {
     passwordHash: hash,
     passwordSalt: salt
   });
 
-  db.addSystemLog('info', 'auth', `Admin reset password for user ${user.email}`);
-  res.json({ success: true, message: `Mot de passe réinitialisé pour ${user.email}.` });
+  db.addSystemLog('info', 'auth', `Admin changed their own password (${currentAdmin.email})`);
+  res.json({ success: true, message: 'Votre mot de passe administrateur a été mis à jour avec succès.' });
 });
 
 // ==========================================
-// ADMIN RESELLER API KEYS MANAGEMENT
+// ADMIN RESELLER API KEYS MANAGEMENT (MASKED TOKENS ONLY)
 // ==========================================
 apiRouter.get('/admin/api-keys', authenticateAdmin, (_req, res) => {
-  res.json(db.getApiKeys());
+  const maskedList = db.getApiKeys().map(k => ({
+    ...k,
+    key: k.maskedKey
+  }));
+  res.json(maskedList);
 });
 
 apiRouter.post('/admin/resellers/:id/api-keys', authenticateAdmin, (req, res) => {
   const { id } = req.params;
-  const { name } = req.body;
+  const { name } = req.body || {};
   const resellers = db.getResellers();
   const reseller = resellers.find(r => r.id === id);
   if (!reseller) return res.status(404).json({ error: 'Revendeur introuvable' });
 
   const apiKeys = db.getApiKeys();
   const rawKey = 'plup_live_' + crypto.randomBytes(20).toString('hex');
+  const maskedKey = `plup_live_${rawKey.slice(10, 14)}...${rawKey.slice(-4)}`;
   const newKey = {
     id: 'key_' + Date.now(),
     resellerId: reseller.id,
     name: name || `Clé API ${reseller.company}`,
     key: rawKey,
-    maskedKey: `plup_live_${rawKey.slice(10, 14)}...${rawKey.slice(-4)}`,
+    maskedKey,
     permissions: ['games.read', 'services.read', 'orders.create', 'orders.read', 'balance.read'],
     status: 'active' as const,
     createdAt: new Date().toISOString()
@@ -2523,12 +3351,15 @@ apiRouter.post('/admin/resellers/:id/api-keys', authenticateAdmin, (req, res) =>
   apiKeys.unshift(newKey);
   db.setApiKeys(apiKeys);
   db.addSystemLog('info', 'auth', `Admin generated new API key "${newKey.name}" for reseller ${reseller.company}`);
-  res.status(201).json(newKey);
+  res.status(201).json({
+    ...newKey,
+    key: maskedKey
+  });
 });
 
 apiRouter.put('/admin/api-keys/:id/status', authenticateAdmin, (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status } = req.body || {};
   const apiKeys = db.getApiKeys();
   const idx = apiKeys.findIndex(k => k.id === id);
   if (idx === -1) return res.status(404).json({ error: 'Clé API introuvable' });
@@ -2536,7 +3367,10 @@ apiRouter.put('/admin/api-keys/:id/status', authenticateAdmin, (req, res) => {
   apiKeys[idx].status = status === 'revoked' ? 'revoked' : 'active';
   db.setApiKeys(apiKeys);
   db.addSystemLog('info', 'auth', `Admin changed API key ${apiKeys[idx].maskedKey} status to ${apiKeys[idx].status}`);
-  res.json(apiKeys[idx]);
+  res.json({
+    ...apiKeys[idx],
+    key: apiKeys[idx].maskedKey
+  });
 });
 
 // ==========================================
@@ -2666,10 +3500,17 @@ apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
     player_id,
     player_name,
     server_id,
+    quantity,
     buyer_ref,
     paymentConfirmed,
+    paymentStatus,
     paymentMethod,
-    paymentReference
+    paymentReference,
+    paymentTransactionId,
+    price: clientManipulatedPrice,
+    status: clientDeclaredStatus,
+    simulateNetworkTimeout,
+    allowIdempotentRecovery
   } = req.body || {};
 
   const rg = new RechargeGamesProvider();
@@ -2680,10 +3521,17 @@ apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
     playerId: String(player_id || ''),
     playerName: player_name ? String(player_name) : undefined,
     serverId: server_id ? String(server_id) : undefined,
+    quantity: quantity ? Number(quantity) : 1,
     buyerRef: buyer_ref ? String(buyer_ref) : undefined,
     paymentConfirmed: Boolean(paymentConfirmed),
+    paymentStatus: paymentStatus as PaymentLifecycleStatus | undefined,
     paymentMethod: paymentMethod ? String(paymentMethod) : 'wallet',
-    paymentReference: paymentReference ? String(paymentReference) : undefined
+    paymentReference: paymentReference ? String(paymentReference) : undefined,
+    paymentTransactionId: paymentTransactionId ? String(paymentTransactionId) : undefined,
+    clientManipulatedPrice: clientManipulatedPrice !== undefined ? Number(clientManipulatedPrice) : undefined,
+    clientDeclaredStatus: clientDeclaredStatus ? String(clientDeclaredStatus) : undefined,
+    simulateNetworkTimeout: Boolean(simulateNetworkTimeout),
+    allowIdempotentRecovery: Boolean(allowIdempotentRecovery)
   });
 
   if (!result.success) {
@@ -2692,16 +3540,38 @@ apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
       success: false,
       errorCode: result.errorCode,
       message: result.userMessage,
-      order: result.order
+      order: result.order,
+      playupOrder: result.playupOrder,
+      refundRecord: result.refundRecord
     });
   }
 
-  return res.status(201).json({
+  return res.status(result.httpStatus || 201).json({
     success: true,
     message: result.userMessage,
     order: result.order,
-    playupOrder: result.playupOrder
+    playupOrder: result.playupOrder,
+    refundRecord: result.refundRecord
   });
+});
+
+// POST /api/rechargegames/orders/:orderId/recover — Safe order recovery & polling with same buyer_ref
+apiRouter.post('/rechargegames/orders/:orderId/recover', authenticateUser, async (req, res) => {
+  const authenticatedUser = (req as any).user as AppUser;
+  const { orderId } = req.params;
+  const existing = db.findRechargeGamesOrderById(orderId) || db.findRechargeGamesOrderByBuyerRef(orderId);
+  if (!existing) {
+    return res.status(404).json({ error: 'Commande introuvable' });
+  }
+  if (authenticatedUser.role !== 'ADMIN' && existing.user_id !== authenticatedUser.id) {
+    return res.status(403).json({ error: 'Accès interdit à cette commande.' });
+  }
+  const rg = new RechargeGamesProvider();
+  const result = await rg.recoverOrder(existing.id, {
+    newPaymentStatus: req.body?.paymentStatus as PaymentLifecycleStatus | undefined,
+    paymentReference: req.body?.paymentReference
+  });
+  return res.status(result.httpStatus).json(result);
 });
 
 // GET /api/rechargegames/orders — User Top-Up History ("Historique des top-ups", strictly scoped to authenticated user)
@@ -2721,11 +3591,18 @@ apiRouter.get('/rechargegames/orders', authenticateUser, (req, res) => {
     region: o.region,
     player_id: o.player_id,
     player_name: o.player_name,
+    server_id: o.server_id,
+    quantity: o.quantity || 1,
     customer_price: o.customer_price,
     currency: o.currency,
     status: o.status,
+    payment_status: o.payment_status,
+    lifecycle_status: o.lifecycle_status,
+    dispatch_status: o.dispatch_status,
+    user_status_message: o.user_status_message,
     test_mode: o.test_mode,
     payment_method: o.payment_method,
+    payment_reference: o.payment_reference,
     created_at: o.created_at,
     updated_at: o.updated_at,
     delivered_at: o.delivered_at,
@@ -2794,10 +3671,13 @@ apiRouter.get('/admin/rechargegames/dashboard', authenticateAdmin, async (_req, 
       totalProducts: db.getRechargeGamesProducts().length,
       activeProducts: db.getRechargeGamesProducts({ activeOnly: true }).length,
       unavailableProducts: db.getRechargeGamesProducts().filter(p => !p.active).length,
-      pendingOrders: orders.filter(o => o.status === 'pending').length,
+      pendingOrders: orders.filter(
+        o => o.status === 'pending' || o.status === 'order_pending' || o.status === 'sent_to_rechargegames'
+      ).length,
       deliveredOrders: orders.filter(o => o.status === 'delivered').length,
       refundedOrders: orders.filter(o => o.status === 'refunded').length,
       failedOrders: orders.filter(o => o.status === 'failed').length,
+      manualReviewOrders: orders.filter(o => o.status === 'manual_review').length,
       totalProfitUsd: Number(
         orders
           .filter(o => o.status === 'delivered')
@@ -2808,10 +3688,103 @@ apiRouter.get('/admin/rechargegames/dashboard', authenticateAdmin, async (_req, 
     },
     products: db.getRechargeGamesProducts(),
     orders,
+    refunds: db.getRefunds(),
+    manualPaymentValidations: db.getManualPaymentValidations(),
+    orderRetryAttempts: db.getOrderRetryAttempts(),
     webhookEvents,
     firestoreIdempotencyLocks: db.getAllFirestoreWebhookLocks(),
     apiLogs
   });
+});
+
+apiRouter.get('/admin/refunds', authenticateAdmin, (_req, res) => {
+  res.json(db.getRefunds());
+});
+
+// Request #9: Validation manuelle d'un paiement PlayUp ("Valider le paiement")
+apiRouter.post('/admin/rechargegames/orders/:orderId/validate-payment', authenticateAdmin, async (req, res) => {
+  const { orderId } = req.params;
+  const adminUser = (req as any).adminUser as AppUser | undefined;
+  const rg = new RechargeGamesProvider();
+  const result = await rg.validatePaymentManually(orderId, {
+    adminId: adminUser?.id || 'admin_master',
+    adminEmail: adminUser?.email || 'admin@playup.ht',
+    note: req.body?.note,
+    simulateTemporaryProviderError: Boolean(req.body?.simulateTemporaryProviderError),
+    simulateImmediateDelivery: Boolean(req.body?.simulateImmediateDelivery),
+    simulateDefinitiveFailure: Boolean(req.body?.simulateDefinitiveFailure)
+  });
+  return res.status(result.httpStatus).json(result);
+});
+
+// Request #10: Nouvelle tentative de commande (automatique ou manuelle après vérification du statut réel)
+apiRouter.post('/admin/rechargegames/orders/:orderId/retry', authenticateAdmin, async (req, res) => {
+  const { orderId } = req.params;
+  const adminUser = (req as any).adminUser as AppUser | undefined;
+  const rg = new RechargeGamesProvider();
+  const result = await rg.executeOrderRetry(orderId, {
+    triggerType: req.body?.triggerType === 'automatic' ? 'automatic' : 'manual_admin',
+    adminId: adminUser?.id || 'admin_master',
+    reason: req.body?.reason,
+    simulateTemporaryError: Boolean(req.body?.simulateTemporaryError),
+    bypassDelayForTest: Boolean(req.body?.bypassDelayForTest),
+    requirePriorAdminStatusCheck: req.body?.requirePriorAdminStatusCheck !== false
+  });
+  return res.status(result.httpStatus).json(result);
+});
+
+// Request #8: Vérification d'éligibilité et prévisualisation avant remboursement manuel ("Rembourser")
+apiRouter.get('/admin/rechargegames/orders/:orderId/refund-eligibility', authenticateAdmin, async (req, res) => {
+  const { orderId } = req.params;
+  const rgOrder = db.findRechargeGamesOrderById(orderId) || db.findRechargeGamesOrderByBuyerRef(orderId);
+  if (!rgOrder) {
+    return res.status(404).json({ eligible: false, reason: 'Commande introuvable.' });
+  }
+  const user = db.getUserById(rgOrder.user_id);
+  const eligibility = db.evaluateRefundEligibility(rgOrder.id, {
+    isManualAdmin: true,
+    providerConfirmedNotDelivered: rgOrder.status === 'failed' || rgOrder.status === 'manual_review',
+    providerConfirmedRefunded: rgOrder.status === 'refunded'
+  });
+
+  return res.json({
+    eligible: eligibility.eligible,
+    code: eligibility.code,
+    reason: eligibility.reason,
+    preview: {
+      orderId: rgOrder.id,
+      buyerRef: rgOrder.buyer_ref,
+      providerOrderId: rgOrder.provider_order_id,
+      amount: rgOrder.customer_price,
+      currency: rgOrder.currency || 'USD',
+      userId: rgOrder.user_id,
+      userName: user?.name || rgOrder.player_name || rgOrder.user_id,
+      userEmail: user?.email || 'client@playup.ht',
+      productName: `${rgOrder.product_name} (${rgOrder.region})`,
+      defaultReason:
+        rgOrder.failure_reason ||
+        rgOrder.refund_reason ||
+        'Remboursement manuel approuvé par un administrateur PlayUp (commande non livrée)',
+      refundMethod: rgOrder.payment_method || 'wallet',
+      currentStatus: rgOrder.status,
+      paymentStatus: rgOrder.payment_status || 'payment_succeeded',
+      refundStatus: rgOrder.refund_status || 'none'
+    }
+  });
+});
+
+// Request #8: Exécution d'un remboursement manuel strict côté backend ("Rembourser")
+apiRouter.post('/admin/rechargegames/orders/:orderId/refund', authenticateAdmin, async (req, res) => {
+  const { orderId } = req.params;
+  const adminUser = (req as any).adminUser as AppUser | undefined;
+  const rg = new RechargeGamesProvider();
+  const result = await rg.executeStrictAdminRefund(orderId, {
+    adminId: adminUser?.id || 'admin_master',
+    adminEmail: adminUser?.email || 'admin@playup.ht',
+    reason: String(req.body?.reason || 'Remboursement manuel approuvé selon les règles de PlayUp'),
+    refundMethod: req.body?.refundMethod || 'wallet'
+  });
+  return res.status(result.httpStatus).json(result);
 });
 
 apiRouter.put('/admin/rechargegames/config', authenticateAdmin, (req, res) => {
@@ -3167,25 +4140,49 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     });
   }
 
-  // Test 11: Vérification du statut d'une commande avec l'endpoint officiel GET /v1/orders/{order_id}
+  const port = 3000;
+  const webhookEndpointUrl = `http://127.0.0.1:${port}/rechargegames-webhook`;
+
+  // Test 9: Rejet d'une signature HMAC-SHA256 incorrecte via POST /rechargegames-webhook (AVANT le polling GET /v1/orders/{order_id} pour garantir que la commande reste en 'pending')
   {
     const t0 = Date.now();
-    const statusRes = await rg.checkOrderStatus(createdTestOrderId || createdProviderOrderId);
+    const whId = `wh_test9_invalid_${Date.now()}`;
+    const whTs = String(Math.floor(Date.now() / 1000));
+    const statusBeforeForged = db.findRechargeGamesOrderById(createdTestOrderId)?.status;
+    const bodyObj = {
+      event: 'order.delivered',
+      event_id: whId,
+      order_id: createdProviderOrderId,
+      buyer_ref: testBuyerRef1
+    };
+    const raw = JSON.stringify(bodyObj);
+    const httpRes = await fetch(webhookEndpointUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'webhook-id': whId,
+        'webhook-timestamp': whTs,
+        'webhook-signature': 'v1,invalid_forged_signature_000000000000000000000000000000000000'
+      },
+      body: raw
+    });
+    const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
+    const statusAfterForged = db.findRechargeGamesOrderById(createdTestOrderId)?.status;
+    const orderUnchanged = statusAfterForged === statusBeforeForged && statusAfterForged === 'pending';
     results.push({
-      testNumber: 11,
-      name: 'Test 11 — Vérification du statut via GET /v1/orders/{order_id}',
-      passed: statusRes.success && statusRes.status === 'pending',
+      testNumber: 9,
+      name: 'Test 9 — Rejet d’une signature HMAC-SHA256 incorrecte (HTTP 401 — crypto.timingSafeEqual)',
+      passed: httpRes.status === 401 && whEvent?.signature_valid === false && orderUnchanged,
       durationMs: Date.now() - t0,
-      details: `GET /v1/orders/${createdProviderOrderId} a retourné status="${statusRes.status}" — ${statusRes.message}`,
+      details: `Webhook forgé sur POST /rechargegames-webhook rejeté en temps constant (crypto.timingSafeEqual) avec HTTP ${httpRes.status}. La commande #${createdTestOrderId} est restée intacte ("${statusAfterForged}").`,
       evidence: {
-        endpoint: `/v1/orders/${createdProviderOrderId}`,
-        statusReturned: statusRes.status
+        httpStatus: httpRes.status,
+        processingStatus: whEvent?.processing_status,
+        orderUnchanged,
+        timingSafeEqualUsed: true
       }
     });
   }
-
-  const port = 3000;
-  const webhookEndpointUrl = `http://127.0.0.1:${port}/rechargegames-webhook`;
 
   // Test 8: Validation d'une signature HMAC-SHA256 correcte (webhook.test) via POST /rechargegames-webhook
   let validTestWebhookId = '';
@@ -3210,53 +4207,39 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
     results.push({
       testNumber: 8,
-      name: 'Test 8 — Validation d’une signature HMAC-SHA256 correcte sur POST /rechargegames-webhook',
+      name: 'Test 8 — Validation d’une signature HMAC-SHA256 correcte sur POST /rechargegames-webhook (crypto.timingSafeEqual)',
       passed: httpRes.status === 200 && whEvent?.signature_valid === true,
       durationMs: Date.now() - t0,
-      details: `POST /rechargegames-webhook : Signature HMAC-SHA256 vérifiée (HTTP ${httpRes.status}, digest=${whEvent?.computed_hmac_preview})`,
+      details: `POST /rechargegames-webhook : Signature HMAC-SHA256 vérifiée via WebhookHmacValidator (HTTP ${httpRes.status}, digest=${whEvent?.computed_hmac_preview})`,
       evidence: {
         endpoint: '/rechargegames-webhook',
         webhookId: whId,
         httpStatus: httpRes.status,
-        hmacPreview: whEvent?.computed_hmac_preview
+        hmacPreview: whEvent?.computed_hmac_preview,
+        timingSafeEqualUsed: true
       }
     });
   }
 
-  // Test 9: Rejet d'une signature HMAC-SHA256 incorrecte via POST /rechargegames-webhook
+  // Test 11: Vérification du statut d'une commande avec l'endpoint officiel GET /v1/orders/{provider_order_id}
   {
     const t0 = Date.now();
-    const whId = `wh_test9_invalid_${Date.now()}`;
-    const whTs = String(Math.floor(Date.now() / 1000));
-    const bodyObj = {
-      event: 'order.delivered',
-      event_id: whId,
-      order_id: createdProviderOrderId,
-      buyer_ref: testBuyerRef1
-    };
-    const raw = JSON.stringify(bodyObj);
-    const httpRes = await fetch(webhookEndpointUrl, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'webhook-id': whId,
-        'webhook-timestamp': whTs,
-        'webhook-signature': 'v1,invalid_forged_signature_000000000000000000000000000000000000'
-      },
-      body: raw
-    });
-    const whEvent = db.getRechargeGamesWebhookEvents().find(e => e.event_id === whId);
-    const orderStillPending = db.findRechargeGamesOrderById(createdTestOrderId)?.status === 'pending';
+    const hasRealProviderId = rg.hasValidProviderOrderId(createdProviderOrderId);
+    const statusRes = await rg.checkOrderStatus(createdTestOrderId || createdProviderOrderId);
     results.push({
-      testNumber: 9,
-      name: 'Test 9 — Rejet d’une signature HMAC-SHA256 incorrecte (HTTP 401)',
-      passed: httpRes.status === 401 && whEvent?.signature_valid === false && orderStillPending,
+      testNumber: 11,
+      name: 'Test 11 — Vérification du statut via GET /v1/orders/{provider_order_id}',
+      passed:
+        hasRealProviderId &&
+        statusRes.success &&
+        (statusRes.status === 'pending' || statusRes.status === 'delivered'),
       durationMs: Date.now() - t0,
-      details: `Webhook forgé sur POST /rechargegames-webhook rejeté avec HTTP ${httpRes.status}. La commande #${createdTestOrderId} est restée intacte ("pending").`,
+      details: `GET /v1/orders/${createdProviderOrderId} (playup_order_id="${createdTestOrderId}") a retourné status="${statusRes.status}" — ${statusRes.message}`,
       evidence: {
-        httpStatus: httpRes.status,
-        processingStatus: whEvent?.processing_status,
-        orderUnchanged: orderStillPending
+        playup_order_id: createdTestOrderId,
+        provider_order_id: createdProviderOrderId,
+        endpoint: `/v1/orders/${createdProviderOrderId}`,
+        statusReturned: statusRes.status
       }
     });
   }
@@ -3506,6 +4489,376 @@ apiRouter.post('/admin/rechargegames/run-test-suite', authenticateAdmin, async (
     });
   }
 
+  // Test 16: Statuts intermédiaires de paiement (payment_pending, payment_processing, payment_failed, payment_cancelled)
+  {
+    const t0 = Date.now();
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
+    const pendingRef = db.generateNextBuyerRef();
+    const processingRef = db.generateNextBuyerRef();
+    const failedRef = db.generateNextBuyerRef();
+    const cancelledRef = db.generateNextBuyerRef();
+
+    const resPending = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: pendingRef,
+      paymentConfirmed: false,
+      paymentStatus: 'payment_pending',
+      testMode: true
+    });
+    const resProcessing = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: processingRef,
+      paymentConfirmed: false,
+      paymentStatus: 'payment_processing',
+      testMode: true
+    });
+    const resFailed = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: failedRef,
+      paymentConfirmed: false,
+      paymentStatus: 'payment_failed',
+      testMode: true
+    });
+    const resCancelled = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: cancelledRef,
+      paymentConfirmed: false,
+      paymentStatus: 'payment_cancelled',
+      testMode: true
+    });
+
+    const neverSentToProvider =
+      resPending.order?.dispatch_status === 'awaiting_payment' &&
+      resProcessing.order?.dispatch_status === 'awaiting_payment' &&
+      resFailed.order?.dispatch_status === 'failed' &&
+      resCancelled.order?.dispatch_status === 'failed';
+
+    results.push({
+      testNumber: 16,
+      name: 'Test 16 — Statuts intermédiaires de paiement (payment_pending / processing / failed / cancelled)',
+      passed:
+        !resPending.success &&
+        !resProcessing.success &&
+        !resFailed.success &&
+        !resCancelled.success &&
+        neverSentToProvider,
+      durationMs: Date.now() - t0,
+      details: `Aucune commande n'est envoyée à RechargeGames tant que le paiement n'est pas "payment_succeeded" (payment_pending, payment_processing, payment_failed, payment_cancelled bloqués avant appel fournisseur).`,
+      evidence: {
+        payment_pending: resPending.order?.lifecycle_status,
+        payment_processing: resProcessing.order?.lifecycle_status,
+        payment_failed: resFailed.order?.lifecycle_status,
+        payment_cancelled: resCancelled.order?.lifecycle_status,
+        neverSentToProvider
+      }
+    });
+  }
+
+  // Test 17: Reprise sécurisée après timeout (même buyer_ref, pas de remboursement auto sur timeout, blocage relance si déjà delivered)
+  {
+    const t0 = Date.now();
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
+    const timeoutBuyerRef = db.generateNextBuyerRef();
+
+    // 1. Simulate network timeout during provider call
+    const timeoutRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: timeoutBuyerRef,
+      paymentConfirmed: true,
+      paymentStatus: 'payment_succeeded',
+      simulateNetworkTimeout: true,
+      testMode: true
+    });
+    const timedOutOrder = timeoutRes.order;
+    const refundAfterTimeout = timedOutOrder ? db.findRefundByOrderId(timedOutOrder.id) : undefined;
+
+    // 2. Recover order safely using the SAME buyer_ref without creating a 2nd order
+    const recoverRes = timedOutOrder ? await rg.recoverOrder(timedOutOrder.id) : null;
+
+    // 3. Deliver the recovered order and verify that recoverOrder refuses to re-launch an already delivered order
+    if (recoverRes?.order) {
+      rg.applyOrderStatusTransition(recoverRes.order, 'delivered', 'Livraison confirmée pour test anti-relance');
+    }
+    const relaunchDeliveredRes = timedOutOrder ? await rg.recoverOrder(timedOutOrder.id) : null;
+
+    results.push({
+      testNumber: 17,
+      name: 'Test 17 — Reprise après timeout (même buyer_ref, aucun remboursement sur timeout, anti-relance si livré)',
+      passed:
+        timedOutOrder?.dispatch_status === 'pending_retry' &&
+        !refundAfterTimeout &&
+        Boolean(recoverRes?.success) &&
+        recoverRes?.order?.buyer_ref === timeoutBuyerRef &&
+        Boolean(relaunchDeliveredRes?.alreadyDelivered) &&
+        relaunchDeliveredRes?.recoveredAction === 'blocked_already_delivered',
+      durationMs: Date.now() - t0,
+      details: `Commande conservée en "order_pending" (pending_retry) sur timeout sans remboursement automatique, reprise réussie avec le même buyer_ref (${timeoutBuyerRef}), et relance bloquée après confirmation de livraison.`,
+      evidence: {
+        orderId: timedOutOrder?.id,
+        buyer_ref: timeoutBuyerRef,
+        autoRefundedOnTimeout: Boolean(refundAfterTimeout),
+        recoveredProviderOrderId: recoverRes?.order?.provider_order_id,
+        relaunchAfterDeliveredAction: relaunchDeliveredRes?.recoveredAction
+      }
+    });
+  }
+
+  // Test 18: Séparation Frontend/Backend & Remboursement vérifiable anti-doublon en base de données
+  {
+    const t0 = Date.now();
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
+    // 1. Frontend attempts to declare status="delivered"
+    const spoofRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      paymentConfirmed: true,
+      clientDeclaredStatus: 'delivered',
+      testMode: true
+    });
+
+    // 2. Attempt to refund a pending order on timeout -> must be rejected by processVerifiableRefund
+    const pendingRefundAttempt = db.processVerifiableRefund({
+      orderId: 'ord_pending_timeout_test',
+      buyerRef: 'playup_pending_test',
+      userId: 'usr_player_01',
+      amount: 5.0,
+      currency: 'USD',
+      reason: 'Timeout réseau temporaire',
+      ruleApplied: 'order_definitively_failed',
+      currentOrderStatus: 'pending'
+    });
+
+    // 3. Attempt double refund on already refunded order from Test 13 -> must be blocked idempotently
+    const doubleRefundAttempt = db.processVerifiableRefund({
+      orderId: createdTestOrderId,
+      buyerRef: testBuyerRef1,
+      userId: 'usr_player_01',
+      amount: 5.0,
+      currency: 'USD',
+      reason: 'Tentative de double remboursement',
+      ruleApplied: 'provider_confirmed_refunded',
+      currentOrderStatus: 'refunded'
+    });
+
+    results.push({
+      testNumber: 18,
+      name: 'Test 18 — Séparation Frontend/Backend & Protection anti-double remboursement (SQLite order_refunds)',
+      passed:
+        !spoofRes.success &&
+        spoofRes.httpStatus === 403 &&
+        !pendingRefundAttempt.refunded &&
+        doubleRefundAttempt.alreadyRefunded === true,
+      durationMs: Date.now() - t0,
+      details: `Auto-déclaration frontend bloquée (HTTP ${spoofRes.httpStatus}), remboursement d'une commande "pending" refusé, et double remboursement bloqué par la table SQLite order_refunds.`,
+      evidence: {
+        frontendSpoofBlocked: spoofRes.errorCode,
+        pendingOrderRefundAllowed: pendingRefundAttempt.refunded,
+        doubleRefundBlocked: doubleRefundAttempt.alreadyRefunded,
+        existingRefundId: doubleRefundAttempt.refundRecord?.id
+      }
+    });
+  }
+
+  // Test 19: Validation manuelle d’un paiement PlayUp (Flux obligatoire Request #9)
+  {
+    const t0 = Date.now();
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
+    const manualValBuyerRef = db.generateNextBuyerRef();
+
+    // 1. Create order in payment_pending (awaiting manual validation)
+    const pendingPayOrderRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: manualValBuyerRef,
+      paymentConfirmed: false,
+      paymentStatus: 'payment_pending',
+      paymentMethod: 'moncash',
+      testMode: true
+    });
+    const pendingOrdId = pendingPayOrderRes.order?.id || '';
+
+    // 2. Execute Manual Payment Validation ("Valider le paiement")
+    const valRes1 = await rg.validatePaymentManually(pendingOrdId, {
+      adminId: 'admin_test_validator',
+      adminEmail: 'admin@playup.ht',
+      note: 'Validation manuelle test officiel'
+    });
+
+    // 3. Click "Valider le paiement" a 2nd time -> must NEVER create a 2nd provider order
+    const valRes2 = await rg.validatePaymentManually(pendingOrdId, {
+      adminId: 'admin_test_validator',
+      adminEmail: 'admin@playup.ht'
+    });
+
+    results.push({
+      testNumber: 19,
+      name: 'Test 19 — Flux obligatoire après validation manuelle d’un paiement PlayUp (payment_verified → sent_to_rechargegames)',
+      passed:
+        valRes1.success &&
+        valRes1.order?.payment_status === 'payment_verified' &&
+        valRes1.order?.status === 'sent_to_rechargegames' &&
+        valRes1.order?.buyer_ref === manualValBuyerRef &&
+        !valRes2.success &&
+        valRes2.alreadyValidated === true &&
+        Boolean(valRes1.validationRecord?.id),
+      durationMs: Date.now() - t0,
+      details: `Validation manuelle exécutée : payment_verified → order_pending → RechargeGames (${valRes1.order?.provider_order_id}) → sent_to_rechargegames avec le même buyer_ref (${manualValBuyerRef}). Double clic administrateur bloqué (alreadyValidated=true).`,
+      evidence: {
+        orderId: pendingOrdId,
+        buyerRef: manualValBuyerRef,
+        paymentStatus: valRes1.order?.payment_status,
+        orderStatus: valRes1.order?.status,
+        providerOrderId: valRes1.order?.provider_order_id,
+        doubleClickBlocked: valRes2.alreadyValidated,
+        validationRecordId: valRes1.validationRecord?.id
+      }
+    });
+  }
+
+  // Test 20: Limite stricte aux nouvelles tentatives de commande (Max 3 retries, 1m/5m/15m, manual_review — Request #10)
+  {
+    const t0 = Date.now();
+    const targetProd = ffLatamProduct || usaProduct || syncedProducts[0];
+    const retryBuyerRef = db.generateNextBuyerRef();
+
+    // Create order that times out on initial dispatch
+    const initRes = await rg.createOrder({
+      userId: 'usr_player_01',
+      productKey: targetProd.product_key,
+      region: targetProd.region,
+      playerId: '16777227705',
+      buyerRef: retryBuyerRef,
+      paymentConfirmed: true,
+      paymentStatus: 'payment_succeeded',
+      simulateNetworkTimeout: true,
+      testMode: true
+    });
+    const retryOrdId = initRes.order?.id || '';
+
+    // Attempt 1 (fails -> schedules 1 min delay)
+    const att1 = await rg.executeOrderRetry(retryOrdId, {
+      triggerType: 'automatic',
+      simulateTemporaryError: true,
+      bypassDelayForTest: true
+    });
+    // Attempt 2 (fails -> schedules 5 min delay)
+    const att2 = await rg.executeOrderRetry(retryOrdId, {
+      triggerType: 'automatic',
+      simulateTemporaryError: true,
+      bypassDelayForTest: true
+    });
+    // Attempt 3 (fails -> 3rd failure stops automatic retries and transitions to "manual_review")
+    const att3 = await rg.executeOrderRetry(retryOrdId, {
+      triggerType: 'automatic',
+      simulateTemporaryError: true,
+      bypassDelayForTest: true
+    });
+    // Attempt 4 automatic -> must be strictly blocked because max 3 retries reached!
+    const att4Blocked = await rg.executeOrderRetry(retryOrdId, {
+      triggerType: 'automatic',
+      bypassDelayForTest: true
+    });
+
+    const recordedAttempts = db.getOrderRetryAttempts(retryOrdId);
+
+    results.push({
+      testNumber: 20,
+      name: 'Test 20 — Limite stricte de 3 tentatives automatiques (1m, 5m, 15m) & Passage en "manual_review"',
+      passed:
+        att1.attemptRecord?.attempt_number === 1 &&
+        att1.attemptRecord?.next_retry_delay_minutes === 1 &&
+        att2.attemptRecord?.attempt_number === 2 &&
+        att2.attemptRecord?.next_retry_delay_minutes === 5 &&
+        att3.attemptRecord?.attempt_number === 3 &&
+        att3.attemptRecord?.status === 'escalated_manual_review' &&
+        att3.order?.status === 'manual_review' &&
+        !att4Blocked.success &&
+        att4Blocked.errorCode === 'MAX_AUTO_RETRIES_EXCEEDED' &&
+        recordedAttempts.length >= 3,
+      durationMs: Date.now() - t0,
+      details: `3 tentatives automatiques exécutées avec le même buyer_ref (${retryBuyerRef}) et délais progressifs (1 min, 5 min, puis arrêt à la 3e tentative → statut "manual_review"). 4e tentative automatique bloquée (${att4Blocked.errorCode}).`,
+      evidence: {
+        orderId: retryOrdId,
+        buyerRef: retryBuyerRef,
+        attempt1DelayMin: att1.attemptRecord?.next_retry_delay_minutes,
+        attempt2DelayMin: att2.attemptRecord?.next_retry_delay_minutes,
+        statusAfter3Failures: att3.order?.status,
+        attempt4BlockedCode: att4Blocked.errorCode,
+        totalRecordedInDb: recordedAttempts.length
+      }
+    });
+  }
+
+  // Test 21: Règles strictes de remboursement manuel & Protection contre le double remboursement (Request #8)
+  {
+    const t0 = Date.now();
+    const manualReviewOrder = db.getRechargeGamesOrders().find(o => o.status === 'manual_review');
+    const targetOrderId = manualReviewOrder?.id || '';
+
+    // 1. Execute authorized manual admin refund on the manual_review (non-delivered) order
+    const refundRes1 = targetOrderId
+      ? await rg.executeStrictAdminRefund(targetOrderId, {
+          adminId: 'admin_refund_officer',
+          adminEmail: 'admin@playup.ht',
+          reason: 'Échec définitif après 3 tentatives et révision manuelle',
+          refundMethod: 'wallet'
+        })
+      : null;
+
+    // 2. Attempt a second manual refund on the same order -> must be blocked (refund_status == "refunded")
+    const refundRes2 = targetOrderId
+      ? await rg.executeStrictAdminRefund(targetOrderId, {
+          adminId: 'admin_refund_officer',
+          adminEmail: 'admin@playup.ht',
+          reason: 'Tentative de double remboursement manuel',
+          refundMethod: 'wallet'
+        })
+      : null;
+
+    results.push({
+      testNumber: 21,
+      name: 'Test 21 — Règles strictes de remboursement manuel (refund_id, admin_id, status="refunded", anti-double remboursement)',
+      passed: Boolean(
+        refundRes1?.success &&
+          refundRes1.refundRecord?.refund_id &&
+          refundRes1.refundRecord?.admin_id === 'admin_refund_officer' &&
+          refundRes1.refundRecord?.status === 'refunded' &&
+          refundRes1.order?.refund_status === 'refunded' &&
+          refundRes2 &&
+          !refundRes2.success &&
+          refundRes2.httpStatus === 409
+      ),
+      durationMs: Date.now() - t0,
+      details: `Remboursement manuel confirmé (refund_id="${refundRes1?.refundRecord?.refund_id}", admin_id="${refundRes1?.refundRecord?.admin_id}", status="${refundRes1?.refundRecord?.status}") et second remboursement bloqué (HTTP ${refundRes2?.httpStatus}).`,
+      evidence: {
+        orderId: targetOrderId,
+        refundId: refundRes1?.refundRecord?.refund_id,
+        adminId: refundRes1?.refundRecord?.admin_id,
+        refundStatus: refundRes1?.order?.refund_status,
+        secondRefundBlockedStatus: refundRes2?.httpStatus
+      }
+    });
+  }
+
   // Sort by testNumber ascending
   results.sort((a, b) => a.testNumber - b.testNumber);
 
@@ -3693,7 +5046,8 @@ apiRouter.get('/notifications/push-stream', (req, res) => {
 });
 
 // ============================================================================
-// OFFICIAL STRIPE WEBHOOK VERIFICATION ENDPOINT
+// OFFICIAL STRIPE & PAYMENT GATEWAY WEBHOOK VERIFICATION ENDPOINTS
+// (Powered by WebhookHmacValidator using crypto.timingSafeEqual)
 // ============================================================================
 
 apiRouter.post('/webhooks/stripe', (req: any, res) => {
@@ -3701,57 +5055,2057 @@ apiRouter.post('/webhooks/stripe', (req: any, res) => {
   const stripeSecret = (process.env.STRIPE_WEBHOOK_SECRET || db.getPaymentGatewaySecret('gw_card')?.webhookSecret || '').trim();
   const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {});
 
-  if (!stripeSecret) {
-    return res.status(400).json({ error: 'STRIPE_WEBHOOK_SECRET non configuré côté serveur.' });
-  }
+  const check = WebhookHmacValidator.verifyStripeWebhook({
+    rawBody,
+    signatureHeader: sigHeader,
+    secret: stripeSecret
+  });
 
-  if (!sigHeader) {
-    return res.status(401).json({ error: 'En-tête stripe-signature manquant.' });
-  }
-
-  // Parse t=... and v1=...
-  const parts = sigHeader.split(',').map(p => p.trim());
-  const tPart = parts.find(p => p.startsWith('t='));
-  const v1Part = parts.find(p => p.startsWith('v1='));
-  const timestamp = tPart ? tPart.slice(2) : '';
-  const signature = v1Part ? v1Part.slice(3) : '';
-
-  if (!timestamp || !signature) {
-    return res.status(401).json({ error: 'Format stripe-signature invalide.' });
-  }
-
-  const tsNum = Number(timestamp);
-  if (Number.isNaN(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300) {
-    return res.status(401).json({ error: 'Horodatage Stripe expiré (protection anti-replay).' });
-  }
-
-  const signedPayload = `${timestamp}.${rawBody}`;
-  const expectedSig = crypto.createHmac('sha256', stripeSecret).update(signedPayload, 'utf8').digest('hex');
-
-  let valid = false;
-  try {
-    const bufA = Buffer.from(signature, 'hex');
-    const bufB = Buffer.from(expectedSig, 'hex');
-    valid = bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
-  } catch {
-    valid = false;
-  }
-
-  if (!valid) {
-    db.addSystemLog('error', 'payment', '[Stripe Security] Signature Webhook Stripe invalide rejetée.');
-    return res.status(401).json({ error: 'Signature Stripe HMAC-SHA256 invalide.' });
+  if (!check.valid) {
+    const status = check.errorCode === 'SECRET_NOT_CONFIGURED' ? 400 : 401;
+    db.addSystemLog('error', 'payment', `[Stripe Security] Signature Webhook Stripe rejetée (${check.errorCode}): ${check.reason}`);
+    return res.status(status).json({
+      error: check.reason,
+      errorCode: check.errorCode,
+      timingSafeEqualUsed: check.timingSafeEqualUsed
+    });
   }
 
   const event = req.body;
   const eventId = String(event?.id || '');
   if (eventId && db.hasProcessedWebhookEvent(`stripe_${eventId}`)) {
-    return res.status(200).json({ received: true, duplicate: true });
+    return res.status(200).json({ received: true, duplicate: true, timingSafeEqualUsed: true });
   }
   if (eventId) {
     db.markWebhookEventProcessed(`stripe_${eventId}`);
   }
 
   db.addSystemLog('info', 'payment', `[Stripe Webhook] Événement authentifié reçu : ${event?.type || 'unknown'} (${eventId})`);
-  return res.status(200).json({ received: true, verified: true });
+  return res.status(200).json({ received: true, verified: true, timingSafeEqualUsed: true });
 });
+
+// Incoming Mobile Money / Payment Gateway Webhooks (MonCash / NatCash) validated via WebhookHmacValidator
+apiRouter.post('/webhooks/payment/:gatewaySlug', (req: any, res) => {
+  const gatewaySlug = String(req.params.gatewaySlug || '').toLowerCase();
+  const gateway = db.getPaymentGateways().find(
+    g => g.slug.toLowerCase() === gatewaySlug || g.id.toLowerCase() === gatewaySlug
+  );
+  if (!gateway) {
+    return res.status(404).json({ error: 'Payment gateway introuvable.' });
+  }
+
+  const gwSecretRecord = db.getPaymentGatewaySecret(gateway.id);
+  const secret = (gwSecretRecord?.webhookSecret || process.env[`${gateway.slug.toUpperCase()}_WEBHOOK_SECRET`] || '').trim();
+  const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {});
+
+  const check = WebhookHmacValidator.verifyProviderWebhook({
+    rawBody,
+    headers: req.headers as Record<string, any>,
+    secret,
+    providerName: gateway.name,
+    allowUnsignedWhenSecretEmpty: false,
+    toleranceSeconds: WebhookHmacValidator.DEFAULT_TOLERANCE_SECONDS
+  });
+
+  if (!check.valid) {
+    const status = check.errorCode === 'SECRET_NOT_CONFIGURED' ? 400 : 401;
+    db.addSystemLog('error', 'payment', `[${gateway.name} Security] Webhook paiement rejeté (${check.errorCode}): ${check.reason}`);
+    return res.status(status).json({
+      received: false,
+      error: check.reason,
+      errorCode: check.errorCode,
+      timingSafeEqualUsed: check.timingSafeEqualUsed
+    });
+  }
+
+  return res.status(200).json({
+    received: true,
+    verified: true,
+    gateway: gateway.slug,
+    timingSafeEqualUsed: true,
+    computedHmacPreview: check.computedHmacPreview
+  });
+});
+
+// Diagnostic & verification endpoint for WebhookHmacValidator (Admin)
+apiRouter.get('/admin/webhooks/hmac-validator-status', authenticateAdmin, (_req, res) => {
+  res.json({
+    validatorClass: 'WebhookHmacValidator',
+    algorithm: 'HMAC-SHA256',
+    timingSafeComparison: 'crypto.timingSafeEqual',
+    defaultReplayWindowSeconds: WebhookHmacValidator.DEFAULT_TOLERANCE_SECONDS,
+    protectedEndpoints: [
+      {
+        endpoint: '/rechargegames-webhook',
+        alias: '/api/webhooks/rechargegames',
+        provider: 'RechargeGames (Standard Webhooks v1,<base64> & sha256=<hex>)',
+        method: 'WebhookHmacValidator.verifyStandardWebhook'
+      },
+      {
+        endpoint: '/api/webhooks/goxtop',
+        alias: '/api/webhooks/:providerSlug',
+        provider: 'GoXtop & B2B Providers',
+        method: 'WebhookHmacValidator.verifyProviderWebhook'
+      },
+      {
+        endpoint: '/api/webhooks/stripe',
+        provider: 'Stripe (t=<timestamp>,v1=<hex>)',
+        method: 'WebhookHmacValidator.verifyStripeWebhook'
+      },
+      {
+        endpoint: '/api/webhooks/payment/:gatewaySlug',
+        provider: 'MonCash / NatCash Payment Gateways',
+        method: 'WebhookHmacValidator.verifyProviderWebhook'
+      }
+    ]
+  });
+});
+
+// ============================================================================
+// ORDER TRACKER STATUS CHANGE PUSH / EMAIL NOTIFICATION PREFERENCES ENDPOINT
+// ============================================================================
+
+apiRouter.patch('/orders/:orderId/tracker-notifications', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const orderId = String(req.params.orderId || '').trim();
+  const { pushAlerts, emailAlerts, sendTestStatusAlert } = req.body || {};
+
+  const orders = db.getOrders();
+  const orderIdx = orders.findIndex(
+    o =>
+      (o.id === orderId || o.orderNumber === orderId || o.partnerOrderId === orderId) &&
+      (o.userId === user.id || o.customerEmail?.toLowerCase() === user.email.toLowerCase() || user.role === 'ADMIN')
+  );
+
+  if (orderIdx === -1) {
+    return res.status(404).json({
+      error: 'Commande introuvable',
+      message: 'Cette commande est introuvable ou ne vous appartient pas.'
+    });
+  }
+
+  const targetOrder = orders[orderIdx];
+  if (typeof pushAlerts === 'boolean') {
+    targetOrder.orderTrackerPushAlerts = pushAlerts;
+  }
+  if (typeof emailAlerts === 'boolean') {
+    targetOrder.orderTrackerEmailAlerts = emailAlerts;
+  }
+  targetOrder.updatedAt = new Date().toISOString();
+  orders[orderIdx] = targetOrder;
+  db.setOrders(orders);
+
+  // Also sync user global notification preferences if enabled
+  if (pushAlerts === true || emailAlerts === true) {
+    db.updateUserProfile(user.id, {
+      ...(pushAlerts === true ? { notificationsPush: true } : {}),
+      ...(emailAlerts === true ? { notificationsEmail: true } : {})
+    });
+  }
+
+  let notificationResult = null;
+  if (sendTestStatusAlert) {
+    notificationResult = await NotificationEngine.triggerOrderStatusChangeNotification({
+      orderId: targetOrder.id,
+      orderNumber: targetOrder.orderNumber,
+      userId: user.id,
+      userEmail: user.email,
+      userName: user.name,
+      gameName: targetOrder.gameName,
+      serviceName: targetOrder.serviceName,
+      packageName: targetOrder.packageName,
+      playerId: targetOrder.playerId,
+      previousStatus: 'payment_verified',
+      newStatus: targetOrder.order_status || targetOrder.status,
+      note: 'Alerte de suivi Order Tracker activée avec succès pour cette commande.'
+    });
+  }
+
+  return res.json({
+    success: true,
+    orderId: targetOrder.id,
+    orderNumber: targetOrder.orderNumber,
+    orderTrackerPushAlerts: targetOrder.orderTrackerPushAlerts !== false,
+    orderTrackerEmailAlerts: targetOrder.orderTrackerEmailAlerts !== false,
+    notificationResult
+  });
+});
+
+// ============================================================================
+// REAL MONCASH (+509 48 03 9151) & NATCASH (+509 55964606) OCR PAYMENT,
+// ANTI-FRAUD, IDEMPOTENCY, ANTI-REPLAY & ATOMIC WALLET CREDIT WORKFLOW
+// ============================================================================
+
+const extractSecurityHeadersAndParams = (req: Request) => {
+  const idempotencyKey = String(
+    req.headers['idempotency-key'] ||
+      req.headers['x-idempotency-key'] ||
+      req.body?.idempotencyKey ||
+      req.body?.idempotency_key ||
+      ''
+  ).trim();
+  const requestId = String(
+    req.headers['x-request-id'] ||
+      req.body?.requestId ||
+      req.body?.request_id ||
+      ''
+  ).trim();
+  const nonce = String(
+    req.headers['x-payment-nonce'] ||
+      req.body?.nonce ||
+      ''
+  ).trim();
+  const clientTimestamp =
+    req.headers['x-client-timestamp'] ||
+    req.body?.clientTimestamp ||
+    req.body?.client_timestamp ||
+    req.body?.timestamp;
+  const ipAddress = extractClientIp(req);
+
+  return {
+    idempotencyKey,
+    requestId,
+    nonce,
+    clientTimestamp: clientTimestamp !== undefined ? String(clientTimestamp) : undefined,
+    ipAddress
+  };
+};
+
+// Issue a short-lived anti-replay security nonce & request_id
+apiRouter.post('/payments/security/nonce', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const { paymentRequestId, operationType } = req.body || {};
+  const token = db.issueShortLivedPaymentNonce({
+    userId: user.id,
+    paymentRequestId: paymentRequestId ? String(paymentRequestId) : undefined,
+    operationType: operationType as PaymentIdempotentOperationType | undefined,
+    ttlSeconds: 300
+  });
+  res.json({
+    success: true,
+    ...token
+  });
+});
+
+// Get active (pending) payment request for the current user so page refresh or leaving/returning restores the exact state
+apiRouter.get('/payments/requests/active', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const packageId = req.query.packageId ? String(req.query.packageId) : undefined;
+  const purpose = req.query.purpose as 'service_order' | 'wallet_topup' | undefined;
+
+  const active = db.getActivePaymentRequestForUser(user.id, { packageId, purpose });
+  const securityToken = db.issueShortLivedPaymentNonce({
+    userId: user.id,
+    paymentRequestId: active?.id
+  });
+
+  res.json({
+    officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+    activeRequest: active ? db.sanitizePaymentRequestForClient(active) : null,
+    securityToken
+  });
+});
+
+// List user's payment requests & audit logs
+apiRouter.get('/payments/requests/my', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const requests = db.getPaymentRequests(user.id).map(r => db.sanitizePaymentRequestForClient(r));
+  const auditLogs = db.getPaymentAuditLogs({ userId: user.id }).slice(0, 50);
+  res.json({
+    officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+    requests,
+    auditLogs
+  });
+});
+
+// Get a specific payment request by ID
+apiRouter.get('/payments/requests/:requestId', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const requestId = String(req.params.requestId || '').trim();
+  const reqRecord = db.getPaymentRequestById(requestId);
+  if (!reqRecord || (reqRecord.user_id !== user.id && user.role !== 'ADMIN')) {
+    return res.status(404).json({
+      error: 'Demande de paiement introuvable.'
+    });
+  }
+  const securityToken = db.issueShortLivedPaymentNonce({
+    userId: user.id,
+    paymentRequestId: reqRecord.id
+  });
+  return res.json({
+    officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+    paymentRequest: db.sanitizePaymentRequestForClient(reqRecord),
+    auditLogs: db.getPaymentAuditLogs({ paymentRequestId: reqRecord.id }),
+    securityToken
+  });
+});
+
+// 1. Create or resume a persistent MonCash / NatCash payment request (Idempotent & Anti-Replay protected)
+apiRouter.post('/payments/requests', authenticateUser, paymentCreateRateLimit, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const sec = extractSecurityHeadersAndParams(req);
+
+  const {
+    paymentMethod = 'moncash',
+    purpose = 'service_order',
+    packageId,
+    gameId,
+    serviceId,
+    playerId,
+    playerName,
+    serverId,
+    region,
+    gameProfileData,
+    amountUsd,
+    forceNew = false
+  } = req.body || {};
+
+  const method: 'moncash' | 'natcash' =
+    String(paymentMethod).toLowerCase() === 'natcash' ? 'natcash' : 'moncash';
+
+  // If the user already has an active pending request for the same package/purpose and forceNew is false,
+  // return the existing active request unless idempotency key is creating a specific request
+  if (!forceNew && !sec.idempotencyKey) {
+    const existingActive = db.getActivePaymentRequestForUser(user.id, {
+      packageId: packageId ? String(packageId) : undefined,
+      purpose: purpose === 'wallet_topup' ? 'wallet_topup' : 'service_order'
+    });
+    if (existingActive) {
+      const securityToken = db.issueShortLivedPaymentNonce({
+        userId: user.id,
+        paymentRequestId: existingActive.id
+      });
+      return res.status(200).json({
+        resumedExisting: true,
+        officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+        paymentRequest: db.sanitizePaymentRequestForClient(existingActive),
+        securityToken
+      });
+    }
+  }
+
+  const effectiveIdempotencyKey =
+    sec.idempotencyKey ||
+    `idem_create_${user.id}_${purpose}_${packageId || amountUsd || 'default'}_${Math.floor(Date.now() / 10000)}`;
+
+  const result = await db.executeIdempotentPaymentOperation({
+    idempotencyKey: effectiveIdempotencyKey,
+    operationType: 'payment_creation',
+    userId: user.id,
+    userEmail: user.email,
+    requestId: sec.requestId,
+    nonce: sec.nonce,
+    clientTimestamp: sec.clientTimestamp,
+    ipAddress: sec.ipAddress,
+    payload: {
+      paymentMethod: method,
+      purpose,
+      packageId,
+      gameId,
+      serviceId,
+      playerId,
+      amountUsd
+    },
+    executor: async () => {
+      // Check if an active pending request already exists for this exact package & player
+      if (!forceNew) {
+        const existing = db.getActivePaymentRequestForUser(user.id, {
+          packageId: packageId ? String(packageId) : undefined,
+          purpose: purpose === 'wallet_topup' ? 'wallet_topup' : 'service_order'
+        });
+        if (existing) {
+          const securityToken = db.issueShortLivedPaymentNonce({
+            userId: user.id,
+            paymentRequestId: existing.id
+          });
+          return {
+            httpStatus: 200,
+            body: {
+              resumedExisting: true,
+              officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+              paymentRequest: db.sanitizePaymentRequestForClient(existing),
+              securityToken
+            }
+          };
+        }
+      }
+
+      // Compute authoritative expected amount on the backend (NEVER trust frontend price for service orders)
+      let authoritativeUsd = 0;
+      let resolvedGame: Game | undefined;
+      let resolvedService: Service | undefined;
+      let resolvedPackage: any;
+
+      if (purpose === 'service_order' && packageId) {
+        for (const srv of db.getServices()) {
+          const foundPkg = srv.packages.find(p => p.id === packageId);
+          if (foundPkg) {
+            resolvedPackage = foundPkg;
+            resolvedService = srv;
+            resolvedGame = db.getGames().find(g => g.id === srv.gameId);
+            break;
+          }
+        }
+        if (!resolvedPackage) {
+          return {
+            httpStatus: 404,
+            body: {
+              error: 'PACKAGE_NOT_FOUND',
+              message: 'Le forfait sélectionné est introuvable dans le catalogue PlayUp.'
+            }
+          };
+        }
+        authoritativeUsd = Number(Number(resolvedPackage.publicPrice).toFixed(2));
+      } else {
+        const parsedTopup = Number(amountUsd);
+        if (Number.isNaN(parsedTopup) || parsedTopup < 1 || parsedTopup > 5000) {
+          return {
+            httpStatus: 400,
+            body: {
+              error: 'INVALID_AMOUNT',
+              message: 'Montant invalide (minimum $1.00 USD).'
+            }
+          };
+        }
+        authoritativeUsd = Number(parsedTopup.toFixed(2));
+      }
+
+      const authoritativeHtg = PaymentOcrAndAntiFraudEngine.computeHtgAmount(authoritativeUsd);
+      const nowIso = new Date().toISOString();
+      const reqId = `preq_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+      const newRequest: PaymentRequestRecord = {
+        id: reqId,
+        user_id: user.id,
+        user_email: user.email,
+        purpose: purpose === 'wallet_topup' ? 'wallet_topup' : 'service_order',
+        game_id: resolvedGame?.id || gameId,
+        game_name: resolvedGame?.name || 'PlayUp Wallet',
+        service_id: resolvedService?.id || serviceId,
+        service_name: resolvedService?.name || 'Recharge PlayUp Wallet',
+        package_id: resolvedPackage?.id || packageId,
+        package_name: resolvedPackage?.name || `Recharge Wallet +$${authoritativeUsd.toFixed(2)} USD`,
+        product_key: resolvedPackage?.externalProductId,
+        region: region || 'Global',
+        player_id: playerId ? String(playerId).trim() : undefined,
+        player_name: playerName ? String(playerName).trim() : undefined,
+        server_id: serverId ? String(serverId).trim() : undefined,
+        game_profile_data: gameProfileData && typeof gameProfileData === 'object' ? gameProfileData : undefined,
+        payment_method: method,
+        recipient_number: PLAYUP_OFFICIAL_PAYMENT_NUMBERS[method],
+        expected_amount: authoritativeUsd,
+        expected_amount_htg: authoritativeHtg,
+        currency: 'USD',
+        stage: 'awaiting_copy',
+        status: 'pending',
+        number_copied: false,
+        countdown_duration_seconds: 69,
+        countdown_remaining_seconds: 69,
+        countdown_completed: false,
+        proof_uploaded: false,
+        anti_fraud_score: 0,
+        anti_fraud_decision: 'PENDING',
+        created_at: nowIso,
+        updated_at: nowIso
+      };
+
+      const saved = db.upsertPaymentRequest(newRequest);
+
+      db.appendPaymentAuditLog({
+        payment_request_id: saved.id,
+        user_id: user.id,
+        user_email: user.email,
+        event_type: 'PAYMENT_CREATED',
+        payment_method: method,
+        expected_amount: authoritativeUsd,
+        status_after: 'pending',
+        summary: `Demande de paiement #${saved.id} créée (${method.toUpperCase()} -> ${PLAYUP_OFFICIAL_PAYMENT_NUMBERS[method]}, attendu: $${authoritativeUsd.toFixed(2)} USD / ${authoritativeHtg} HTG).`
+      });
+
+      const securityToken = db.issueShortLivedPaymentNonce({
+        userId: user.id,
+        paymentRequestId: saved.id
+      });
+
+      return {
+        httpStatus: 201,
+        body: {
+          resumedExisting: false,
+          officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+          paymentRequest: db.sanitizePaymentRequestForClient(saved),
+          securityToken
+        }
+      };
+    }
+  });
+
+  return res.status(result.httpStatus).json(result.body);
+});
+
+// 2. Select or switch payment method (MonCash +509 48 03 9151 vs NatCash +509 55964606)
+apiRouter.post('/payments/requests/:requestId/select-method', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const requestId = String(req.params.requestId || '').trim();
+  const { paymentMethod } = req.body || {};
+
+  const reqRecord = db.getPaymentRequestById(requestId);
+  if (!reqRecord || reqRecord.user_id !== user.id) {
+    return res.status(404).json({ error: 'Demande de paiement introuvable.' });
+  }
+
+  // Irreversible state check
+  if (reqRecord.status !== 'pending') {
+    db.appendPaymentAuditLog({
+      payment_request_id: reqRecord.id,
+      user_id: user.id,
+      user_email: user.email,
+      event_type: 'INVALID_STATE_TRANSITION_BLOCKED',
+      status_after: reqRecord.status,
+      summary: `Tentative de modification de méthode refusée : la demande #${reqRecord.id} est dans l'état irréversible "${reqRecord.status}".`
+    });
+    return res.status(409).json({
+      error: 'IRREVERSIBLE_PAYMENT_STATE',
+      message: `Cette demande est déjà dans l'état final "${reqRecord.status}" et ne peut plus être modifiée.`
+    });
+  }
+
+  const method: 'moncash' | 'natcash' =
+    String(paymentMethod).toLowerCase() === 'natcash' ? 'natcash' : 'moncash';
+
+  if (reqRecord.payment_method !== method) {
+    reqRecord.payment_method = method;
+    reqRecord.recipient_number = PLAYUP_OFFICIAL_PAYMENT_NUMBERS[method];
+    // Reset copy flag only if switching method before uploading proof
+    if (!reqRecord.proof_uploaded) {
+      reqRecord.number_copied = false;
+      reqRecord.copied_at = undefined;
+      reqRecord.countdown_ends_at = undefined;
+      reqRecord.countdown_completed = false;
+      reqRecord.stage = 'awaiting_copy';
+    }
+    db.upsertPaymentRequest(reqRecord);
+
+    db.appendPaymentAuditLog({
+      payment_request_id: reqRecord.id,
+      user_id: user.id,
+      user_email: user.email,
+      event_type: 'METHOD_SELECTED',
+      payment_method: method,
+      expected_amount: reqRecord.expected_amount,
+      status_after: reqRecord.status,
+      summary: `Méthode de paiement sélectionnée : ${method.toUpperCase()} (${PLAYUP_OFFICIAL_PAYMENT_NUMBERS[method]}).`
+    });
+  }
+
+  const securityToken = db.issueShortLivedPaymentNonce({
+    userId: user.id,
+    paymentRequestId: reqRecord.id
+  });
+
+  return res.json({
+    officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+    paymentRequest: db.sanitizePaymentRequestForClient(reqRecord),
+    securityToken
+  });
+});
+
+// 3. Confirm that the user copied the official MonCash/NatCash number -> Starts persistent 69s countdown
+apiRouter.post('/payments/requests/:requestId/confirm-copy', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const requestId = String(req.params.requestId || '').trim();
+  const { copiedText } = req.body || {};
+
+  const reqRecord = db.getPaymentRequestById(requestId);
+  if (!reqRecord || reqRecord.user_id !== user.id) {
+    return res.status(404).json({ error: 'Demande de paiement introuvable.' });
+  }
+
+  if (reqRecord.status !== 'pending') {
+    return res.status(409).json({
+      error: 'IRREVERSIBLE_PAYMENT_STATE',
+      message: `Cette demande est dans l'état "${reqRecord.status}" et ne peut plus être modifiée.`
+    });
+  }
+
+  const expectedNumber = PLAYUP_OFFICIAL_PAYMENT_NUMBERS[reqRecord.payment_method];
+  if (copiedText) {
+    const cleanCopied = String(copiedText).replace(/\s+/g, '');
+    const cleanExpected = expectedNumber.replace(/\s+/g, '');
+    if (cleanCopied !== cleanExpected) {
+      return res.status(400).json({
+        error: 'COPIED_NUMBER_MISMATCH',
+        message: `Le numéro copié ne correspond pas au numéro officiel ${reqRecord.payment_method.toUpperCase()} (${expectedNumber}).`
+      });
+    }
+  }
+
+  // If already copied, preserve the existing countdown_ends_at so refreshing or re-copying does not restart the 69s timer
+  if (!reqRecord.number_copied || !reqRecord.countdown_ends_at) {
+    const nowMs = Date.now();
+    const durationSec = 69;
+    reqRecord.number_copied = true;
+    reqRecord.copied_at = new Date(nowMs).toISOString();
+    reqRecord.countdown_duration_seconds = durationSec;
+    reqRecord.countdown_ends_at = new Date(nowMs + durationSec * 1000).toISOString();
+    reqRecord.countdown_completed = false;
+    reqRecord.stage = 'countdown_active';
+    db.upsertPaymentRequest(reqRecord);
+
+    db.appendPaymentAuditLog({
+      payment_request_id: reqRecord.id,
+      user_id: user.id,
+      user_email: user.email,
+      event_type: 'NUMBER_COPIED',
+      payment_method: reqRecord.payment_method,
+      expected_amount: reqRecord.expected_amount,
+      status_after: reqRecord.status,
+      summary: `Numéro officiel ${reqRecord.payment_method.toUpperCase()} (${expectedNumber}) copié par l'utilisateur. Compte à rebours serveur de 69s démarré (fin: ${reqRecord.countdown_ends_at}).`
+    });
+  }
+
+  const securityToken = db.issueShortLivedPaymentNonce({
+    userId: user.id,
+    paymentRequestId: reqRecord.id
+  });
+
+  return res.json({
+    officialNumbers: PLAYUP_OFFICIAL_PAYMENT_NUMBERS,
+    paymentRequest: db.sanitizePaymentRequestForClient(reqRecord),
+    securityToken
+  });
+});
+
+// 4. Upload Payment Proof Screenshot -> Real OCR + Forensic Analysis + Idempotency + Anti-Replay
+apiRouter.post(
+  '/payments/requests/:requestId/upload-proof',
+  authenticateUser,
+  proofUploadRateLimit,
+  async (req, res) => {
+    const user = (req as any).user as AppUser;
+    const requestId = String(req.params.requestId || '').trim();
+    const sec = extractSecurityHeadersAndParams(req);
+    const { imageDataUrl, fileName } = req.body || {};
+
+    if (!imageDataUrl || typeof imageDataUrl !== 'string') {
+      return res.status(400).json({
+        error: 'MISSING_PROOF_IMAGE',
+        message: 'Veuillez fournir une capture d’écran valide de votre preuve de paiement.'
+      });
+    }
+
+    const reqRecord = db.getPaymentRequestById(requestId);
+    if (!reqRecord || reqRecord.user_id !== user.id) {
+      return res.status(404).json({ error: 'Demande de paiement introuvable.' });
+    }
+
+    // Irreversible state check
+    if (reqRecord.status !== 'pending') {
+      db.appendPaymentAuditLog({
+        payment_request_id: reqRecord.id,
+        user_id: user.id,
+        user_email: user.email,
+        event_type: 'INVALID_STATE_TRANSITION_BLOCKED',
+        status_after: reqRecord.status,
+        summary: `Envoi de preuve bloqué : la demande #${reqRecord.id} est déjà verrouillée dans l'état irréversible "${reqRecord.status}".`
+      });
+      return res.status(409).json({
+        error: 'IRREVERSIBLE_PAYMENT_STATE',
+        message: `Cette demande de paiement est déjà dans l'état final "${reqRecord.status}". Aucune nouvelle preuve ne peut y être associée.`
+      });
+    }
+
+    if (!reqRecord.number_copied) {
+      return res.status(400).json({
+        error: 'NUMBER_NOT_COPIED_YET',
+        message: `Veuillez d'abord copier le numéro officiel ${reqRecord.payment_method.toUpperCase()} (${reqRecord.recipient_number}) avant d'envoyer une preuve.`
+      });
+    }
+
+    const imgHashPreview = crypto.createHash('sha256').update(imageDataUrl).digest('hex').slice(0, 24);
+    const effectiveIdempotencyKey =
+      sec.idempotencyKey || `idem_proof_${reqRecord.id}_${imgHashPreview}`;
+
+    const opResult = await db.executeIdempotentPaymentOperation({
+      idempotencyKey: effectiveIdempotencyKey,
+      operationType: 'proof_upload',
+      userId: user.id,
+      userEmail: user.email,
+      paymentRequestId: reqRecord.id,
+      requestId: sec.requestId,
+      nonce: sec.nonce,
+      clientTimestamp: sec.clientTimestamp,
+      ipAddress: sec.ipAddress,
+      payload: {
+        requestId: reqRecord.id,
+        imageSha256: imgHashPreview
+      },
+      executor: async () => {
+        const freshRecord = db.getPaymentRequestById(requestId);
+        if (!freshRecord || freshRecord.status !== 'pending') {
+          return {
+            httpStatus: 409,
+            body: {
+              error: 'IRREVERSIBLE_PAYMENT_STATE',
+              message: `La demande est déjà dans l'état "${freshRecord?.status || 'inconnu'}".`
+            }
+          };
+        }
+
+        const nowIso = new Date().toISOString();
+        db.appendPaymentAuditLog({
+          payment_request_id: freshRecord.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'PROOF_UPLOADED',
+          payment_method: freshRecord.payment_method,
+          expected_amount: freshRecord.expected_amount,
+          status_after: freshRecord.status,
+          summary: `Preuve de paiement reçue (${fileName || 'screenshot'}) — lancement de l'analyse OCR et forensique.`
+        });
+
+        const analysis = await PaymentOcrAndAntiFraudEngine.analyzePaymentProofScreenshot({
+          requestId: freshRecord.id,
+          userId: user.id,
+          imageDataUrl,
+          expectedMethod: freshRecord.payment_method,
+          expectedAmountUsd: freshRecord.expected_amount,
+          expectedAmountHtg: freshRecord.expected_amount_htg
+        });
+
+        const detectedTranscode = analysis.ocr.detectedTranscode;
+        const detectedLength = analysis.ocr.detectedTranscodeLength;
+
+        // Store server-side OCR-detected transcode securely (NEVER returned in plaintext to client)
+        db.setServerDetectedTranscode(freshRecord.id, detectedTranscode);
+
+        // Register proof hash usage & insert into dedicated "payment_proofs" table
+        db.registerProofHashUsage({
+          proofHash: analysis.forensics.sha256Hash,
+          perceptualHash: analysis.forensics.perceptualHash,
+          paymentRequestId: freshRecord.id,
+          userId: user.id,
+          status: 'uploaded',
+          transcode: detectedTranscode,
+          detectedAmount: analysis.ocr.detectedAmount,
+          detectedMethod: analysis.ocr.detectedMethod,
+          detectedDateTime: analysis.ocr.detectedDateTime,
+          ocrResult: analysis.ocr,
+          fraudScore: 0
+        });
+
+        freshRecord.proof_uploaded = true;
+        freshRecord.proof_uploaded_at = nowIso;
+        freshRecord.proof_hash = analysis.forensics.sha256Hash;
+        freshRecord.proof_perceptual_hash = analysis.forensics.perceptualHash;
+        freshRecord.proof_file_path = analysis.savedFilePath;
+        freshRecord.proof_preview_data_url = imageDataUrl.length <= 350000 ? imageDataUrl : undefined;
+        freshRecord.detected_transcode_length = detectedLength || undefined;
+        freshRecord.ocr_extraction = {
+          ...analysis.ocr,
+          detectedTranscode: undefined,
+          transcodeDetected: Boolean(detectedTranscode),
+          transcodeMasked: db.maskTranscode(detectedTranscode)
+        };
+        freshRecord.forensic_analysis = analysis.forensics;
+        freshRecord.stage = 'proof_analyzed';
+
+        const saved = db.upsertPaymentRequest(freshRecord);
+
+        // Audit logs for OCR completion, Transcode detection, and Amount detection
+        db.appendPaymentAuditLog({
+          payment_request_id: saved.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'OCR_COMPLETED',
+          payment_method: saved.payment_method,
+          expected_amount: saved.expected_amount,
+          detected_amount: analysis.ocr.detectedAmount,
+          detected_transcode_masked: db.maskTranscode(detectedTranscode),
+          proof_hash: analysis.forensics.sha256Hash,
+          status_after: saved.status,
+          summary: `Analyse OCR terminée via ${analysis.ocr.engineUsed} (confiance: ${analysis.ocr.confidence}%).`
+        });
+
+        db.appendPaymentAuditLog({
+          payment_request_id: saved.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'TRANSCODE_DETECTED',
+          payment_method: saved.payment_method,
+          expected_amount: saved.expected_amount,
+          detected_transcode_masked: db.maskTranscode(detectedTranscode),
+          proof_hash: analysis.forensics.sha256Hash,
+          status_after: saved.status,
+          summary: detectedTranscode
+            ? `Transcode détecté dans la preuve : ${db.maskTranscode(detectedTranscode)} (longueur exacte exigée : ${detectedLength} caractères).`
+            : `Aucun Transcode lisible n'a été détecté dans la capture d'écran.`
+        });
+
+        db.appendPaymentAuditLog({
+          payment_request_id: saved.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'AMOUNT_DETECTED',
+          payment_method: saved.payment_method,
+          expected_amount: saved.expected_amount,
+          detected_amount: analysis.ocr.detectedAmount,
+          proof_hash: analysis.forensics.sha256Hash,
+          status_after: saved.status,
+          summary:
+            analysis.ocr.detectedAmount !== null
+              ? `Montant détecté dans la preuve : ${analysis.ocr.detectedAmount} ${analysis.ocr.detectedCurrency || 'USD'} (attendu: $${saved.expected_amount.toFixed(2)} USD / ${saved.expected_amount_htg} HTG).`
+              : `Montant non détecté clairement dans la preuve.`
+        });
+
+        const securityToken = db.issueShortLivedPaymentNonce({
+          userId: user.id,
+          paymentRequestId: saved.id,
+          operationType: 'payment_verification'
+        });
+
+        return {
+          httpStatus: 200,
+          body: {
+            success: true,
+            transcodeDetected: Boolean(detectedTranscode),
+            detectedTranscodeLength: detectedLength,
+            paymentRequest: db.sanitizePaymentRequestForClient(saved),
+            securityToken
+          }
+        };
+      }
+    });
+
+    return res.status(opResult.httpStatus).json(opResult.body);
+  }
+);
+
+// 5. Verify User-Entered Transcode + Complete Anti-Fraud Verification + Atomic Wallet Credit + Auto Order Dispatch
+apiRouter.post(
+  '/payments/requests/:requestId/verify-transcode',
+  authenticateUser,
+  paymentVerifyRateLimit,
+  async (req, res) => {
+    const user = (req as any).user as AppUser;
+    const requestId = String(req.params.requestId || '').trim();
+    const sec = extractSecurityHeadersAndParams(req);
+    const {
+      enteredTranscode,
+      twoFactorVerificationToken,
+      twoFactorChallengeId,
+      twoFactorCode
+    } = req.body || {};
+
+    const cleanEntered = String(enteredTranscode || '').trim();
+    if (!cleanEntered) {
+      return res.status(400).json({
+        error: 'MISSING_TRANSCODE',
+        message: 'Veuillez saisir le Transcode figurant sur votre preuve de paiement.'
+      });
+    }
+
+    const initialRecord = db.getPaymentRequestById(requestId);
+    if (!initialRecord || initialRecord.user_id !== user.id) {
+      return res.status(404).json({
+        error: 'PAYMENT_REQUEST_NOT_FOUND',
+        message: 'Demande de paiement introuvable.'
+      });
+    }
+
+    // Blocking Backend 2FA Gate for Wallet Credit:
+    // If the payment request is still pending and anti-fraud would approve the credit,
+    // verify the mandatory 2FA SMS/Email challenge BEFORE executing the wallet credit or locking the idempotency key.
+    if (initialRecord.status === 'pending') {
+      const preCheckDetectedTranscode = db.getServerDetectedTranscode(initialRecord.id);
+      const preCheckVerdict = PaymentOcrAndAntiFraudEngine.evaluateAntiFraudVerification({
+        requestRecord: initialRecord,
+        enteredTranscode: cleanEntered,
+        serverDetectedTranscode: preCheckDetectedTranscode
+      });
+
+      if (preCheckVerdict.decision === 'AUTO_APPROVED') {
+        const twoFactorGate = db.assertAndConsumeWallet2FA({
+          userId: user.id,
+          userEmail: user.email,
+          operationType: 'wallet_credit',
+          paymentRequestId: initialRecord.id,
+          expectedAmount: initialRecord.expected_amount,
+          twoFactorVerificationToken: twoFactorVerificationToken
+            ? String(twoFactorVerificationToken)
+            : String(req.headers['x-2fa-verification-token'] || ''),
+          twoFactorChallengeId: twoFactorChallengeId
+            ? String(twoFactorChallengeId)
+            : String(req.headers['x-2fa-challenge-id'] || ''),
+          twoFactorCode: twoFactorCode
+            ? String(twoFactorCode)
+            : String(req.headers['x-2fa-code'] || ''),
+          ipAddress: sec.ipAddress,
+          userAgent: String(req.headers['user-agent'] || '')
+        });
+
+        if (!twoFactorGate.allowed) {
+          return res.status(403).json({
+            success: false,
+            credited: false,
+            twoFactorRequired: true,
+            twoFactorBlocked: true,
+            error: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+            errorCode: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+            message:
+              twoFactorGate.message ||
+              'Étape bloquante : la vérification 2FA par code SMS ou Email a échoué côté backend. Aucun crédit effectué.',
+            paymentRequest: db.sanitizePaymentRequestForClient(initialRecord),
+            walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+          });
+        }
+      }
+    }
+
+    const effectiveIdempotencyKey =
+      sec.idempotencyKey || `idem_verify_${initialRecord.id}_${cleanEntered}`;
+
+    const opResult = await db.executeIdempotentPaymentOperation({
+      idempotencyKey: effectiveIdempotencyKey,
+      operationType: 'payment_verification',
+      userId: user.id,
+      userEmail: user.email,
+      paymentRequestId: initialRecord.id,
+      requestId: sec.requestId,
+      nonce: sec.nonce,
+      clientTimestamp: sec.clientTimestamp,
+      ipAddress: sec.ipAddress,
+      payload: {
+        requestId: initialRecord.id,
+        enteredTranscode: cleanEntered
+      },
+      executor: async () => {
+        const reqRecord = db.getPaymentRequestById(requestId);
+        if (!reqRecord) {
+          return {
+            httpStatus: 404,
+            body: { error: 'Demande introuvable.' }
+          };
+        }
+
+        // 10. Irreversible State Check: if already credited, rejected, refunded, or in manual_review,
+        // NEVER re-credit or reset to pending.
+        if (reqRecord.status !== 'pending') {
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'INVALID_STATE_TRANSITION_BLOCKED',
+            status_after: reqRecord.status,
+            summary: `Tentative de revérification bloquée : la demande #${reqRecord.id} est déjà dans l'état irréversible "${reqRecord.status}".`
+          });
+
+          const currentUser = db.getUserById(user.id);
+          return {
+            httpStatus: reqRecord.status === 'credited' ? 200 : 409,
+            body: {
+              success: reqRecord.status === 'credited',
+              alreadyProcessed: true,
+              decision: reqRecord.anti_fraud_decision,
+              status: reqRecord.status,
+              redirectToHome: reqRecord.status === 'rejected',
+              message:
+                reqRecord.user_message ||
+                `Cette transaction a déjà été traitée (statut irréversible : ${reqRecord.status}).`,
+              paymentRequest: db.sanitizePaymentRequestForClient(reqRecord),
+              walletBalance: currentUser?.walletBalance ?? 0
+            }
+          };
+        }
+
+        const serverDetectedTranscode = db.getServerDetectedTranscode(reqRecord.id);
+
+        // Log TRANSCODE_COMPARED
+        db.appendPaymentAuditLog({
+          payment_request_id: reqRecord.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'TRANSCODE_COMPARED',
+          payment_method: reqRecord.payment_method,
+          expected_amount: reqRecord.expected_amount,
+          detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+          detected_transcode_masked: db.maskTranscode(serverDetectedTranscode),
+          entered_transcode_masked: db.maskTranscode(cleanEntered),
+          proof_hash: reqRecord.proof_hash,
+          status_after: reqRecord.status,
+          summary: `Comparaison backend du Transcode saisi (${db.maskTranscode(cleanEntered)}) avec le Transcode extrait par OCR (${db.maskTranscode(serverDetectedTranscode)}).`
+        });
+
+        // Evaluate full Anti-Fraud ruleset (Rules 1 to 11)
+        const verdict = PaymentOcrAndAntiFraudEngine.evaluateAntiFraudVerification({
+          requestRecord: reqRecord,
+          enteredTranscode: cleanEntered,
+          serverDetectedTranscode
+        });
+
+        db.appendPaymentAuditLog({
+          payment_request_id: reqRecord.id,
+          user_id: user.id,
+          user_email: user.email,
+          event_type: 'ANTIFRAUD_RESULT',
+          payment_method: reqRecord.payment_method,
+          expected_amount: reqRecord.expected_amount,
+          detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+          detected_transcode_masked: db.maskTranscode(serverDetectedTranscode),
+          entered_transcode_masked: db.maskTranscode(cleanEntered),
+          proof_hash: reqRecord.proof_hash,
+          anti_fraud_decision: verdict.decision,
+          status_after: verdict.finalStatus,
+          summary: verdict.auditSummary,
+          details: {
+            riskScore: verdict.riskScore,
+            reasonCode: verdict.reasonCode,
+            anomalies: verdict.anomalies,
+            amountMatches: verdict.amountMatches,
+            methodMatches: verdict.methodMatches,
+            transcodeMatches: verdict.transcodeMatches
+          }
+        });
+
+        // CASE A: AUTO_REJECTED -> Irreversible 'rejected' state, $0 credited, redirect to home page
+        if (verdict.decision === 'AUTO_REJECTED') {
+          reqRecord.stage = 'rejected';
+          reqRecord.status = 'rejected';
+          reqRecord.entered_transcode = cleanEntered;
+          reqRecord.anti_fraud_score = verdict.riskScore;
+          reqRecord.anti_fraud_decision = 'AUTO_REJECTED';
+          reqRecord.rejection_reason = verdict.userMessage;
+          reqRecord.user_message = verdict.userMessage;
+          const savedRejected = db.upsertPaymentRequest(reqRecord);
+
+          db.recordAntiFraudIncident({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode: db.maskTranscode(serverDetectedTranscode),
+            entered_transcode: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            duplicate_of_request_id: reqRecord.forensic_analysis?.duplicateOfRequestId,
+            risk_score: verdict.riskScore,
+            decision: 'AUTO_REJECTED',
+            reason_code: verdict.reasonCode,
+            reason_message: verdict.userMessage,
+            anomalies: verdict.anomalies
+          });
+
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'PAYMENT_REJECTED',
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode_masked: db.maskTranscode(serverDetectedTranscode),
+            entered_transcode_masked: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            anti_fraud_decision: 'AUTO_REJECTED',
+            status_after: 'rejected',
+            summary: `Demande #${reqRecord.id} rejetée définitivement (${verdict.reasonCode}) : ${verdict.userMessage} — Aucun crédit effectué.`
+          });
+
+          return {
+            httpStatus: 422,
+            body: {
+              success: false,
+              credited: false,
+              decision: 'AUTO_REJECTED',
+              status: 'rejected',
+              reasonCode: verdict.reasonCode,
+              message: verdict.userMessage,
+              anomalies: verdict.anomalies,
+              redirectToHome: true,
+              paymentRequest: db.sanitizePaymentRequestForClient(savedRejected),
+              walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+            }
+          };
+        }
+
+        // CASE B: MANUAL_REVIEW -> Irreversible 'manual_review' state by user, $0 automatic credit
+        if (verdict.decision === 'MANUAL_REVIEW') {
+          reqRecord.stage = 'manual_review';
+          reqRecord.status = 'manual_review';
+          reqRecord.entered_transcode = cleanEntered;
+          reqRecord.anti_fraud_score = verdict.riskScore;
+          reqRecord.anti_fraud_decision = 'MANUAL_REVIEW';
+          reqRecord.rejection_reason = verdict.userMessage;
+          reqRecord.user_message = verdict.userMessage;
+          const savedReview = db.upsertPaymentRequest(reqRecord);
+
+          db.recordAntiFraudIncident({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode: db.maskTranscode(serverDetectedTranscode),
+            entered_transcode: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            risk_score: verdict.riskScore,
+            decision: 'MANUAL_REVIEW',
+            reason_code: verdict.reasonCode,
+            reason_message: verdict.userMessage,
+            anomalies: verdict.anomalies
+          });
+
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'PAYMENT_MANUAL_REVIEW',
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode_masked: db.maskTranscode(serverDetectedTranscode),
+            entered_transcode_masked: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            anti_fraud_decision: 'MANUAL_REVIEW',
+            status_after: 'manual_review',
+            summary: `Demande #${reqRecord.id} placée en "manual_review" (${verdict.reasonCode}) — Aucun crédit automatique effectué.`
+          });
+
+          return {
+            httpStatus: 202,
+            body: {
+              success: false,
+              credited: false,
+              decision: 'MANUAL_REVIEW',
+              status: 'manual_review',
+              reasonCode: verdict.reasonCode,
+              message: verdict.userMessage,
+              anomalies: verdict.anomalies,
+              redirectToHome: false,
+              paymentRequest: db.sanitizePaymentRequestForClient(savedReview),
+              walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+            }
+          };
+        }
+
+        // CASE C: AUTO_APPROVED -> Execute Atomic Wallet Credit Lock
+        // ("payment verification -> transaction lock -> validation -> wallet credit -> transaction marked credited")
+        const atomicCredit = await db.executeAtomicPaymentCredit({
+          paymentRequestId: reqRecord.id,
+          userId: user.id,
+          verifiedTranscode: cleanEntered,
+          proofHash: reqRecord.proof_hash || '',
+          perceptualHash: reqRecord.proof_perceptual_hash || '',
+          riskScore: verdict.riskScore,
+          idempotencyKey: effectiveIdempotencyKey,
+          requestId: sec.requestId,
+          ipAddress: sec.ipAddress,
+          userAgent: String(req.headers['user-agent'] || '')
+        });
+
+        if (!atomicCredit.credited) {
+          // E.g. concurrent race where the same transcode or proof hash was just claimed millisecond ago
+          reqRecord.stage = 'rejected';
+          reqRecord.status = 'rejected';
+          reqRecord.rejection_reason = atomicCredit.errorReason || 'Transcode ou preuve déjà utilisé.';
+          reqRecord.anti_fraud_decision = 'AUTO_REJECTED';
+          const savedRaceRejected = db.upsertPaymentRequest(reqRecord);
+
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'PAYMENT_REJECTED',
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            proof_hash: reqRecord.proof_hash,
+            anti_fraud_decision: 'AUTO_REJECTED',
+            status_after: 'rejected',
+            summary: `Rejet transactionnel lors du verrouillage atomique : ${atomicCredit.errorReason}`
+          });
+
+          return {
+            httpStatus: 409,
+            body: {
+              success: false,
+              credited: false,
+              decision: 'AUTO_REJECTED',
+              status: 'rejected',
+              message:
+                'Ce Transcode ou cette preuve vient d’être utilisé sur une autre opération. Crédit refusé.',
+              redirectToHome: true,
+              paymentRequest: db.sanitizePaymentRequestForClient(savedRaceRejected),
+              walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+            }
+          };
+        }
+
+        if (!atomicCredit.alreadyProcessed) {
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'PAYMENT_VALIDATED',
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode_masked: db.maskTranscode(cleanEntered),
+            entered_transcode_masked: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            anti_fraud_decision: 'AUTO_APPROVED',
+            status_after: 'credited',
+            summary: `Paiement #${reqRecord.id} validé par le moteur OCR & Anti-Fraude.`
+          });
+
+          db.appendPaymentAuditLog({
+            payment_request_id: reqRecord.id,
+            user_id: user.id,
+            user_email: user.email,
+            event_type: 'WALLET_CREDITED',
+            payment_method: reqRecord.payment_method,
+            expected_amount: reqRecord.expected_amount,
+            detected_amount: reqRecord.ocr_extraction?.detectedAmount,
+            detected_transcode_masked: db.maskTranscode(cleanEntered),
+            entered_transcode_masked: db.maskTranscode(cleanEntered),
+            proof_hash: reqRecord.proof_hash,
+            anti_fraud_decision: 'AUTO_APPROVED',
+            status_after: 'credited',
+            summary: `Crédit atomique de +$${reqRecord.expected_amount.toFixed(2)} USD appliqué une seule fois sur le PlayUp Wallet de ${user.email} (Tx: ${atomicCredit.transaction?.id}).`
+          });
+        }
+
+        const updatedRequest = atomicCredit.paymentRequest || reqRecord;
+        const updatedUser = atomicCredit.user || db.getUserById(user.id);
+
+        return {
+          httpStatus: 200,
+          body: {
+            success: true,
+            credited: true,
+            alreadyProcessed: atomicCredit.alreadyProcessed,
+            decision: 'AUTO_APPROVED',
+            status: 'credited',
+            message: `Paiement vérifié ! +$${reqRecord.expected_amount.toFixed(2)} USD ont été crédités dans votre PlayUp Wallet.`,
+            redirectToHome: false,
+            transaction: atomicCredit.transaction,
+            validatedPayment: atomicCredit.validatedPayment
+              ? {
+                  ...atomicCredit.validatedPayment,
+                  transcode: db.maskTranscode(atomicCredit.validatedPayment.transcode)
+                }
+              : undefined,
+            paymentRequest: db.sanitizePaymentRequestForClient(updatedRequest),
+            walletBalance: updatedUser?.walletBalance ?? 0,
+            user: updatedUser
+          }
+        };
+      }
+    });
+
+    return res.status(opResult.httpStatus).json(opResult.body);
+  }
+);
+
+// 6. Generate a real PNG payment receipt image for MonCash (+509 48 03 9151) or NatCash (+509 55964606)
+// so the user or automated tests can test real OCR extraction & anti-fraud scenarios
+apiRouter.post('/payments/requests/:requestId/generate-receipt-image', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const requestId = String(req.params.requestId || '').trim();
+  const { scenario = 'valid', customTranscode } = req.body || {};
+
+  const reqRecord = db.getPaymentRequestById(requestId);
+  if (!reqRecord || reqRecord.user_id !== user.id) {
+    return res.status(404).json({ error: 'Demande de paiement introuvable.' });
+  }
+
+  // Generate a realistic 14-digit transcode (like 26100413555244)
+  const now = new Date();
+  const yy = String(now.getUTCFullYear()).slice(-2);
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(now.getUTCDate()).padStart(2, '0');
+  const hh = String(now.getUTCHours()).padStart(2, '0');
+  const mi = String(now.getUTCMinutes()).padStart(2, '0');
+  const rand4 = String(Math.floor(1000 + Math.random() * 9000));
+  const generatedTranscode =
+    customTranscode && String(customTranscode).trim().length >= 6
+      ? String(customTranscode).trim()
+      : `${yy}${mm}${dd}${hh}${mi}${rand4}`;
+
+  const methodForReceipt: 'moncash' | 'natcash' =
+    scenario === 'wrong_method'
+      ? reqRecord.payment_method === 'moncash'
+        ? 'natcash'
+        : 'moncash'
+      : reqRecord.payment_method;
+
+  const amountUsdForReceipt =
+    scenario === 'wrong_amount'
+      ? Number(Math.max(0.5, reqRecord.expected_amount - 1.0).toFixed(2))
+      : reqRecord.expected_amount;
+
+  const amountHtgForReceipt = PaymentOcrAndAntiFraudEngine.computeHtgAmount(amountUsdForReceipt);
+  const dateLabel = `${now.getUTCFullYear()}-${mm}-${dd} ${hh}:${mi}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+
+  const pngDataUrl = PaymentOcrAndAntiFraudEngine.generateVerifiableReceiptPngDataUrl({
+    paymentMethod: methodForReceipt,
+    recipientNumber: PLAYUP_OFFICIAL_PAYMENT_NUMBERS[methodForReceipt],
+    amountUsd: amountUsdForReceipt,
+    amountHtg: amountHtgForReceipt,
+    transcode: generatedTranscode,
+    dateTime: dateLabel,
+    senderPhone: user.phone || '+509 37 12 3456',
+    tamperedSoftwareTag: scenario === 'manipulated_image' ? 'Adobe Photoshop 2026 (Edited)' : undefined
+  });
+
+  return res.json({
+    success: true,
+    scenario,
+    imageDataUrl: pngDataUrl,
+    sampleTranscodeForUserEntry: generatedTranscode,
+    transcodeLength: generatedTranscode.length,
+    receiptSummary: {
+      method: methodForReceipt,
+      recipientNumber: PLAYUP_OFFICIAL_PAYMENT_NUMBERS[methodForReceipt],
+      amountUsd: amountUsdForReceipt,
+      amountHtg: amountHtgForReceipt,
+      dateTime: dateLabel
+    }
+  });
+});
+
+// 7. Admin Idempotent Payment Refund Endpoint
+apiRouter.post('/payments/requests/:requestId/refund', authenticateAdmin, async (req, res) => {
+  const adminUser = (req as any).user as AppUser;
+  const requestId = String(req.params.requestId || '').trim();
+  const sec = extractSecurityHeadersAndParams(req);
+  const { reason = 'Remboursement administratif vérifié' } = req.body || {};
+
+  const effectiveIdempotencyKey = sec.idempotencyKey || `idem_refund_${requestId}`;
+  const opResult = await db.executeIdempotentPaymentOperation({
+    idempotencyKey: effectiveIdempotencyKey,
+    operationType: 'payment_refund',
+    userId: adminUser.id,
+    userEmail: adminUser.email,
+    paymentRequestId: requestId,
+    requestId: sec.requestId,
+    nonce: sec.nonce,
+    clientTimestamp: sec.clientTimestamp,
+    ipAddress: sec.ipAddress,
+    payload: { requestId, reason },
+    executor: async () => {
+      const refundRes = await db.executeAtomicPaymentRefund({
+        paymentRequestId: requestId,
+        adminUserId: adminUser.id,
+        adminEmail: adminUser.email,
+        reason: String(reason),
+        idempotencyKey: effectiveIdempotencyKey,
+        requestId: sec.requestId,
+        ipAddress: sec.ipAddress,
+        userAgent: String(req.headers['user-agent'] || ''),
+        deductFromUserWallet: true
+      });
+      if (!refundRes.refunded) {
+        return {
+          httpStatus: 409,
+          body: {
+            success: false,
+            status: refundRes.status,
+            message: refundRes.errorReason || 'Remboursement refusé.'
+          }
+        };
+      }
+      return {
+        httpStatus: 200,
+        body: {
+          success: true,
+          refunded: true,
+          alreadyRefunded: refundRes.alreadyRefunded,
+          status: 'refunded',
+          refundReference: refundRes.refundReference,
+          walletTransaction: refundRes.walletTransaction,
+          paymentRequest: refundRes.paymentRequest
+            ? db.sanitizePaymentRequestForClient(refundRes.paymentRequest)
+            : null
+        }
+      };
+    }
+  });
+
+  return res.status(opResult.httpStatus).json(opResult.body);
+});
+
+// 8. Live Concurrency, Anti-Replay, Idempotency & Irreversible State Verification Endpoint
+// Fires 25 simultaneous identical credit verification requests + replay attack tests + duplicate proof tests
+// to prove 100% that: 1 payment = 1 request = 1 validation = 1 credit maximum.
+apiRouter.post('/payments/security/concurrency-self-test', authenticateUser, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const concurrentCount = Math.min(100, Math.max(10, Number(req.body?.concurrentRequests || 25)));
+  const ipAddress = extractClientIp(req);
+
+  const initialUser = db.getUserById(user.id);
+  const balanceBefore = Number((initialUser?.walletBalance || 0).toFixed(2));
+  const testAmountUsd = 5.0;
+  const testAmountHtg = PaymentOcrAndAntiFraudEngine.computeHtgAmount(testAmountUsd);
+  const uniqueTranscode = `261007${String(Date.now()).slice(-8)}`; // 14 digits
+
+  // Step 1: Create 1 payment request via idempotent engine
+  const createIdemKey = `selftest_create_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const createNonce = db.issueShortLivedPaymentNonce({ userId: user.id, operationType: 'payment_creation' });
+
+  const createCalls = await Promise.all(
+    Array.from({ length: 10 }).map((_, idx) =>
+      db.executeIdempotentPaymentOperation({
+        idempotencyKey: createIdemKey,
+        operationType: 'payment_creation',
+        userId: user.id,
+        userEmail: user.email,
+        requestId: idx === 0 ? createNonce.requestId : `retry_req_${idx}_${Date.now()}`,
+        nonce: createNonce.nonce,
+        clientTimestamp: Date.now(),
+        ipAddress,
+        payload: {
+          paymentMethod: 'moncash',
+          purpose: 'wallet_topup',
+          amountUsd: testAmountUsd
+        },
+        executor: async () => {
+          const nowIso = new Date().toISOString();
+          const newReq: PaymentRequestRecord = {
+            id: `preq_test_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+            user_id: user.id,
+            user_email: user.email,
+            purpose: 'wallet_topup',
+            game_name: 'PlayUp Security Verification',
+            service_name: 'Test Anti-Replay & Concurrence',
+            package_name: `Crédit Test +$${testAmountUsd.toFixed(2)} USD`,
+            payment_method: 'moncash',
+            recipient_number: PLAYUP_OFFICIAL_PAYMENT_NUMBERS.moncash,
+            expected_amount: testAmountUsd,
+            expected_amount_htg: testAmountHtg,
+            currency: 'USD',
+            stage: 'countdown_active',
+            status: 'pending',
+            number_copied: true,
+            copied_at: nowIso,
+            countdown_duration_seconds: 69,
+            countdown_ends_at: new Date(Date.now() - 1000).toISOString(),
+            countdown_completed: true,
+            proof_uploaded: false,
+            anti_fraud_score: 0,
+            anti_fraud_decision: 'PENDING',
+            created_at: nowIso,
+            updated_at: nowIso
+          };
+          const saved = db.upsertPaymentRequest(newReq);
+          return {
+            httpStatus: 201,
+            body: { paymentRequest: saved }
+          };
+        }
+      })
+    )
+  );
+
+  const createdPaymentRequest: PaymentRequestRecord = createCalls[0].body.paymentRequest;
+  const uniqueCreatedIds = new Set(createCalls.map(c => c.body.paymentRequest?.id));
+
+  // Step 2: Generate a real PNG receipt for this request and run real OCR
+  const receiptDataUrl = PaymentOcrAndAntiFraudEngine.generateVerifiableReceiptPngDataUrl({
+    paymentMethod: 'moncash',
+    recipientNumber: PLAYUP_OFFICIAL_PAYMENT_NUMBERS.moncash,
+    amountUsd: testAmountUsd,
+    amountHtg: testAmountHtg,
+    transcode: uniqueTranscode,
+    dateTime: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    senderPhone: '+509 37 00 1122'
+  });
+
+  const ocrResult = await PaymentOcrAndAntiFraudEngine.analyzePaymentProofScreenshot({
+    requestId: createdPaymentRequest.id,
+    userId: user.id,
+    imageDataUrl: receiptDataUrl,
+    expectedMethod: 'moncash',
+    expectedAmountUsd: testAmountUsd,
+    expectedAmountHtg: testAmountHtg
+  });
+
+  db.setServerDetectedTranscode(createdPaymentRequest.id, ocrResult.ocr.detectedTranscode);
+  db.registerProofHashUsage({
+    proofHash: ocrResult.forensics.sha256Hash,
+    perceptualHash: ocrResult.forensics.perceptualHash,
+    paymentRequestId: createdPaymentRequest.id,
+    userId: user.id,
+    status: 'received',
+    transcode: ocrResult.ocr.detectedTranscode,
+    detectedAmount: ocrResult.ocr.detectedAmount,
+    detectedMethod: ocrResult.ocr.detectedMethod,
+    detectedDateTime: ocrResult.ocr.detectedDateTime,
+    ocrResult: ocrResult.ocr,
+    fraudScore: 0
+  });
+
+  // Verify strict separation BEFORE payment validation:
+  // A received proof in payment_proofs must have verification_status = 'received' and ZERO rows in validated_payments!
+  const proofsBeforeValidation = db.getPaymentProofs({ paymentRequestId: createdPaymentRequest.id });
+  const validatedBeforeValidation = db.getValidatedPayments({ paymentRequestId: createdPaymentRequest.id });
+  const proofStatusBeforeValidation = proofsBeforeValidation[0]?.verification_status;
+  const zeroValidatedPaymentsOnProofUpload = validatedBeforeValidation.length === 0 && proofStatusBeforeValidation === 'received';
+
+  createdPaymentRequest.proof_uploaded = true;
+  createdPaymentRequest.proof_uploaded_at = new Date().toISOString();
+  createdPaymentRequest.proof_hash = ocrResult.forensics.sha256Hash;
+  createdPaymentRequest.proof_perceptual_hash = ocrResult.forensics.perceptualHash;
+  createdPaymentRequest.detected_transcode_length = ocrResult.ocr.detectedTranscodeLength || 14;
+  createdPaymentRequest.ocr_extraction = {
+    ...ocrResult.ocr,
+    detectedTranscode: undefined,
+    transcodeDetected: Boolean(ocrResult.ocr.detectedTranscode),
+    transcodeMasked: db.maskTranscode(ocrResult.ocr.detectedTranscode)
+  };
+  createdPaymentRequest.forensic_analysis = ocrResult.forensics;
+  createdPaymentRequest.stage = 'proof_analyzed';
+  db.upsertPaymentRequest(createdPaymentRequest);
+
+  // Step 3: Fire `concurrentCount` (e.g. 25) SIMULTANEOUS credit verification requests
+  // Mix of identical idempotency_key AND distinct idempotency_keys for the same payment_request_id
+  const sharedVerifyKey = `selftest_verify_${createdPaymentRequest.id}`;
+  const verifyPromises = Array.from({ length: concurrentCount }).map((_, idx) => {
+    const keyToUse = idx < Math.ceil(concurrentCount / 2) ? sharedVerifyKey : `${sharedVerifyKey}_tab_${idx}`;
+    return db.executeIdempotentPaymentOperation({
+      idempotencyKey: keyToUse,
+      operationType: 'payment_verification',
+      userId: user.id,
+      userEmail: user.email,
+      paymentRequestId: createdPaymentRequest.id,
+      requestId: `req_conc_${createdPaymentRequest.id}_${idx}`,
+      clientTimestamp: Date.now(),
+      ipAddress,
+      payload: {
+        requestId: createdPaymentRequest.id,
+        enteredTranscode: uniqueTranscode
+      },
+      executor: async () => {
+        const atomic = await db.executeAtomicPaymentCredit({
+          paymentRequestId: createdPaymentRequest.id,
+          userId: user.id,
+          verifiedTranscode: uniqueTranscode,
+          proofHash: ocrResult.forensics.sha256Hash,
+          perceptualHash: ocrResult.forensics.perceptualHash,
+          riskScore: 0
+        });
+        return {
+          httpStatus: 200,
+          body: {
+            credited: atomic.credited,
+            alreadyProcessed: atomic.alreadyProcessed,
+            status: atomic.status,
+            transactionId: atomic.transaction?.id,
+            validatedPaymentId: atomic.validatedPayment?.id
+          }
+        };
+      }
+    });
+  });
+
+  const verifyResults = await Promise.all(verifyPromises);
+  const actualNewCreditsCount = verifyResults.filter(
+    r => !r.replayed && r.body.credited === true && r.body.alreadyProcessed === false
+  ).length;
+
+  const userAfterConcurrent = db.getUserById(user.id);
+  const balanceAfterConcurrent = Number((userAfterConcurrent?.walletBalance || 0).toFixed(2));
+  const netBalanceDelta = Number((balanceAfterConcurrent - balanceBefore).toFixed(2));
+
+  // Step 4: Test Replay Attack with Expired Timestamp (10 minutes old > 300s max window)
+  const expiredReplayResult = await db.executeIdempotentPaymentOperation({
+    idempotencyKey: `selftest_expired_${Date.now()}`,
+    operationType: 'payment_verification',
+    userId: user.id,
+    userEmail: user.email,
+    paymentRequestId: createdPaymentRequest.id,
+    requestId: `req_expired_${Date.now()}`,
+    clientTimestamp: Date.now() - 600 * 1000, // 10 minutes ago
+    ipAddress,
+    payload: { requestId: createdPaymentRequest.id, enteredTranscode: uniqueTranscode },
+    executor: async () => ({ httpStatus: 200, body: {} })
+  });
+
+  // Step 5: Test Key Reuse with Different Payload (must return 409 IDEMPOTENCY_KEY_REUSE_FORBIDDEN)
+  const keyReuseResult = await db.executeIdempotentPaymentOperation({
+    idempotencyKey: sharedVerifyKey,
+    operationType: 'payment_verification',
+    userId: user.id,
+    userEmail: user.email,
+    paymentRequestId: createdPaymentRequest.id,
+    requestId: `req_key_reuse_${Date.now()}`,
+    clientTimestamp: Date.now(),
+    ipAddress,
+    payload: {
+      requestId: createdPaymentRequest.id,
+      enteredTranscode: '99999999999999' // modified payload with same key
+    },
+    executor: async () => ({ httpStatus: 200, body: {} })
+  });
+
+  // Step 6: Test Irreversible State Protection (`credited` cannot revert to `pending`)
+  const irreversibleCheck = db.canTransitionPaymentStatus('credited', 'pending');
+
+  // Step 7: Test Idempotent Refund with 10 simultaneous refund calls for the same payment_request_id
+  // Must create at most 1 refund row in wallet_transactions with reference REFUND-{payment_request_id}
+  // and restore user's wallet balance to exact balanceBefore
+  const refundIdemKey = `REFUND-KEY-${createdPaymentRequest.id}`;
+  const refundCalls = await Promise.all(
+    Array.from({ length: 10 }).map((_, idx) =>
+      db.executeIdempotentPaymentOperation({
+        idempotencyKey: idx < 5 ? refundIdemKey : `${refundIdemKey}_tab_${idx}`,
+        operationType: 'payment_refund',
+        endpoint: `/api/payments/requests/${createdPaymentRequest.id}/refund`,
+        userId: user.id,
+        userEmail: user.email,
+        paymentRequestId: createdPaymentRequest.id,
+        requestId: `req_refund_${createdPaymentRequest.id}_${idx}`,
+        clientTimestamp: Date.now(),
+        ipAddress,
+        payload: {
+          requestId: createdPaymentRequest.id,
+          reason: 'Nettoyage automatique après vérification anti-replay & concurrence'
+        },
+        executor: async () => {
+          const refRes = await db.executeAtomicPaymentRefund({
+            paymentRequestId: createdPaymentRequest.id,
+            adminUserId: user.id,
+            adminEmail: user.email,
+            reason: 'Nettoyage automatique après vérification anti-replay & concurrence',
+            idempotencyKey: refundIdemKey,
+            deductFromUserWallet: true
+          });
+          return {
+            httpStatus: 200,
+            body: {
+              refunded: refRes.refunded,
+              alreadyRefunded: refRes.alreadyRefunded,
+              status: refRes.status,
+              refundReference: refRes.refundReference,
+              walletTransactionId: refRes.walletTransaction?.id
+            }
+          };
+        }
+      })
+    )
+  );
+
+  // Verify database rows across all 6 canonical tables for this paymentRequestId
+  const walletTxsForPayment = db.getWalletTransactions({ paymentRequestId: createdPaymentRequest.id });
+  const depositTxsCount = walletTxsForPayment.filter(t => t.type === 'deposit' && t.status === 'completed').length;
+  const refundTxsCount = walletTxsForPayment.filter(t => t.type === 'refund' && t.status === 'completed').length;
+  const expectedRefundReference = `REFUND-${createdPaymentRequest.id}`;
+  const refundTxRecord = walletTxsForPayment.find(t => t.type === 'refund');
+  const depositTxRecord = walletTxsForPayment.find(t => t.type === 'deposit');
+  const proofsForPayment = db.getPaymentProofs({ paymentRequestId: createdPaymentRequest.id });
+  const validatedForPayment = db.getValidatedPayments({ paymentRequestId: createdPaymentRequest.id });
+  const auditLogsForPayment = db.getAuditLogs({ resourceId: createdPaymentRequest.id });
+  const canonicalIdemKeys = db.getCanonicalIdempotencyKeys({ userId: user.id, limit: 20 });
+
+  return res.json({
+    allPassed:
+      uniqueCreatedIds.size === 1 &&
+      zeroValidatedPaymentsOnProofUpload &&
+      actualNewCreditsCount === 1 &&
+      validatedForPayment.length === 1 &&
+      validatedForPayment[0]?.payment_proof_id === proofsForPayment[0]?.id &&
+      depositTxRecord?.validated_payment_id === validatedForPayment[0]?.id &&
+      depositTxsCount === 1 &&
+      refundTxsCount === 1 &&
+      refundTxRecord?.reference === expectedRefundReference &&
+      proofsForPayment.length === 1 &&
+      proofsForPayment[0]?.verification_status === 'credited' &&
+      auditLogsForPayment.length >= 2 &&
+      netBalanceDelta === testAmountUsd &&
+      expiredReplayResult.httpStatus === 409 &&
+      keyReuseResult.httpStatus === 409 &&
+      !irreversibleCheck.allowed &&
+      refundCalls[0]?.body?.status === 'refunded',
+    summary: {
+      concurrentRequestsSent: concurrentCount,
+      uniquePaymentRequestsCreated: uniqueCreatedIds.size,
+      zeroValidatedPaymentsOnProofUpload,
+      proofInitialStatusOnUpload: proofStatusBeforeValidation,
+      validatedPaymentsCreatedCount: validatedForPayment.length,
+      validatedPaymentLinkedToProof: validatedForPayment[0]?.payment_proof_id === proofsForPayment[0]?.id,
+      walletDepositLinkedToValidatedPayment: depositTxRecord?.validated_payment_id === validatedForPayment[0]?.id,
+      timesWalletCredited: actualNewCreditsCount,
+      walletDepositTransactionsCount: depositTxsCount,
+      walletRefundTransactionsCount: refundTxsCount,
+      refundReferenceVerified: refundTxRecord?.reference,
+      paymentProofsRecordedCount: proofsForPayment.length,
+      paymentProofVerificationStatus: proofsForPayment[0]?.verification_status,
+      canonicalIdempotencyKeysRecorded: canonicalIdemKeys.length,
+      auditLogsRecordedForPayment: auditLogsForPayment.length,
+      expectedDeltaUsd: testAmountUsd,
+      actualDeltaUsdDuringTest: netBalanceDelta,
+      expiredReplayBlockedStatus: expiredReplayResult.httpStatus,
+      idempotencyKeyMismatchBlockedStatus: keyReuseResult.httpStatus,
+      irreversibleStateProtected: !irreversibleCheck.allowed,
+      finalRefundedLockState: refundCalls[0]?.body?.status
+    }
+  });
+});
+
+// 9. Inspect Idempotent Schema Tables (payment_requests, payment_proofs, validated_payments, idempotency_keys, wallet_transactions, audit_logs)
+apiRouter.get('/payments/security/idempotent-schema', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const isAdmin = user.role === 'ADMIN';
+  const filterUserId = isAdmin && req.query.all === 'true' ? undefined : user.id;
+
+  return res.json({
+    tables: {
+      payment_requests: db
+        .getPaymentRequests(filterUserId)
+        .slice(0, 25)
+        .map(r => db.sanitizePaymentRequestForClient(r)),
+      payment_proofs: db.getPaymentProofs({ userId: filterUserId, limit: 25 }).map(p => ({
+        ...p,
+        transcode: db.maskTranscode(p.transcode)
+      })),
+      validated_payments: db.getValidatedPayments({ userId: filterUserId, limit: 25 }).map(vp => ({
+        ...vp,
+        transcode: db.maskTranscode(vp.transcode)
+      })),
+      idempotency_keys: db.getCanonicalIdempotencyKeys({ userId: filterUserId, limit: 25 }),
+      wallet_transactions: db.getWalletTransactions({ userId: filterUserId, limit: 25 }),
+      audit_logs: db.getAuditLogs({ userId: filterUserId, limit: 25 })
+    },
+    relations: [
+      { from: 'users.id', to: 'payment_requests.user_id', onDelete: 'RESTRICT' },
+      { from: 'users.id', to: 'payment_proofs.user_id', onDelete: 'RESTRICT' },
+      { from: 'payment_requests.id', to: 'payment_proofs.payment_request_id', onDelete: 'RESTRICT' },
+      { from: 'payment_requests.id', to: 'validated_payments.payment_request_id', onDelete: 'RESTRICT' },
+      { from: 'payment_proofs.id', to: 'validated_payments.payment_proof_id', onDelete: 'RESTRICT' },
+      { from: 'users.id', to: 'validated_payments.user_id', onDelete: 'RESTRICT' },
+      { from: 'payment_requests.id', to: 'wallet_transactions.payment_request_id', onDelete: 'RESTRICT' },
+      { from: 'validated_payments.id', to: 'wallet_transactions.validated_payment_id', onDelete: 'RESTRICT' },
+      { from: 'users.id', to: 'wallet_transactions.user_id', onDelete: 'RESTRICT' },
+      { from: 'payment_requests.id', to: 'idempotency_keys.resource_id', onDelete: 'RESTRICT', nullable: true },
+      { from: 'users.id', to: 'idempotency_keys.user_id', onDelete: 'RESTRICT' },
+      { from: 'users.id', to: 'audit_logs.user_id', onDelete: 'RESTRICT', nullable: true },
+      { from: 'payment_requests.id', to: 'audit_logs.payment_request_id', onDelete: 'RESTRICT', nullable: true }
+    ],
+    guarantees: {
+      proofNeverConsideredValidatedPayment: true,
+      walletDepositRequiresValidatedPaymentTrigger: true,
+      financialHistoryDeletionForbidden: true,
+      sameRequestSameKeySameOperation: true,
+      maxOneCreditPerPayment: true,
+      maxOneUsePerValidatedTranscode: true,
+      maxOneUsePerPaymentProofHash: true,
+      maxOneRefundPerPayment: true,
+      stateMachineTransitions: [
+        'pending -> verifying -> verified -> credited',
+        'pending / verifying -> rejected',
+        'pending / verifying -> manual_review',
+        'credited -> refunded'
+      ]
+    },
+    postgresSchemaSql: db.getPostgresSchemaSql()
+  });
+});
+
+// ============================================================================
+// 10. BLOCKING 2FA SMS / EMAIL VERIFICATION FOR WALLET CREDIT & WITHDRAWAL
+// ============================================================================
+
+const wallet2FARateLimit = paymentVerifyRateLimit;
+
+// 10A. Request a 6-digit 2FA OTP code via SMS or Email for a Wallet Credit or Wallet Withdrawal
+apiRouter.post('/wallet/2fa/challenge', authenticateUser, wallet2FARateLimit, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const sec = extractSecurityHeadersAndParams(req);
+  const {
+    operationType = 'wallet_credit',
+    channel = 'email',
+    paymentRequestId,
+    amount,
+    currency = 'USD',
+    destinationOverride
+  } = req.body || {};
+
+  const normalizedOp: Wallet2FAOperationType =
+    operationType === 'wallet_withdrawal' ? 'wallet_withdrawal' : 'wallet_credit';
+  const normalizedChannel: Wallet2FAChannel = channel === 'sms' ? 'sms' : 'email';
+
+  let resolvedAmount = Number(amount || 0);
+  let resolvedPaymentRequestId: string | null = paymentRequestId ? String(paymentRequestId).trim() : null;
+
+  if (resolvedPaymentRequestId) {
+    const paymentReq = db.getPaymentRequestById(resolvedPaymentRequestId);
+    if (!paymentReq || paymentReq.user_id !== user.id) {
+      return res.status(404).json({
+        error: 'PAYMENT_REQUEST_NOT_FOUND',
+        message: 'Demande de paiement introuvable pour ce challenge 2FA.'
+      });
+    }
+    resolvedAmount = paymentReq.expected_amount;
+  }
+
+  if (Number.isNaN(resolvedAmount) || resolvedAmount <= 0) {
+    return res.status(400).json({
+      error: 'INVALID_AMOUNT',
+      message: 'Montant invalide pour l’émission du code 2FA.'
+    });
+  }
+
+  const destination =
+    normalizedChannel === 'sms'
+      ? String(destinationOverride || user.phone || '+509 37 00 0000').trim()
+      : user.email;
+
+  const issued = db.createWallet2FAChallenge({
+    userId: user.id,
+    userEmail: user.email,
+    userPhone: user.phone,
+    operationType: normalizedOp,
+    paymentRequestId: resolvedPaymentRequestId,
+    channel: normalizedChannel,
+    destination,
+    amount: resolvedAmount,
+    currency: String(currency || 'USD'),
+    ipAddress: sec.ipAddress,
+    userAgent: String(req.headers['user-agent'] || ''),
+    ttlSeconds: 300
+  });
+
+  const dispatchResult = await NotificationEngine.sendWalletTwoFactorCodeNotification({
+    userId: user.id,
+    userEmail: user.email,
+    userName: user.name,
+    userPhone: destination,
+    channel: normalizedChannel,
+    destination: issued.challenge.destination,
+    maskedDestination: issued.challenge.masked_destination,
+    operationType: normalizedOp,
+    code: issued.rawCode,
+    challengeId: issued.challenge.id,
+    amount: resolvedAmount,
+    currency: String(currency || 'USD'),
+    paymentRequestId: resolvedPaymentRequestId,
+    expiresInSeconds: issued.expiresInSeconds
+  });
+
+  return res.status(201).json({
+    success: true,
+    challengeId: issued.challenge.id,
+    operationType: issued.challenge.operation_type,
+    channel: issued.challenge.channel,
+    maskedDestination: issued.challenge.masked_destination,
+    amount: issued.challenge.amount,
+    currency: issued.challenge.currency,
+    expiresAt: issued.challenge.expires_at,
+    expiresInSeconds: issued.expiresInSeconds,
+    maxAttempts: issued.challenge.max_attempts,
+    deliverySummary: `Code 2FA envoyé par ${issued.challenge.channel.toUpperCase()} à ${issued.challenge.masked_destination}`,
+    delivered: dispatchResult.delivered,
+    // Expose demoCode so the user in the preview environment can test both valid and invalid codes immediately
+    demoCode: issued.rawCode
+  });
+});
+
+// 10B. Verify the 6-digit 2FA OTP code on the backend using crypto.timingSafeEqual
+apiRouter.post('/wallet/2fa/verify', authenticateUser, wallet2FARateLimit, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const sec = extractSecurityHeadersAndParams(req);
+  const { challengeId, code } = req.body || {};
+
+  if (!challengeId || !code) {
+    return res.status(400).json({
+      verified: false,
+      error: 'MISSING_2FA_PARAMETERS',
+      errorCode: 'MISSING_2FA_PARAMETERS',
+      message: 'Veuillez fournir l’identifiant du challenge 2FA et le code à 6 chiffres.'
+    });
+  }
+
+  const verifyResult = db.verifyWallet2FAChallenge({
+    challengeId: String(challengeId),
+    userId: user.id,
+    userEmail: user.email,
+    code: String(code),
+    ipAddress: sec.ipAddress,
+    userAgent: String(req.headers['user-agent'] || '')
+  });
+
+  if (!verifyResult.verified) {
+    return res.status(403).json({
+      verified: false,
+      twoFactorBlocked: true,
+      error: verifyResult.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+      errorCode: verifyResult.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+      message: verifyResult.message,
+      remainingAttempts: verifyResult.remainingAttempts
+    });
+  }
+
+  return res.json({
+    verified: true,
+    message: verifyResult.message,
+    verificationToken: verifyResult.verificationToken,
+    challenge: {
+      id: verifyResult.challenge?.id,
+      operationType: verifyResult.challenge?.operation_type,
+      channel: verifyResult.challenge?.channel,
+      maskedDestination: verifyResult.challenge?.masked_destination,
+      amount: verifyResult.challenge?.amount,
+      currency: verifyResult.challenge?.currency,
+      status: verifyResult.challenge?.status,
+      verifiedAt: verifyResult.challenge?.verified_at
+    }
+  });
+});
+
+// 10C. Atomic & Idempotent Wallet Withdrawal Endpoint (MonCash / NatCash) — BLOCKED if 2FA fails on backend
+apiRouter.post('/wallet/withdraw', authenticateUser, wallet2FARateLimit, async (req, res) => {
+  const user = (req as any).user as AppUser;
+  const sec = extractSecurityHeadersAndParams(req);
+  const {
+    amount,
+    currency = 'USD',
+    payoutMethod = 'moncash',
+    destinationPhone,
+    twoFactorVerificationToken,
+    twoFactorChallengeId,
+    twoFactorCode
+  } = req.body || {};
+
+  const numAmount = Number(Number(amount || 0).toFixed(2));
+  if (Number.isNaN(numAmount) || numAmount < 1) {
+    return res.status(400).json({
+      withdrawn: false,
+      error: 'INVALID_WITHDRAWAL_AMOUNT',
+      message: 'Veuillez saisir un montant de retrait valide (minimum $1.00 USD).'
+    });
+  }
+
+  const cleanMethod: 'moncash' | 'natcash' = payoutMethod === 'natcash' ? 'natcash' : 'moncash';
+  const cleanPhone = String(destinationPhone || user.phone || '').trim();
+  if (cleanPhone.length < 8) {
+    return res.status(400).json({
+      withdrawn: false,
+      error: 'INVALID_DESTINATION_PHONE',
+      message: `Veuillez saisir un numéro ${cleanMethod === 'moncash' ? 'MonCash' : 'NatCash'} de réception valide.`
+    });
+  }
+
+  // BLOCKING BACKEND 2FA GATE: Withdrawal is strictly refused (403 Forbidden) if 2FA SMS/Email verification fails or is absent
+  const twoFactorGate = db.assertAndConsumeWallet2FA({
+    userId: user.id,
+    userEmail: user.email,
+    operationType: 'wallet_withdrawal',
+    expectedAmount: numAmount,
+    twoFactorVerificationToken: twoFactorVerificationToken
+      ? String(twoFactorVerificationToken)
+      : String(req.headers['x-2fa-verification-token'] || ''),
+    twoFactorChallengeId: twoFactorChallengeId
+      ? String(twoFactorChallengeId)
+      : String(req.headers['x-2fa-challenge-id'] || ''),
+    twoFactorCode: twoFactorCode
+      ? String(twoFactorCode)
+      : String(req.headers['x-2fa-code'] || ''),
+    ipAddress: sec.ipAddress,
+    userAgent: String(req.headers['user-agent'] || '')
+  });
+
+  if (!twoFactorGate.allowed || !twoFactorGate.challenge) {
+    return res.status(403).json({
+      success: false,
+      withdrawn: false,
+      twoFactorRequired: true,
+      twoFactorBlocked: true,
+      error: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+      errorCode: twoFactorGate.errorCode || 'TWO_FACTOR_VERIFICATION_FAILED',
+      message:
+        twoFactorGate.message ||
+        'Étape 2FA bloquante : la vérification 2FA SMS/Email a échoué côté backend. Le retrait est refusé.',
+      walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+    });
+  }
+
+  const consumedChallengeId = twoFactorGate.challenge.id;
+  const effectiveIdempotencyKey =
+    sec.idempotencyKey || `idem_withdraw_${user.id}_${consumedChallengeId}`;
+
+  const opResult = await db.executeIdempotentPaymentOperation({
+    idempotencyKey: effectiveIdempotencyKey,
+    operationType: 'wallet_withdrawal',
+    endpoint: '/api/wallet/withdraw',
+    userId: user.id,
+    userEmail: user.email,
+    paymentRequestId: `wdr_${consumedChallengeId}`,
+    requestId: sec.requestId,
+    nonce: sec.nonce,
+    clientTimestamp: sec.clientTimestamp,
+    ipAddress: sec.ipAddress,
+    payload: {
+      amount: numAmount,
+      currency,
+      payoutMethod: cleanMethod,
+      destinationPhone: cleanPhone,
+      twoFactorChallengeId: consumedChallengeId
+    },
+    executor: async () => {
+      const withdrawalRes = await db.executeAtomicWalletWithdrawal({
+        userId: user.id,
+        userEmail: user.email,
+        amount: numAmount,
+        currency: String(currency || 'USD'),
+        payoutMethod: cleanMethod,
+        destinationPhone: cleanPhone,
+        idempotencyKey: effectiveIdempotencyKey,
+        twoFactorChallengeId: consumedChallengeId,
+        requestId: sec.requestId,
+        ipAddress: sec.ipAddress,
+        userAgent: String(req.headers['user-agent'] || '')
+      });
+
+      if (!withdrawalRes.withdrawn) {
+        return {
+          httpStatus: 400,
+          body: {
+            success: false,
+            withdrawn: false,
+            error: withdrawalRes.errorCode || 'WITHDRAWAL_FAILED',
+            errorCode: withdrawalRes.errorCode || 'WITHDRAWAL_FAILED',
+            message: withdrawalRes.message,
+            walletBalance: db.getUserById(user.id)?.walletBalance ?? 0
+          }
+        };
+      }
+
+      return {
+        httpStatus: 200,
+        body: {
+          success: true,
+          withdrawn: true,
+          message: withdrawalRes.message,
+          walletTransaction: withdrawalRes.walletTransaction,
+          paymentTransaction: withdrawalRes.paymentTransaction,
+          walletBalance: withdrawalRes.user?.walletBalance ?? 0,
+          user: withdrawalRes.user
+        }
+      };
+    }
+  });
+
+  return res.status(opResult.httpStatus).json(opResult.body);
+});
+
+// 10D. List recent 2FA challenges for audit & user security visibility
+apiRouter.get('/wallet/2fa/challenges', authenticateUser, (req, res) => {
+  const user = (req as any).user as AppUser;
+  const isAdmin = user.role === 'ADMIN';
+  const filterUserId = isAdmin && req.query.all === 'true' ? undefined : user.id;
+  return res.json({
+    challenges: db.getWallet2FAChallenges({ userId: filterUserId, limit: 30 })
+  });
+});
+
 

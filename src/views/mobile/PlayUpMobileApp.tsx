@@ -19,19 +19,22 @@ import {
   connectRealTimePushStream,
   requestAndSubscribePushNotifications
 } from '../../lib/pushNotifications';
+import { ProductPriceHistoryChart } from '../../components/ProductPriceHistoryChart';
 
 interface PlayUpMobileAppProps {
   games: Game[];
   services: Service[];
   onClose: () => void;
   lang: Language;
+  onAuthChange?: (user: AppUser | null) => void;
 }
 
 export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   games,
   services,
   onClose,
-  lang
+  lang,
+  onAuthChange
 }) => {
   const t = translations[lang].mobileApp;
 
@@ -178,6 +181,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setUserToken(token);
     safeStorage.setItem('playup_user_token', token);
     safeStorage.setItem('playup_user_profile', JSON.stringify(user));
+    onAuthChange?.(user);
     setProfileName(user.name);
     setProfilePhone(user.phone || '');
     setProfileCurrency(user.preferredCurrency || 'USD');
@@ -210,7 +214,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
           phone: authPhone
         });
         syncUserState(res.user, res.token);
-        setAuthSuccess('Compte créé avec succès ! $15.00 de bonus crédités sur votre PlayUp Wallet.');
+        setAuthSuccess(
+          res.user.role === 'ADMIN'
+            ? 'Compte créé avec succès ! En tant que premier utilisateur, le rôle ADMIN vous a été attribué.'
+            : 'Compte créé avec succès ! Bienvenue sur PlayUp.'
+        );
       } else if (authMode === 'forgot') {
         const res = await apiClient.forgotUserPassword(authEmail);
         setGeneratedResetCode(res.resetCode);
@@ -251,25 +259,6 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
       setAuthSuccess(`Connecté via Google (${res.user.email})`);
     } catch (err: any) {
       setAuthError(err.message || 'Connexion Google annulée ou indisponible dans cette fenêtre.');
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
-  const handleFacebookQuickLogin = async () => {
-    setAuthLoading(true);
-    setAuthError(null);
-    setAuthSuccess(null);
-    try {
-      const res = await apiClient.socialLoginUser({
-        provider: 'facebook',
-        email: 'gamer.fb@playup.gg',
-        name: 'Joueur Facebook PlayUp'
-      });
-      syncUserState(res.user, res.token);
-      setAuthSuccess(`Connecté avec Facebook (${res.user.name})`);
-    } catch (err: any) {
-      setAuthError(err.message || 'Erreur connexion Facebook');
     } finally {
       setAuthLoading(false);
     }
@@ -1689,6 +1678,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     </div>
                   </div>
 
+                  {/* 30-Day Recharts Price Evolution Chart under the selected product price */}
+                  <ProductPriceHistoryChart pkg={selectedPackage} theme="dark" compact />
+
                   <button
                     disabled={isOrdering}
                     onClick={handleConfirmOrder}
@@ -1724,6 +1716,11 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                       ${selectedPackage ? selectedPackage.publicPrice.toFixed(2) : '0.00'} USD
                     </span>
                   </div>
+
+                  {/* 30-Day Recharts Price Evolution Chart under the selected product price */}
+                  {selectedPackage && (
+                    <ProductPriceHistoryChart pkg={selectedPackage} theme="dark" compact />
+                  )}
 
                   <button
                     disabled={
@@ -2368,24 +2365,14 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                       {/* Social Logins */}
                       <div className="pt-3 border-t border-slate-100 space-y-2">
                         <span className="text-[11px] text-slate-400 text-center block">Ou continuer avec</span>
-                        <div className="grid grid-cols-2 gap-2">
-                          <button
-                            type="button"
-                            disabled={authLoading}
-                            onClick={handleGoogleSignIn}
-                            className="py-2 px-3 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl font-semibold text-slate-800 flex items-center justify-center gap-1.5"
-                          >
-                            <span>Google</span>
-                          </button>
-                          <button
-                            type="button"
-                            disabled={authLoading}
-                            onClick={handleFacebookQuickLogin}
-                            className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-semibold flex items-center justify-center gap-1.5"
-                          >
-                            <span>Facebook</span>
-                          </button>
-                        </div>
+                        <button
+                          type="button"
+                          disabled={authLoading}
+                          onClick={handleGoogleSignIn}
+                          className="w-full py-2 px-3 bg-white border border-slate-300 hover:bg-slate-50 rounded-xl font-semibold text-slate-800 flex items-center justify-center gap-1.5"
+                        >
+                          <span>Continuer avec Google</span>
+                        </button>
                       </div>
                     </div>
                   ) : (
@@ -2408,8 +2395,10 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                               signOutFirebase().catch(() => {});
                               safeStorage.removeItem('playup_user_token');
                               safeStorage.removeItem('playup_user_profile');
+                              safeStorage.removeItem('playup_admin_token');
                               setAuthUser(null);
                               setUserToken('');
+                              onAuthChange?.(null);
                             }}
                             className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800"
                             title="Déconnexion"

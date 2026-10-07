@@ -148,8 +148,9 @@ export interface DatabaseSchema {
   processedOrderDeliveries?: string[];
 }
 
-class PlayUpDatabase {
+export class PlayUpDatabase {
   private data: DatabaseSchema;
+  private registrationLock = false;
 
   constructor() {
     this.ensureDataDir();
@@ -395,11 +396,14 @@ class PlayUpDatabase {
       changed = true;
     }
 
-    // Purge legacy demo accounts and demo API keys if present from older builds
-    const beforeUsersLen = this.data.users.length;
-    this.data.users = this.data.users.filter(u => u.id !== 'usr_demo_01');
-    if (this.data.users.length !== beforeUsersLen) {
-      delete this.data.userCredentials['usr_demo_01'];
+    // Rotate any non-HMAC session secret to a fresh cryptographic secret
+    if (
+      !this.data.adminToken ||
+      !this.data.adminToken.startsWith('plup_hmac_')
+    ) {
+      this.data.adminToken =
+        process.env.PLAYUP_SESSION_SECRET?.trim() ||
+        'plup_hmac_' + crypto.randomBytes(32).toString('hex');
       changed = true;
     }
 
@@ -416,51 +420,13 @@ class PlayUpDatabase {
     }
 
     // Ensure every user record has an explicit role ('USER' | 'ADMIN') and pushNotificationsEnabled
-    const configuredAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || '').trim().toLowerCase();
     for (const u of this.data.users) {
-      if (!u.role) {
-        u.role = configuredAdminEmail && u.email.toLowerCase() === configuredAdminEmail ? 'ADMIN' : 'USER';
+      if (u.role !== 'ADMIN' && u.role !== 'USER') {
+        u.role = 'USER';
         changed = true;
       }
       if (typeof u.pushNotificationsEnabled !== 'boolean') {
         u.pushNotificationsEnabled = true;
-        changed = true;
-      }
-    }
-
-    // Provision the dedicated ADMIN account ONLY if PLAYUP_ADMIN_EMAIL and PLAYUP_ADMIN_PASSWORD are set in server environment variables
-    const adminInitialPassword = (process.env.PLAYUP_ADMIN_PASSWORD || '').trim();
-    if (configuredAdminEmail && adminInitialPassword) {
-      let adminUser = this.data.users.find(u => u.email.toLowerCase() === configuredAdminEmail);
-      if (!adminUser) {
-        const salt = crypto.randomBytes(16).toString('hex');
-        const hash = crypto.scryptSync(adminInitialPassword, salt, 64).toString('hex');
-        adminUser = {
-          id: 'usr_admin_master',
-          name: 'Administrateur PlayUp',
-          email: configuredAdminEmail,
-          role: 'ADMIN',
-          authProvider: 'email',
-          emailVerified: true,
-          status: 'active',
-          preferredCurrency: 'USD',
-          twoFactorEnabled: true,
-          emailNotifications: true,
-          pushNotificationsEnabled: true,
-          walletBalance: 0,
-          ordersCount: 0,
-          totalSpent: 0,
-          createdAt: '2026-01-01T00:00:00Z',
-          lastLoginAt: new Date().toISOString()
-        };
-        this.data.users.push(adminUser);
-        this.data.userCredentials[adminUser.id] = {
-          passwordHash: hash,
-          passwordSalt: salt
-        };
-        changed = true;
-      } else if (adminUser.role !== 'ADMIN') {
-        adminUser.role = 'ADMIN';
         changed = true;
       }
     }
@@ -600,7 +566,9 @@ class PlayUpDatabase {
       supportTickets: INITIAL_TICKETS,
       settings: INITIAL_SETTINGS,
       systemLogs: INITIAL_LOGS,
-      adminToken: 'plup_admin_secret_token_2026_secured'
+      adminToken:
+        process.env.PLAYUP_SESSION_SECRET?.trim() ||
+        'plup_hmac_' + crypto.randomBytes(32).toString('hex')
     };
 
     this.saveDirect(initialSchema);
@@ -610,9 +578,15 @@ class PlayUpDatabase {
   private saveDirect(dataToSave: DatabaseSchema) {
     try {
       this.ensureDataDir();
-      fs.writeFileSync(DB_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      const tmpFile = `${DB_FILE}.tmp.${process.pid}`;
+      fs.writeFileSync(tmpFile, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, DB_FILE);
     } catch (err) {
-      console.error('[DB] Failed to save database file:', err);
+      try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      } catch (fallbackErr) {
+        console.error('[DB] Failed to save database file:', fallbackErr);
+      }
     }
   }
 
@@ -1002,6 +976,152 @@ class PlayUpDatabase {
 
   public getUserCredential(userId: string): UserCredentialRecord | undefined {
     return this.data.userCredentials?.[userId];
+  }
+
+  /**
+   * Controlled reset of all application user accounts & credentials without touching
+   * games, services, providers, API configurations, or system tables.
+   */
+  public resetAllUsers(): {
+    removedUsersCount: number;
+    removedCredentialsCount: number;
+    remainingUsersCount: number;
+  } {
+    const removedUsersCount = (this.data.users || []).length;
+    const removedCredentialsCount = Object.keys(this.data.userCredentials || {}).length;
+    this.data.users = [];
+    this.data.userCredentials = {};
+    this.data.userNotifications = [];
+    this.data.pushSubscriptions = [];
+    // Rotate HMAC session signing secret so any old session token on any device is immediately invalidated
+    this.data.adminToken =
+      process.env.PLAYUP_SESSION_SECRET?.trim() ||
+      'plup_hmac_' + crypto.randomBytes(32).toString('hex');
+    this.save();
+    this.addSystemLog(
+      'info',
+      'auth',
+      `Database user accounts reset completed: ${removedUsersCount} user(s) removed, 0 remaining.`
+    );
+    return {
+      removedUsersCount,
+      removedCredentialsCount,
+      remainingUsersCount: this.data.users.length
+    };
+  }
+
+  /**
+   * Atomic, concurrency-safe user registration.
+   * - The VERY FIRST user created when the users table is empty (0 users) atomically receives role = 'ADMIN'.
+   * - Every subsequent user strictly receives role = 'USER'.
+   * - Client-supplied role/privilege fields are never accepted.
+   */
+  public registerUserAtomic(params: {
+    name: string;
+    email: string;
+    password?: string;
+    phone?: string;
+    preferredCurrency?: 'USD' | 'HTG' | 'EUR';
+    authProvider?: 'email' | 'google';
+    uid?: string;
+    avatarUrl?: string;
+  }): { user: AppUser; token: string; isFirstUserAdmin: boolean } {
+    if (this.registrationLock) {
+      throw new Error('Une inscription simultanée est en cours de traitement. Veuillez réessayer.');
+    }
+    this.registrationLock = true;
+    try {
+      const cleanName = String(params.name || '').trim().slice(0, 80);
+      const cleanEmail = String(params.email || '').trim().toLowerCase().slice(0, 160);
+      const cleanPhone = params.phone ? String(params.phone).trim().slice(0, 32) : undefined;
+
+      if (!cleanName || cleanName.length < 2) {
+        throw new Error('Le nom complet doit contenir au moins 2 caractères.');
+      }
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!cleanEmail || !emailRegex.test(cleanEmail)) {
+        throw new Error('Veuillez fournir une adresse email valide.');
+      }
+
+      if (!this.data.users) {
+        this.data.users = [];
+      }
+      if (!this.data.userCredentials) {
+        this.data.userCredentials = {};
+      }
+
+      const existing = this.data.users.find(u => u.email.toLowerCase() === cleanEmail);
+      if (existing) {
+        throw new Error('Un compte PlayUp existe déjà avec cette adresse email.');
+      }
+
+      // ATOMIC ROLE ASSIGNMENT: First user in empty database = ADMIN, all others = USER
+      const isFirstUser =
+        this.data.users.length === 0 && !this.data.users.some(u => u.role === 'ADMIN');
+      const assignedRole: 'ADMIN' | 'USER' = isFirstUser ? 'ADMIN' : 'USER';
+
+      const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex');
+      const nowIso = new Date().toISOString();
+
+      let passwordCred: { hash: string; salt: string } | null = null;
+      if (params.authProvider !== 'google') {
+        const rawPassword = String(params.password || '');
+        if (rawPassword.length < 6) {
+          throw new Error('Le mot de passe doit contenir au moins 6 caractères.');
+        }
+        passwordCred = this.hashPassword(rawPassword);
+      }
+
+      const newUser: AppUser = {
+        id: userId,
+        ...(params.uid ? { uid: String(params.uid).slice(0, 128) } : {}),
+        name: cleanName,
+        email: cleanEmail,
+        ...(cleanPhone ? { phone: cleanPhone } : {}),
+        ...(params.avatarUrl ? { avatarUrl: params.avatarUrl } : {}),
+        role: assignedRole,
+        authProvider: params.authProvider === 'google' ? 'google' : 'email',
+        emailVerified: true,
+        status: 'active',
+        preferredCurrency:
+          params.preferredCurrency && ['USD', 'HTG', 'EUR'].includes(params.preferredCurrency)
+            ? params.preferredCurrency
+            : 'USD',
+        twoFactorEnabled: false,
+        emailNotifications: true,
+        pushNotificationsEnabled: true,
+        walletBalance: 0.0,
+        ordersCount: 0,
+        totalSpent: 0,
+        createdAt: nowIso,
+        lastLoginAt: nowIso
+      };
+
+      // Synchronous mutation + atomic disk write inside lock
+      this.data.users.push(newUser);
+      if (passwordCred) {
+        this.data.userCredentials[userId] = {
+          passwordHash: passwordCred.hash,
+          passwordSalt: passwordCred.salt
+        };
+      }
+      this.save();
+
+      const token = this.generateUserSessionToken(userId);
+      this.addSystemLog(
+        'info',
+        'auth',
+        `User registered: ${newUser.email} (id=${newUser.id}, role=${newUser.role})`
+      );
+
+      return {
+        user: newUser,
+        token,
+        isFirstUserAdmin: isFirstUser
+      };
+    } finally {
+      this.registrationLock = false;
+    }
   }
 
   public generateUserSessionToken(userId: string): string {

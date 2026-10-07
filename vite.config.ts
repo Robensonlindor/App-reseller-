@@ -5,7 +5,32 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      {
+        name: 'playup-bundle-backend',
+        async closeBundle() {
+          const {build} = await import('esbuild');
+          await build({
+            entryPoints: ['server/apiRoutes.ts'],
+            bundle: true,
+            platform: 'node',
+            format: 'esm',
+            packages: 'external',
+            outfile: 'dist/apiRoutes.mjs',
+          });
+          await build({
+            entryPoints: ['server/apiRoutes.ts'],
+            bundle: true,
+            platform: 'node',
+            format: 'esm',
+            packages: 'external',
+            outfile: 'server/apiRoutes.bundle.mjs',
+          });
+        },
+      },
+    ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

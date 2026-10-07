@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { 
   Smartphone, Download, ExternalLink, Info, Check, 
-  ArrowRight, ShieldCheck, Zap, X, ChevronRight 
+  ArrowRight, ShieldCheck, Zap, X, ChevronRight, TrendingDown
 } from 'lucide-react';
 import { Game, Service, ServicePackage } from '../../types';
 import { Language, translations } from '../../i18n';
+import { ProductPriceHistoryChart } from '../../components/ProductPriceHistoryChart';
 
 interface ServicesViewProps {
   games: Game[];
@@ -26,6 +27,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
   lang
 }) => {
   const t = translations[lang];
+  const [selectedPackagesByService, setSelectedPackagesByService] = useState<Record<string, ServicePackage>>({});
   const [activePackageModal, setActivePackageModal] = useState<{
     game: Game;
     service: Service;
@@ -38,6 +40,7 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
     : services;
 
   const handlePackageClick = (service: Service, pkg: ServicePackage) => {
+    setSelectedPackagesByService(prev => ({ ...prev, [service.id]: pkg }));
     const parentGame = games.find(g => g.id === service.gameId);
     if (!parentGame) return;
     setActivePackageModal({
@@ -137,39 +140,109 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
               {/* Packages Grid */}
               <div>
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-4">
-                  Packs & Tarifs indicatifs ({service.packages.length} options)
+                  Packs & Tarifs indicatifs ({service.packages.length} options) — Cliquez sur un produit pour analyser son tarif
                 </h3>
 
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5">
-                  {service.packages.map(pkg => (
-                    <div
-                      key={pkg.id}
-                      onClick={() => handlePackageClick(service, pkg)}
-                      className="group cursor-pointer border border-slate-200 hover:border-orange-500 hover:shadow-md rounded-2xl p-4 transition-all bg-slate-50/50 hover:bg-white flex flex-col justify-between"
-                    >
-                      <div>
-                        <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-tight">
-                          {pkg.unit}
-                        </span>
-                        <div className="font-display text-lg font-bold text-slate-900 mt-0.5 group-hover:text-orange-600 transition-colors">
-                          {pkg.name}
+                  {service.packages.map(pkg => {
+                    const currentSelectedPkg = selectedPackagesByService[service.id] || service.packages[0];
+                    const isSelected = currentSelectedPkg?.id === pkg.id;
+                    return (
+                      <div
+                        key={pkg.id}
+                        onClick={() => setSelectedPackagesByService(prev => ({ ...prev, [service.id]: pkg }))}
+                        className={`group cursor-pointer border rounded-2xl p-4 transition-all flex flex-col justify-between ${
+                          isSelected
+                            ? 'border-orange-600 bg-orange-50/50 shadow-sm ring-1 ring-orange-500'
+                            : 'border-slate-200 hover:border-orange-500 hover:shadow-md bg-slate-50/50 hover:bg-white'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-tight">
+                              {pkg.unit}
+                            </span>
+                            {isSelected && (
+                              <span className="px-1.5 py-0.5 rounded bg-orange-600 text-white text-[9px] font-bold uppercase">
+                                Sélectionné
+                              </span>
+                            )}
+                          </div>
+                          <div className="font-display text-lg font-bold text-slate-900 mt-0.5 group-hover:text-orange-600 transition-colors">
+                            {pkg.name}
+                          </div>
+                        </div>
+
+                        <div className="mt-4 pt-3 border-t border-slate-200/60 flex items-center justify-between">
+                          <div>
+                            <span className="text-[10px] text-slate-400 block">Prix indicatif</span>
+                            <span className="font-mono text-sm font-semibold text-slate-900">
+                              ${pkg.publicPrice.toFixed(2)}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handlePackageClick(service, pkg);
+                            }}
+                            className="text-orange-600 hover:text-orange-700 text-xs font-semibold group-hover:translate-x-0.5 transition-transform"
+                          >
+                            Commander →
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Selected Product Price Detail + 30-Day Recharts Price Evolution */}
+                {(() => {
+                  const selectedPkg = selectedPackagesByService[service.id] || service.packages[0];
+                  if (!selectedPkg) return null;
+                  const resellerRate =
+                    selectedPkg.resellerPrice && selectedPkg.resellerPrice < selectedPkg.publicPrice
+                      ? selectedPkg.resellerPrice
+                      : +(selectedPkg.publicPrice * 0.92).toFixed(2);
+                  return (
+                    <div className="mt-5 bg-slate-50/90 border border-slate-200 rounded-2xl p-4 sm:p-5 space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200/80">
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-orange-600 block">
+                            Produit sélectionné · Transparence Tarifaire Revendeur
+                          </span>
+                          <h4 className="font-display text-base sm:text-lg font-bold text-slate-900">
+                            {game?.name} — {selectedPkg.name}
+                          </h4>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-4">
+                          <div>
+                            <span className="text-[10px] text-slate-500 block">Tarif B2B Revendeur</span>
+                            <span className="font-mono text-lg font-extrabold text-orange-600">
+                              ${resellerRate.toFixed(2)} {selectedPkg.currency || 'USD'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] text-slate-500 block">Prix Public Conseillé</span>
+                            <span className="font-mono text-base font-bold text-slate-800">
+                              ${selectedPkg.publicPrice.toFixed(2)} {selectedPkg.currency || 'USD'}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handlePackageClick(service, selectedPkg)}
+                            className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold rounded-xl shadow-2xs transition-colors"
+                          >
+                            Ouvrir ce pack →
+                          </button>
                         </div>
                       </div>
 
-                      <div className="mt-4 pt-3 border-t border-slate-200/60 flex items-center justify-between">
-                        <div>
-                          <span className="text-[10px] text-slate-400 block">Prix indicatif</span>
-                          <span className="font-mono text-sm font-semibold text-slate-900">
-                            ${pkg.publicPrice.toFixed(2)}
-                          </span>
-                        </div>
-                        <span className="text-orange-600 text-xs font-medium group-hover:translate-x-0.5 transition-transform">
-                          →
-                        </span>
-                      </div>
+                      {/* Recharts 30-Day Price Evolution Chart directly underneath the selected product price */}
+                      <ProductPriceHistoryChart pkg={selectedPkg} theme="light" />
                     </div>
-                  ))}
-                </div>
+                  );
+                })()}
               </div>
 
               {/* Dynamic Game Profile Fields Info */}
@@ -253,6 +326,9 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                 </span>
               </div>
             </div>
+
+            {/* 30-Day Price Evolution Chart under the selected product price in modal */}
+            <ProductPriceHistoryChart pkg={activePackageModal.pkg} theme="light" compact />
 
             {/* Actions */}
             <div className="space-y-2.5 pt-2">

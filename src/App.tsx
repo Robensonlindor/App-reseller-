@@ -49,7 +49,9 @@ export default function App() {
     const token = safeStorage.getItem('playup_user_token');
     if (!token) {
       safeStorage.removeItem('playup_user_profile');
+      safeStorage.removeItem('playup_admin_token');
       setAuthUser(null);
+      setIsAdminOpen(false);
       return;
     }
     try {
@@ -57,15 +59,23 @@ export default function App() {
       if (res && res.user) {
         setAuthUser(res.user);
         safeStorage.setItem('playup_user_profile', JSON.stringify(res.user));
+        if (res.user.role !== 'ADMIN') {
+          safeStorage.removeItem('playup_admin_token');
+          setIsAdminOpen(false);
+        }
       } else {
         safeStorage.removeItem('playup_user_token');
         safeStorage.removeItem('playup_user_profile');
+        safeStorage.removeItem('playup_admin_token');
         setAuthUser(null);
+        setIsAdminOpen(false);
       }
     } catch {
       safeStorage.removeItem('playup_user_token');
       safeStorage.removeItem('playup_user_profile');
+      safeStorage.removeItem('playup_admin_token');
       setAuthUser(null);
+      setIsAdminOpen(false);
     }
   }, []);
 
@@ -255,6 +265,7 @@ export default function App() {
             verifyCurrentSession();
           }}
           lang={lang}
+          onAuthChange={(user) => setAuthUser(user)}
         />
       )}
 

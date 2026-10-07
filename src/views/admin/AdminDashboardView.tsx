@@ -84,6 +84,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       const res = await apiClient.adminLogin(email, password);
       setToken(res.token);
       safeStorage.setItem('playup_admin_token', res.token);
+      safeStorage.setItem('playup_user_token', res.token);
+      if (res.admin) {
+        safeStorage.setItem('playup_user_profile', JSON.stringify(res.admin));
+      }
     } catch (err: any) {
       setLoginError(err.message || 'Identifiants invalides');
     }
@@ -91,7 +95,10 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
 
   const handleLogout = () => {
     safeStorage.removeItem('playup_admin_token');
+    safeStorage.removeItem('playup_user_token');
+    safeStorage.removeItem('playup_user_profile');
     setToken(null);
+    onClose();
   };
 
   const loadAllAdminData = async () => {

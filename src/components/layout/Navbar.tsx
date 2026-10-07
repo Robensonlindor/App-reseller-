@@ -142,16 +142,19 @@ export const Navbar: React.FC<NavbarProps> = ({
               Espace Reseller
             </button>
 
-            {/* Admin Access Link (strictly restricted to ADMIN role) */}
+            {/* Admin Access Link (strictly restricted to authenticated ADMIN role) */}
             {isAdmin && (
               <button
                 onClick={() => onNavigate('admin')}
-                className={`p-1.5 text-slate-500 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-colors ${
-                  currentTab === 'admin' ? 'text-orange-600 bg-orange-50' : ''
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg border transition-colors ${
+                  currentTab === 'admin'
+                    ? 'bg-orange-600 text-white border-orange-600'
+                    : 'text-orange-700 bg-orange-50 border-orange-200 hover:bg-orange-100'
                 }`}
                 title="Espace Administrateur"
               >
-                <Shield className="w-4 h-4" />
+                <Shield className="w-3.5 h-3.5" />
+                <span>Admin</span>
               </button>
             )}
           </div>

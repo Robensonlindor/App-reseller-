@@ -20,21 +20,40 @@ process.on('unhandledRejection', reason => {
 });
 
 async function loadBackendCore(): Promise<{ apiRouter: express.Router; RechargeGamesProvider: any }> {
-  const builtBundlePath = path.resolve(__dirname, 'dist/apiRoutes.mjs');
-  if (fs.existsSync(builtBundlePath)) {
+  if (!isProduction) {
     try {
-      // Load via tsx in dev if available so source edits take effect immediately; otherwise use built bundle for native node server.ts
-      if (!isProduction) {
-        const modPath = './server/apiRoutes';
-        return await import(modPath);
-      }
+      const devMod = './server/apiRoutes';
+      return await import(devMod);
     } catch {
-      // Fallback to built bundle when running under plain node without tsx
+      // Running under plain node without tsx loader; fall through to bundled ESM
     }
-    return await import(builtBundlePath);
   }
-  const modPath = './server/apiRoutes';
-  return await import(modPath);
+
+  const distBundlePath = path.resolve(__dirname, 'dist/apiRoutes.mjs');
+  const serverBundlePath = path.resolve(__dirname, 'server/apiRoutes.bundle.mjs');
+
+  if (fs.existsSync(distBundlePath)) {
+    return await import(distBundlePath);
+  }
+  if (fs.existsSync(serverBundlePath)) {
+    return await import(serverBundlePath);
+  }
+
+  try {
+    const devMod = './server/apiRoutes';
+    return await import(devMod);
+  } catch {
+    const { build } = await import('esbuild');
+    await build({
+      entryPoints: [path.resolve(__dirname, 'server/apiRoutes.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      packages: 'external',
+      outfile: serverBundlePath
+    });
+    return await import(serverBundlePath);
+  }
 }
 
 async function startServer() {

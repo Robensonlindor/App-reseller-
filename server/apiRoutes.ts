@@ -239,65 +239,52 @@ apiRouter.get('/services', (_req, res) => {
 
 apiRouter.post('/auth/register', authRateLimit, (req, res) => {
   try {
-    const { name, email, password, phone, preferredCurrency } = req.body;
+    const {
+      name,
+      email,
+      password,
+      phone,
+      preferredCurrency,
+      role: attemptedRole,
+      isAdmin: attemptedIsAdmin
+    } = req.body || {};
+
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Le nom, l’adresse email et le mot de passe sont obligatoires.' });
     }
-    if (String(password).length < 6) {
-      return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 6 caractères.' });
+
+    if (attemptedRole !== undefined || attemptedIsAdmin !== undefined) {
+      db.addSystemLog(
+        'warn',
+        'auth',
+        `[Security] Blocked client attempt to supply role/admin flag during registration for ${String(email)}`
+      );
     }
 
-    const existing = db.getUserByEmail(email);
-    if (existing) {
-      return res.status(400).json({ error: 'Un compte PlayUp existe déjà avec cette adresse email.' });
-    }
-
-    const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex');
-    const nowIso = new Date().toISOString();
-    const { hash, salt } = db.hashPassword(String(password));
-
-    const newUser: AppUser = {
-      id: userId,
-      name: String(name).trim().slice(0, 80),
-      email: String(email).trim().toLowerCase().slice(0, 160),
-      phone: phone ? String(phone).trim().slice(0, 32) : undefined,
-      role: 'USER',
-      authProvider: 'email',
-      emailVerified: true,
-      status: 'active',
+    const result = db.registerUserAtomic({
+      name: String(name),
+      email: String(email),
+      password: String(password),
+      phone: phone ? String(phone) : undefined,
       preferredCurrency: ['USD', 'HTG', 'EUR'].includes(preferredCurrency) ? preferredCurrency : 'USD',
-      twoFactorEnabled: false,
-      emailNotifications: true,
-      walletBalance: 0.00,
-      ordersCount: 0,
-      totalSpent: 0,
-      createdAt: nowIso,
-      lastLoginAt: nowIso
-    };
-
-    const users = db.getUsers();
-    users.unshift(newUser);
-    db.setUsers(users);
-    db.setUserCredential(userId, {
-      passwordHash: hash,
-      passwordSalt: salt
+      authProvider: 'email'
     });
-
-    const token = db.generateUserSessionToken(userId);
-    db.addSystemLog('info', 'auth', `New PlayUp user registered: ${newUser.email} (${newUser.name})`);
 
     return res.status(201).json({
-      user: newUser,
-      token
+      user: result.user,
+      token: result.token,
+      isFirstUserAdmin: result.isFirstUserAdmin
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Erreur lors de la création du compte' });
+    const msg = err?.message || 'Erreur lors de la création du compte';
+    const status = msg.includes('existe déjà') ? 409 : 400;
+    return res.status(status).json({ error: msg, message: msg });
   }
 });
 
 apiRouter.post('/auth/login', authRateLimit, (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
     if (!email || !password) {
       return res.status(400).json({ error: 'Veuillez renseigner votre email et votre mot de passe.' });
     }
@@ -321,11 +308,14 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
     const idx = users.findIndex(u => u.id === user.id);
     if (idx !== -1) {
       users[idx].lastLoginAt = new Date().toISOString();
+      if (users[idx].role !== 'ADMIN' && users[idx].role !== 'USER') {
+        users[idx].role = 'USER';
+      }
       db.setUsers(users);
     }
 
     const token = db.generateUserSessionToken(user.id);
-    db.addSystemLog('info', 'auth', `User logged in: ${user.email}`);
+    db.addSystemLog('info', 'auth', `User logged in: ${user.email} (role=${(users[idx] || user).role})`);
 
     return res.json({
       user: users[idx] || user,
@@ -336,58 +326,47 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
   }
 });
 
-apiRouter.post('/auth/social', (req, res) => {
+apiRouter.post('/auth/social', authRateLimit, (req, res) => {
   try {
-    const { provider, uid, email, name, avatarUrl } = req.body;
-    if (!email || !provider) {
-      return res.status(400).json({ error: 'Informations d’authentification sociale incomplètes.' });
+    const { provider, uid, email, name, avatarUrl } = req.body || {};
+    if (!email || provider !== 'google' || !uid) {
+      return res.status(400).json({ error: 'Authentification Google OAuth vérifiée requise.' });
     }
 
     const users = db.getUsers();
-    let user = users.find(u => u.email.toLowerCase() === String(email).toLowerCase() || (uid && u.uid === uid));
+    const existing = users.find(u => u.email.toLowerCase() === String(email).toLowerCase() || (uid && u.uid === uid));
     const nowIso = new Date().toISOString();
 
-    if (user) {
-      if (user.status === 'suspended') {
+    if (existing) {
+      if (existing.status === 'suspended') {
         return res.status(401).json({ error: 'Ce compte utilisateur est suspendu.' });
       }
-      user.lastLoginAt = nowIso;
-      if (uid && !user.uid) user.uid = uid;
-      if (avatarUrl) user.avatarUrl = avatarUrl;
+      existing.lastLoginAt = nowIso;
+      if (uid && !existing.uid) existing.uid = uid;
+      if (avatarUrl) existing.avatarUrl = avatarUrl;
       db.setUsers(users);
-    } else {
-      const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex');
-      user = {
-        id: userId,
-        uid: uid || undefined,
-        name: String(name || email.split('@')[0]).slice(0, 80),
-        email: String(email).toLowerCase().slice(0, 160),
-        avatarUrl: avatarUrl || undefined,
-        role: 'USER',
-        authProvider: provider === 'facebook' ? 'facebook' : 'google',
-        emailVerified: true,
-        status: 'active',
-        preferredCurrency: 'USD',
-        twoFactorEnabled: false,
-        emailNotifications: true,
-        walletBalance: 0.00,
-        ordersCount: 0,
-        totalSpent: 0,
-        createdAt: nowIso,
-        lastLoginAt: nowIso
-      };
-      users.unshift(user);
-      db.setUsers(users);
-      db.addSystemLog('info', 'auth', `New social login user (${provider}): ${user.email}`);
+      const token = db.generateUserSessionToken(existing.id);
+      return res.json({
+        user: existing,
+        token
+      });
     }
 
-    const token = db.generateUserSessionToken(user.id);
-    return res.json({
-      user,
-      token
+    const created = db.registerUserAtomic({
+      name: String(name || String(email).split('@')[0]),
+      email: String(email),
+      authProvider: 'google',
+      uid: String(uid),
+      avatarUrl: avatarUrl ? String(avatarUrl) : undefined
+    });
+
+    return res.status(201).json({
+      user: created.user,
+      token: created.token,
+      isFirstUserAdmin: created.isFirstUserAdmin
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Erreur connexion sociale' });
+    return res.status(400).json({ error: err.message || 'Erreur connexion sociale' });
   }
 });
 
@@ -481,7 +460,26 @@ apiRouter.get('/auth/me', authenticateUser, (req, res) => {
 
 apiRouter.put('/auth/profile', authenticateUser, (req, res) => {
   const currentUser = (req as any).user as AppUser;
-  const { name, phone, preferredCurrency, twoFactorEnabled, emailNotifications, pushNotificationsEnabled, currentPassword, newPassword } = req.body;
+  const {
+    name,
+    phone,
+    preferredCurrency,
+    twoFactorEnabled,
+    emailNotifications,
+    pushNotificationsEnabled,
+    currentPassword,
+    newPassword,
+    role: attemptedRole,
+    isAdmin: attemptedIsAdmin
+  } = req.body || {};
+
+  if (attemptedRole !== undefined || attemptedIsAdmin !== undefined) {
+    db.addSystemLog(
+      'warn',
+      'auth',
+      `[Security] Blocked privilege escalation attempt via PUT /auth/profile by ${currentUser.email}`
+    );
+  }
 
   const users = db.getUsers();
   const idx = users.findIndex(u => u.id === currentUser.id);

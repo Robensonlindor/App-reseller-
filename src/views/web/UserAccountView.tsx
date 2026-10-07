@@ -150,7 +150,13 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
         const res = await apiClient.registerUser({ name, email, password, phone });
         syncSession(res.user, res.token);
         await refreshProfileData(res.token);
-        setFeedback({ type: 'success', text: 'Compte créé avec succès ! $15.00 de bienvenue crédités sur votre PlayUp Wallet.' });
+        setFeedback({
+          type: 'success',
+          text:
+            res.user.role === 'ADMIN'
+              ? 'Compte créé avec succès ! En tant que premier utilisateur enregistré, le rôle ADMIN vous a été attribué.'
+              : 'Compte créé avec succès ! Bienvenue dans votre espace privé PlayUp.'
+        });
       } else if (authMode === 'forgot') {
         const res = await apiClient.forgotUserPassword(email);
         setResetCode(res.resetCode);
@@ -190,25 +196,6 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
       setFeedback({ type: 'success', text: `Connecté avec Google (${res.user.email})` });
     } catch (err: any) {
       setFeedback({ type: 'error', text: err.message || 'Authentification Google interrompue' });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleFacebookLogin = async () => {
-    setLoading(true);
-    setFeedback(null);
-    try {
-      const res = await apiClient.socialLoginUser({
-        provider: 'facebook',
-        email: 'gamer.fb@playup.gg',
-        name: 'Joueur Facebook PlayUp'
-      });
-      syncSession(res.user, res.token);
-      await refreshProfileData(res.token);
-      setFeedback({ type: 'success', text: `Connecté avec Facebook (${res.user.name})` });
-    } catch (err: any) {
-      setFeedback({ type: 'error', text: err.message || 'Erreur Facebook Login' });
     } finally {
       setLoading(false);
     }
@@ -510,26 +497,16 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
 
               <div className="pt-4 border-t border-slate-100 space-y-3">
                 <span className="text-[11px] text-slate-400 text-center block uppercase tracking-wider font-semibold">
-                  Connexions Sociales Rapides
+                  Connexion OAuth Sécurisée
                 </span>
-                <div className="grid grid-cols-2 gap-3 text-xs">
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={handleGoogleLogin}
-                    className="py-2.5 px-4 border border-slate-300 hover:bg-slate-50 rounded-xl font-bold text-slate-800 flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <span>Continuer avec Google</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={loading}
-                    onClick={handleFacebookLogin}
-                    className="py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-bold flex items-center justify-center gap-2 transition-colors"
-                  >
-                    <span>Continuer avec Facebook</span>
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={handleGoogleLogin}
+                  className="w-full py-2.5 px-4 border border-slate-300 hover:bg-slate-50 rounded-xl font-bold text-slate-800 flex items-center justify-center gap-2 transition-colors text-xs"
+                >
+                  <span>Continuer avec Google</span>
+                </button>
               </div>
             </div>
           </div>
@@ -544,10 +521,16 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                 {authUser.name.charAt(0).toUpperCase()}
               </div>
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <h1 className="font-display text-2xl font-bold">{authUser.name}</h1>
-                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    {authUser.authProvider}
+                  <span
+                    className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase border ${
+                      authUser.role === 'ADMIN'
+                        ? 'bg-orange-500/20 text-orange-300 border-orange-500/40'
+                        : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                    }`}
+                  >
+                    Rôle : {authUser.role || 'USER'}
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">
@@ -563,6 +546,16 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
                   ${authUser.walletBalance.toFixed(2)} {authUser.preferredCurrency || 'USD'}
                 </span>
               </div>
+
+              {authUser.role === 'ADMIN' && (
+                <button
+                  onClick={() => onNavigate('admin')}
+                  className="px-4 py-3 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition-colors shadow-sm"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>Panneau Admin</span>
+                </button>
+              )}
 
               <button
                 onClick={onOpenMobileApp}

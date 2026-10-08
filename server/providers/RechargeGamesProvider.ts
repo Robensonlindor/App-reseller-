@@ -1267,10 +1267,18 @@ export class RechargeGamesProvider {
                 amount,
                 unit,
                 provider_price: providerPrice,
-                currency: 'USD',
+                provider_price_usd: providerPrice,
+                provider_cost_htg: marginCalc.providerCostHtg,
+                currency: 'HTG',
+                reference_currency: 'USD',
+                selling_currency: 'HTG',
+                exchange_rate: marginCalc.exchangeRate,
                 playup_price: marginCalc.playupPrice,
+                playup_price_htg: marginCalc.playupPriceHtg,
+                manual_price_htg: marginCalc.isManualHtg ? marginCalc.playupPriceHtg : undefined,
                 margin_percent: marginCalc.marginPercent,
                 profit_estimate: marginCalc.profit,
+                profit_htg: marginCalc.profitHtg,
                 active,
                 requires_player_id: requiresPlayerId,
                 last_synced_at: nowIso,
@@ -1548,27 +1556,41 @@ export class RechargeGamesProvider {
       let srv = services.find(s => s.gameId === game.id);
       if (!srv) continue;
 
-      const rgPackages = matchingProds.map((p, idx) => ({
-        id: `pkg_rg_${p.product_key}`,
-        serviceId: srv!.id,
-        externalProductId: p.product_key,
-        productKey: p.product_key,
-        region: p.region,
-        providerSlug: 'rechargegames',
-        externalGameId: p.game_slug || game.slug,
-        name: `${p.name}`,
-        amount: p.amount || 1,
-        unit: p.unit || 'Diamonds',
-        supplierCost: p.provider_price,
-        margin: p.profit_estimate,
-        publicPrice: p.playup_price,
-        resellerPrice: Number((p.provider_price + p.profit_estimate * 0.5).toFixed(2)),
-        currency: p.currency,
-        isActive: p.active,
-        requiresPlayerId: p.requires_player_id !== false,
-        requiredFields: p.requires_player_id === false ? [] : game.fields.map(f => f.name),
-        displayOrder: idx + 1
-      }));
+      const rate = db.getUsdToHtgExchangeRate();
+      const rgPackages = matchingProds.map((p, idx) => {
+        const calc = db.computePlayUpMarginAndPrice(p.provider_price, p.game, p.region, p.product_key);
+        return {
+          id: `pkg_rg_${p.product_key}`,
+          serviceId: srv!.id,
+          externalProductId: p.product_key,
+          productKey: p.product_key,
+          region: p.region,
+          providerSlug: 'rechargegames',
+          externalGameId: p.game_slug || game.slug,
+          name: `${p.name}`,
+          amount: p.amount || 1,
+          unit: p.unit || 'Diamonds',
+          supplierCost: p.provider_price,
+          supplierCostUsd: p.provider_price,
+          supplierCostHtg: calc.providerCostHtg,
+          margin: calc.profit,
+          marginHtg: calc.marginPercent,
+          profitHtg: calc.profitHtg,
+          publicPrice: calc.playupPrice,
+          publicPriceHtg: calc.playupPriceHtg,
+          resellerPrice: Number((p.provider_price + calc.profit * 0.5).toFixed(2)),
+          resellerPriceHtg: Number((calc.providerCostHtg + calc.profitHtg * 0.5).toFixed(2)),
+          manualPriceHtgDefined: calc.isManualHtg,
+          referenceCurrency: 'USD' as const,
+          sellingCurrency: 'HTG' as const,
+          exchangeRateApplied: rate,
+          currency: 'HTG',
+          isActive: p.active,
+          requiresPlayerId: p.requires_player_id !== false,
+          requiredFields: p.requires_player_id === false ? [] : game.fields.map(f => f.name),
+          displayOrder: idx + 1
+        };
+      });
 
       srv.packages = rgPackages;
       srv.updatedAt = new Date().toISOString();
@@ -1724,18 +1746,22 @@ export class RechargeGamesProvider {
     );
     const unitPrice = serverPriceCalc.playupPrice;
     const subtotalPrice = Number((unitPrice * quantity).toFixed(2));
+    const unitPriceHtg = serverPriceCalc.playupPriceHtg;
+    const subtotalPriceHtg = Number((unitPriceHtg * quantity).toFixed(2));
     const providerCost = Number((product.provider_price * quantity).toFixed(2));
     const margin = Number((subtotalPrice - providerCost).toFixed(2));
 
     if (
       params.clientManipulatedPrice !== undefined &&
-      Math.abs(Number(params.clientManipulatedPrice) - subtotalPrice) > 0.01 &&
-      Math.abs(Number(params.clientManipulatedPrice) - unitPrice) > 0.01
+      Math.abs(Number(params.clientManipulatedPrice) - subtotalPrice) > 0.05 &&
+      Math.abs(Number(params.clientManipulatedPrice) - unitPrice) > 0.05 &&
+      Math.abs(Number(params.clientManipulatedPrice) - subtotalPriceHtg) > 1 &&
+      Math.abs(Number(params.clientManipulatedPrice) - unitPriceHtg) > 1
     ) {
       db.addSystemLog(
         'error',
         'payment',
-        `[Security Alert] Tentative de manipulation de prix bloquée avant paiement (user=${params.userId}, clientPrice=${params.clientManipulatedPrice}, serverPrice=${subtotalPrice})`
+        `[Security Alert] Tentative de manipulation de prix bloquée avant paiement (user=${params.userId}, clientPrice=${params.clientManipulatedPrice}, serverPriceHtg=${subtotalPriceHtg} HTG, serverPriceUsd=${subtotalPrice} USD)`
       );
       return {
         valid: false,

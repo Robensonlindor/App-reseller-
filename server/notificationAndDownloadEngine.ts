@@ -10,6 +10,11 @@ import {
   Order,
   PushNotificationLog
 } from '../src/types';
+import {
+  ApkVerificationReport,
+  buildSignedReleaseApk,
+  verifyApkBinaryStructure
+} from './androidApkBuilder';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,202 +49,62 @@ export function formatFrenchDateTime(isoTimestamp?: string): { dateLabel: string
   };
 }
 
-/**
- * Minimal standard ZIP builder (store method = 0) so the generated APK is a genuine,
- * valid ZIP/APK archive containing AndroidManifest.xml, classes.dex, resources.arsc,
- * and META-INF/MANIFEST.MF with zero embedded secrets.
- */
-function createZipArchive(entries: Array<{ name: string; content: Buffer }>): Buffer {
-  const localHeaders: Buffer[] = [];
-  const centralHeaders: Buffer[] = [];
-  let offset = 0;
-
-  // Precompute CRC32 table
-  const crcTable = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    crcTable[n] = c >>> 0;
-  }
-
-  const crc32 = (buf: Buffer): number => {
-    let crc = 0xffffffff;
-    for (let i = 0; i < buf.length; i++) {
-      crc = crcTable[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
-    }
-    return (crc ^ 0xffffffff) >>> 0;
-  };
-
-  for (const entry of entries) {
-    const nameBuf = Buffer.from(entry.name, 'utf8');
-    const dataBuf = entry.content;
-    const crc = crc32(dataBuf);
-
-    // Local file header (30 bytes + name)
-    const localHeader = Buffer.alloc(30 + nameBuf.length);
-    localHeader.writeUInt32LE(0x04034b50, 0); // Signature
-    localHeader.writeUInt16LE(20, 4);         // Version needed
-    localHeader.writeUInt16LE(0, 6);          // Flags
-    localHeader.writeUInt16LE(0, 8);          // Compression: 0 (Stored)
-    localHeader.writeUInt16LE(0, 10);         // Mod time
-    localHeader.writeUInt16LE(0, 12);         // Mod date
-    localHeader.writeUInt32LE(crc, 14);       // CRC32
-    localHeader.writeUInt32LE(dataBuf.length, 18); // Compressed size
-    localHeader.writeUInt32LE(dataBuf.length, 22); // Uncompressed size
-    localHeader.writeUInt16LE(nameBuf.length, 26); // File name length
-    localHeader.writeUInt16LE(0, 28);         // Extra field length
-    nameBuf.copy(localHeader, 30);
-
-    localHeaders.push(localHeader, dataBuf);
-
-    // Central directory header (46 bytes + name)
-    const centralHeader = Buffer.alloc(46 + nameBuf.length);
-    centralHeader.writeUInt32LE(0x02014b50, 0); // Signature
-    centralHeader.writeUInt16LE(20, 4);         // Version made by
-    centralHeader.writeUInt16LE(20, 6);         // Version needed
-    centralHeader.writeUInt16LE(0, 8);          // Flags
-    centralHeader.writeUInt16LE(0, 10);         // Compression
-    centralHeader.writeUInt16LE(0, 12);         // Mod time
-    centralHeader.writeUInt16LE(0, 14);         // Mod date
-    centralHeader.writeUInt32LE(crc, 16);       // CRC32
-    centralHeader.writeUInt32LE(dataBuf.length, 20); // Compressed size
-    centralHeader.writeUInt32LE(dataBuf.length, 24); // Uncompressed size
-    centralHeader.writeUInt16LE(nameBuf.length, 28); // File name length
-    centralHeader.writeUInt16LE(0, 30);         // Extra length
-    centralHeader.writeUInt16LE(0, 32);         // Comment length
-    centralHeader.writeUInt16LE(0, 34);         // Disk number
-    centralHeader.writeUInt16LE(0, 36);         // Internal attrs
-    centralHeader.writeUInt32LE(0, 38);         // External attrs
-    centralHeader.writeUInt32LE(offset, 42);    // Local header offset
-    nameBuf.copy(centralHeader, 46);
-
-    centralHeaders.push(centralHeader);
-    offset += localHeader.length + dataBuf.length;
-  }
-
-  const centralDirBuf = Buffer.concat(centralHeaders);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);                 // EOCD signature
-  eocd.writeUInt16LE(0, 4);                          // Disk number
-  eocd.writeUInt16LE(0, 6);                          // Start disk
-  eocd.writeUInt16LE(entries.length, 8);             // Entries on disk
-  eocd.writeUInt16LE(entries.length, 10);            // Total entries
-  eocd.writeUInt32LE(centralDirBuf.length, 12);      // Central dir size
-  eocd.writeUInt32LE(offset, 16);                    // Central dir offset
-  eocd.writeUInt16LE(0, 20);                         // Comment length
-
-  return Buffer.concat([...localHeaders, centralDirBuf, eocd]);
-}
-
 export class PackageDistributionEngine {
-  public static readonly LATEST_VERSION = '2.4.1';
-  public static readonly BUILD_NUMBER = 20261006;
-  public static readonly ANDROID_FILENAME = `PlayUp-Android-v2.4.1.apk`;
-  public static readonly IOS_FILENAME = `PlayUp-iOS-v2.4.1.mobileconfig`;
+  public static readonly APPLICATION_ID = 'io.playup.mobile';
+  public static readonly LATEST_VERSION = '2.4.4';
+  public static readonly BUILD_NUMBER = 20404;
+  public static readonly MIN_SDK_VERSION = 26;
+  public static readonly TARGET_SDK_VERSION = 34;
+  public static readonly COMPILE_SDK_VERSION = 34;
+  public static readonly ANDROID_FILENAME = `PlayUp-Android-v2.4.4-release.apk`;
+  public static readonly IOS_FILENAME = `PlayUp-iOS-v2.4.4.mobileconfig`;
 
   public static ensurePackagesOnDisk(): void {
     if (!fs.existsSync(PACKAGES_DIR)) {
       fs.mkdirSync(PACKAGES_DIR, { recursive: true });
     }
 
+    const appUrl = (
+      process.env.APP_URL ||
+      'https://ais-pre-x2ludovvteawsky54uj7vr-266949098099.europe-west2.run.app'
+    ).replace(/\/+$/, '');
+
     const apkPath = path.join(PACKAGES_DIR, this.ANDROID_FILENAME);
-    if (!fs.existsSync(apkPath) || fs.statSync(apkPath).size < 64000) {
-      // Build real APK structure with NO secrets inside (only public configuration)
-      const manifestXml = Buffer.from(
-        `<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.playup.mobile"
-    android:versionCode="${this.BUILD_NUMBER}"
-    android:versionName="${this.LATEST_VERSION}">
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <application
-        android:label="PlayUp Gaming"
-        android:usesCleartextTraffic="false"
-        android:networkSecurityConfig="@xml/network_security_config">
-        <activity android:name=".MainActivity" android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-        <service android:name=".push.PlayUpPushMessagingService" android:exported="false" />
-    </application>
-</manifest>`,
-        'utf8'
-      );
-
-      const networkSecXml = Buffer.from(
-        `<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-    <base-config cleartextTrafficPermitted="false">
-        <trust-anchors>
-            <certificates src="system" />
-        </trust-anchors>
-    </base-config>
-</network-security-config>`,
-        'utf8'
-      );
-
-      const publicClientConfig = Buffer.from(
-        JSON.stringify(
-          {
-            appName: 'PlayUp',
-            packageName: 'io.playup.mobile',
-            version: this.LATEST_VERSION,
-            buildNumber: this.BUILD_NUMBER,
-            securityPolicy: {
-              noEmbeddedSecrets: true,
-              backendOnlyGateway: true,
-              sessionRotationEnabled: true,
-              pushNotificationsEnabled: true
-            }
-          },
-          null,
-          2
-        ),
-        'utf8'
-      );
-
-      // Deterministic DEX bytecode header & asset table (~180 KB binary payload so progress bar streams real chunks)
-      const dexHeader = Buffer.alloc(163840);
-      dexHeader.write('dex\n035\0', 0, 'utf8');
-      for (let i = 8; i < dexHeader.length; i++) {
-        dexHeader[i] = (i * 31 + 17) & 0xff;
+    let needsRebuild = !fs.existsSync(apkPath);
+    if (!needsRebuild) {
+      try {
+        const report = verifyApkBinaryStructure(apkPath, PACKAGES_DIR);
+        if (!report.valid) {
+          needsRebuild = true;
+        }
+      } catch {
+        needsRebuild = true;
       }
+    }
 
-      const resourcesArsc = Buffer.alloc(65536);
-      resourcesArsc.writeUInt16LE(0x0002, 0);
-      resourcesArsc.writeUInt16LE(0x000c, 2);
-      resourcesArsc.writeUInt32LE(resourcesArsc.length, 4);
+    if (needsRebuild) {
+      const signedApkBuffer = buildSignedReleaseApk({
+        packagesDir: PACKAGES_DIR,
+        packageName: this.APPLICATION_ID,
+        versionCode: this.BUILD_NUMBER,
+        versionName: this.LATEST_VERSION,
+        minSdkVersion: this.MIN_SDK_VERSION,
+        targetSdkVersion: this.TARGET_SDK_VERSION,
+        compileSdkVersion: this.COMPILE_SDK_VERSION,
+        appUrl: `${appUrl}/?mode=mobile_app`
+      });
 
-      const metaManifest = Buffer.from(
-        [
-          'Manifest-Version: 1.0',
-          `Created-By: PlayUp Release Builder ${this.LATEST_VERSION}`,
-          `SHA-256-Digest-Manifest: ${crypto.createHash('sha256').update(manifestXml).digest('base64')}`,
-          ''
-        ].join('\r\n'),
-        'utf8'
-      );
+      fs.writeFileSync(apkPath, signedApkBuffer);
 
-      const apkBuffer = createZipArchive([
-        { name: 'META-INF/MANIFEST.MF', content: metaManifest },
-        { name: 'AndroidManifest.xml', content: manifestXml },
-        { name: 'res/xml/network_security_config.xml', content: networkSecXml },
-        { name: 'assets/playup_public_config.json', content: publicClientConfig },
-        { name: 'classes.dex', content: dexHeader },
-        { name: 'resources.arsc', content: resourcesArsc }
-      ]);
-
-      fs.writeFileSync(apkPath, apkBuffer);
+      // Verify the generated APK binary structure before serving
+      const verification = verifyApkBinaryStructure(apkPath, PACKAGES_DIR);
+      if (!verification.valid) {
+        throw new Error('La vérification post-compilation de l’APK Release a échoué.');
+      }
     }
 
     const iosPath = path.join(PACKAGES_DIR, this.IOS_FILENAME);
     if (!fs.existsSync(iosPath) || fs.statSync(iosPath).size < 500) {
-      const appUrl = (process.env.APP_URL || 'https://ais-pre-eb452b7f-ba42-4636-8a26-b5c9f374598c-3000.run.app').replace(/\/+$/, '');
       const mobileConfigXml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -258,7 +123,7 @@ export class PackageDistributionEngine {
       <key>PayloadDisplayName</key>
       <string>PlayUp WebApp iOS v${this.LATEST_VERSION}</string>
       <key>PayloadIdentifier</key>
-      <string>io.playup.ios.webclip.${this.BUILD_NUMBER}</string>
+      <string>${this.APPLICATION_ID}.ios.webclip.${this.BUILD_NUMBER}</string>
       <key>PayloadType</key>
       <string>com.apple.webClip.managed</string>
       <key>PayloadUUID</key>
@@ -276,7 +141,7 @@ export class PackageDistributionEngine {
   <key>PayloadDisplayName</key>
   <string>PlayUp Gaming (${this.LATEST_VERSION})</string>
   <key>PayloadIdentifier</key>
-  <string>io.playup.ios.profile.${this.BUILD_NUMBER}</string>
+  <string>${this.APPLICATION_ID}.ios.profile.${this.BUILD_NUMBER}</string>
   <key>PayloadOrganization</key>
   <string>PlayUp Technologies Inc.</string>
   <key>PayloadRemovalDisallowed</key>
@@ -293,6 +158,12 @@ export class PackageDistributionEngine {
     }
   }
 
+  public static verifyAndroidApk(): ApkVerificationReport {
+    this.ensurePackagesOnDisk();
+    const apkPath = path.join(PACKAGES_DIR, this.ANDROID_FILENAME);
+    return verifyApkBinaryStructure(apkPath, PACKAGES_DIR);
+  }
+
   public static getPackageMetadata(platform: 'android' | 'ios'): AppPackageMetadata {
     this.ensurePackagesOnDisk();
     const fileName = platform === 'android' ? this.ANDROID_FILENAME : this.IOS_FILENAME;
@@ -301,6 +172,7 @@ export class PackageDistributionEngine {
     let sizeBytes = 0;
     let sha256 = '';
     let publishedAt = new Date().toISOString();
+    let apkReport: ApkVerificationReport | null = null;
 
     if (exists) {
       const stat = fs.statSync(filePath);
@@ -308,6 +180,13 @@ export class PackageDistributionEngine {
       publishedAt = stat.mtime.toISOString();
       const buf = fs.readFileSync(filePath);
       sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+      if (platform === 'android') {
+        try {
+          apkReport = verifyApkBinaryStructure(filePath, PACKAGES_DIR);
+        } catch {
+          apkReport = null;
+        }
+      }
     }
 
     const sizeFormatted =
@@ -318,8 +197,20 @@ export class PackageDistributionEngine {
     return {
       platform,
       fileName,
+      applicationId: this.APPLICATION_ID,
       version: this.LATEST_VERSION,
       buildNumber: this.BUILD_NUMBER,
+      minSdkVersion: platform === 'android' ? this.MIN_SDK_VERSION : undefined,
+      targetSdkVersion: platform === 'android' ? this.TARGET_SDK_VERSION : undefined,
+      compileSdkVersion: platform === 'android' ? this.COMPILE_SDK_VERSION : undefined,
+      supportedAbis:
+        platform === 'android' ? ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'] : undefined,
+      signatureSchemes:
+        platform === 'android'
+          ? ['v1 (JAR PKCS#7 RSA-2048)', 'v2 (APK Sig Block 42)']
+          : undefined,
+      certificateSha256Fingerprint: apkReport?.certificateSha256Fingerprint,
+      verificationPassed: platform === 'android' ? Boolean(apkReport?.valid) : true,
       sizeBytes,
       sizeFormatted,
       sha256,
@@ -342,6 +233,7 @@ export class PackageDistributionEngine {
 
 // Connected Server-Sent Events (SSE) clients for instant push delivery to active/background tabs & service workers
 const activeSseClients = new Map<string, Set<Response>>();
+const activePricingSseClients = new Set<Response>();
 
 export class NotificationEngine {
   public static registerSseClient(userId: string, res: Response): void {
@@ -357,6 +249,47 @@ export class NotificationEngine {
       set.delete(res);
       if (set.size === 0) {
         activeSseClients.delete(userId);
+      }
+    }
+  }
+
+  public static registerPricingSseClient(res: Response): void {
+    activePricingSseClients.add(res);
+  }
+
+  public static unregisterPricingSseClient(res: Response): void {
+    activePricingSseClients.delete(res);
+  }
+
+  /**
+   * Broadcasts real-time USD->HTG exchange rate and HTG selling price updates to all connected clients
+   */
+  public static broadcastPricingUpdate(payload: {
+    changeType: string;
+    usdToHtgExchangeRate: number;
+    historyEntry?: any;
+  }): void {
+    const dataStr = JSON.stringify({
+      type: 'PRICING_UPDATED',
+      timestamp: new Date().toISOString(),
+      ...payload
+    });
+
+    for (const res of activePricingSseClients) {
+      try {
+        res.write(`data: ${dataStr}\n\n`);
+      } catch {
+        activePricingSseClients.delete(res);
+      }
+    }
+
+    for (const [, set] of activeSseClients) {
+      for (const res of set) {
+        try {
+          res.write(`data: ${dataStr}\n\n`);
+        } catch {
+          set.delete(res);
+        }
       }
     }
   }

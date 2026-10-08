@@ -24,6 +24,7 @@ import {
   ConnectionTestResult,
   ManualPaymentValidationRecord,
   OrderRetryAttemptRecord,
+  PriceChangeHistoryEntry,
   ProviderApiLog,
   RechargeGamesConfigState,
   RechargeGamesMode,
@@ -90,7 +91,12 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
   const [gameFilter, setGameFilter] = useState<string>('all');
   const [catalogSearch, setCatalogSearch] = useState<string>('');
 
-  // Margins state
+  // Margins & USD -> HTG Reference Currency state
+  const [usdToHtgRateInput, setUsdToHtgRateInput] = useState<string>('132');
+  const [savingExchangeRate, setSavingExchangeRate] = useState<boolean>(false);
+  const [inlineProductPricesHtg, setInlineProductPricesHtg] = useState<Record<string, string>>({});
+  const [savingProductKeyHtg, setSavingProductKeyHtg] = useState<string | null>(null);
+  const [priceHistory, setPriceHistory] = useState<PriceChangeHistoryEntry[]>([]);
   const [globalMargin, setGlobalMargin] = useState<number>(20);
   const [gameMargins, setGameMargins] = useState<Record<string, number>>({});
   const [regionMargins, setRegionMargins] = useState<Record<string, number>>({});
@@ -128,7 +134,10 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
 
   const loadDashboard = useCallback(async () => {
     try {
-      const data = await apiClient.getRechargeGamesAdminDashboard(token);
+      const [data, historyRes] = await Promise.all([
+        apiClient.getRechargeGamesAdminDashboard(token),
+        apiClient.getPricingHistory(token, { limit: 100 }).catch(() => null)
+      ]);
       setConfig(data.config);
       setMetrics(data.metrics);
       setProducts(data.products || []);
@@ -139,6 +148,10 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
       setWebhookEvents(data.webhookEvents || []);
       setApiLogs(data.apiLogs || []);
 
+      if (historyRes) {
+        setPriceHistory(historyRes.history || []);
+      }
+
       if (Array.isArray((data as any).firestoreIdempotencyLocks)) {
         for (const lock of (data as any).firestoreIdempotencyLocks.slice(0, 15)) {
           syncWebhookEventIdempotencyToFirestore(lock).catch(() => {});
@@ -148,6 +161,23 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
       setModeInput(data.config.mode);
       setBaseUrlInput(data.config.baseUrl);
       setAutoSyncEnabled(data.config.syncStats.autoSyncEnabled);
+
+      const activeRate =
+        historyRes?.usdToHtgExchangeRate ||
+        data.config.margins?.usdToHtgExchangeRate ||
+        data.config.margins?.usdToHtgRate ||
+        132;
+      setUsdToHtgRateInput(String(activeRate));
+
+      const nextInlinePrices: Record<string, string> = {};
+      for (const p of data.products || []) {
+        const htgVal =
+          typeof p.playup_price_htg === 'number' && p.playup_price_htg > 0
+            ? p.playup_price_htg
+            : Number((Number(p.playup_price || 0) * activeRate).toFixed(2));
+        nextInlinePrices[p.product_key] = String(htgVal);
+      }
+      setInlineProductPricesHtg(nextInlinePrices);
 
       if (data.config.margins) {
         setGlobalMargin(data.config.margins.globalMarginPercent ?? 20);
@@ -222,6 +252,68 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
     }
   };
 
+  const handleUpdateExchangeRate = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const numRate = Number(usdToHtgRateInput);
+    if (!Number.isFinite(numRate) || numRate <= 0) {
+      setStatusBanner({
+        type: 'error',
+        text: 'Veuillez saisir un taux de change USD → HTG valide (supérieur à 0).'
+      });
+      return;
+    }
+    setSavingExchangeRate(true);
+    setStatusBanner(null);
+    try {
+      const res = await apiClient.updateUsdToHtgExchangeRate(token, {
+        usdToHtgExchangeRate: numRate,
+        reason: `Modification du taux de change USD → HTG depuis le panneau RechargeGames (1 USD = ${numRate} HTG)`
+      });
+      setStatusBanner({ type: 'success', text: res.message });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
+      await loadDashboard();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Erreur lors de la mise à jour du taux de change USD → HTG'
+      });
+    } finally {
+      setSavingExchangeRate(false);
+    }
+  };
+
+  const handleSaveManualProductPriceHtg = async (prod: RechargeGamesProduct) => {
+    const rawVal = inlineProductPricesHtg[prod.product_key];
+    const numPriceHtg = Number(rawVal);
+    if (!Number.isFinite(numPriceHtg) || numPriceHtg <= 0) {
+      setStatusBanner({
+        type: 'error',
+        text: 'Veuillez saisir un prix de vente final en HTG valide (supérieur à 0).'
+      });
+      return;
+    }
+    setSavingProductKeyHtg(prod.product_key);
+    setStatusBanner(null);
+    try {
+      const res = await apiClient.updateManualServicePriceHtg(token, {
+        productKey: prod.product_key,
+        sellingPriceHtg: numPriceHtg
+      });
+      setStatusBanner({ type: 'success', text: res.message });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
+      await loadDashboard();
+      if (onRefreshParent) onRefreshParent();
+    } catch (err: any) {
+      setStatusBanner({
+        type: 'error',
+        text: err.message || 'Erreur lors de la sauvegarde du prix de vente final en HTG'
+      });
+    } finally {
+      setSavingProductKeyHtg(null);
+    }
+  };
+
   const handleSaveMargins = async (e: React.FormEvent) => {
     e.preventDefault();
     setSavingMargins(true);
@@ -229,11 +321,13 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
     try {
       const res = await apiClient.updateRechargeGamesMargins(token, {
         globalMarginPercent: Number(globalMargin),
+        usdToHtgExchangeRate: Number(usdToHtgRateInput) > 0 ? Number(usdToHtgRateInput) : 132,
         gameMargins,
         regionMargins,
         productMargins
-      });
+      } as any);
       setStatusBanner({ type: 'success', text: res.message });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
       await loadDashboard();
       if (onRefreshParent) onRefreshParent();
     } catch (err: any) {
@@ -934,226 +1028,422 @@ export const RechargeGamesAdminPanel: React.FC<RechargeGamesAdminPanelProps> = (
               <thead>
                 <tr className="border-b border-slate-800 text-slate-400">
                   <th className="py-3 px-3">product_key</th>
-                  <th className="py-3 px-3">Jeu</th>
-                  <th className="py-3 px-3">Région</th>
+                  <th className="py-3 px-3">Jeu &amp; Région</th>
                   <th className="py-3 px-3">Nom du produit</th>
-                  <th className="py-3 px-3">Valeur Top-Up</th>
-                  <th className="py-3 px-3">Prix Fournisseur</th>
-                  <th className="py-3 px-3">Marge PlayUp</th>
-                  <th className="py-3 px-3">Prix Client PlayUp</th>
+                  <th className="py-3 px-3">Prix Fournisseur (USD — Fixe)</th>
+                  <th className="py-3 px-3">Coût Fournisseur Auto (HTG)</th>
+                  <th className="py-3 px-3">Prix Vente Final PlayUp (HTG — Manuel)</th>
+                  <th className="py-3 px-3">Bénéfice &amp; Marge (HTG)</th>
                   <th className="py-3 px-3">Disponibilité</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {filteredProducts.map(prod => (
-                  <tr key={prod.product_key} className="hover:bg-slate-800/30">
-                    <td className="py-3 px-3 font-mono font-bold text-orange-300">
-                      {prod.product_key}
-                    </td>
-                    <td className="py-3 px-3 font-semibold text-white">{prod.game}</td>
-                    <td className="py-3 px-3">
-                      <span className="px-2.5 py-1 rounded-md bg-slate-800 text-white font-bold text-[11px]">
-                        {getRegionBadge(prod.region)}
-                      </span>
-                    </td>
-                    <td className="py-3 px-3 text-slate-200">{prod.name}</td>
-                    <td className="py-3 px-3 text-slate-300 font-mono">{prod.topup_value}</td>
-                    <td className="py-3 px-3 font-mono text-slate-300">
-                      ${prod.provider_price.toFixed(2)} {prod.currency}
-                    </td>
-                    <td className="py-3 px-3 font-mono text-emerald-400">
-                      +{prod.margin_percent}% (+${prod.profit_estimate.toFixed(2)})
-                    </td>
-                    <td className="py-3 px-3 font-mono font-black text-white">
-                      ${prod.playup_price.toFixed(2)} {prod.currency}
-                    </td>
-                    <td className="py-3 px-3">
-                      {prod.active ? (
-                        <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[11px]">
-                          Actif
+                {filteredProducts.map(prod => {
+                  const activeRate = Number(usdToHtgRateInput) > 0 ? Number(usdToHtgRateInput) : (prod.exchange_rate_usd_htg || 132);
+                  const supplierUsd = Number((prod.provider_price_usd ?? prod.provider_price ?? 0).toFixed(2));
+                  const autoSupplierCostHtg = Number((supplierUsd * activeRate).toFixed(2));
+                  const currentInputStr =
+                    inlineProductPricesHtg[prod.product_key] !== undefined
+                      ? inlineProductPricesHtg[prod.product_key]
+                      : String(
+                          typeof prod.playup_price_htg === 'number' && prod.playup_price_htg > 0
+                            ? prod.playup_price_htg
+                            : Number((Number(prod.playup_price || 0) * activeRate).toFixed(2))
+                        );
+                  const effectiveSellingHtg = Number(currentInputStr) > 0 ? Number(currentInputStr) : 0;
+                  const autoProfitHtg = Number((effectiveSellingHtg - autoSupplierCostHtg).toFixed(2));
+                  const autoMarginPct =
+                    autoSupplierCostHtg > 0
+                      ? Number(((autoProfitHtg / autoSupplierCostHtg) * 100).toFixed(2))
+                      : 0;
+
+                  return (
+                    <tr key={prod.product_key} className="hover:bg-slate-800/30">
+                      <td className="py-3 px-3 font-mono font-bold text-orange-300">
+                        {prod.product_key}
+                      </td>
+                      <td className="py-3 px-3">
+                        <div className="font-semibold text-white">{prod.game}</div>
+                        <span className="inline-block mt-0.5 px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-bold text-[10px]">
+                          {getRegionBadge(prod.region)}
                         </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold text-[11px]">
-                          Indisponible
+                      </td>
+                      <td className="py-3 px-3 text-slate-200">
+                        <div>{prod.name}</div>
+                        <div className="text-[10px] text-slate-400 font-mono">{prod.topup_value}</div>
+                      </td>
+                      <td className="py-3 px-3 font-mono text-slate-200">
+                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-950 border border-slate-800 font-bold" title="Prix fournisseur RechargeGames en USD — Ne jamais modifier">
+                          <Lock className="w-3 h-3 text-slate-500" />
+                          ${supplierUsd.toFixed(2)} USD
                         </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="py-3 px-3 font-mono text-slate-300">
+                        <div className="font-bold text-white">{autoSupplierCostHtg.toFixed(2)} HTG</div>
+                        <div className="text-[10px] text-slate-500">
+                          (${supplierUsd.toFixed(2)} × {activeRate})
+                        </div>
+                      </td>
+                      <td className="py-3 px-3 font-mono">
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            step="1"
+                            min="1"
+                            value={currentInputStr}
+                            onChange={e =>
+                              setInlineProductPricesHtg(prev => ({
+                                ...prev,
+                                [prod.product_key]: e.target.value
+                              }))
+                            }
+                            className="w-24 px-2 py-1 rounded-lg bg-slate-950 border border-orange-500/50 text-orange-300 font-mono font-bold text-xs"
+                          />
+                          <span className="text-[10px] font-bold text-slate-400">HTG</span>
+                          <button
+                            type="button"
+                            disabled={savingProductKeyHtg === prod.product_key}
+                            onClick={() => handleSaveManualProductPriceHtg(prod)}
+                            className="px-2.5 py-1 rounded-lg bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white font-sans font-bold text-[11px] cursor-pointer"
+                          >
+                            {savingProductKeyHtg === prod.product_key ? '...' : 'Sauver'}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-3 px-3 font-mono">
+                        <div className={`font-bold ${autoProfitHtg >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {autoProfitHtg >= 0 ? '+' : ''}{autoProfitHtg.toFixed(2)} HTG
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          Marge : {autoMarginPct >= 0 ? '+' : ''}{autoMarginPct.toFixed(1)}%
+                        </div>
+                      </td>
+                      <td className="py-3 px-3">
+                        {prod.active ? (
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[11px]">
+                            Actif
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold text-[11px]">
+                            Indisponible
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         </div>
       )}
 
-      {/* TAB 3: PRIX ET MARGE PLAYUP (Section 15) */}
+      {/* TAB 3: PRIX ET MARGE PLAYUP (Section 15 + Devise de référence USD -> HTG) */}
       {subTab === 'margins' && (
-        <form
-          onSubmit={handleSaveMargins}
-          className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 space-y-6"
-        >
-          <div>
-            <h3 className="text-base font-bold text-white flex items-center gap-2">
-              <Sliders className="w-4 h-4 text-orange-400" />
-              <span>Système de Marges PlayUp Côté Serveur</span>
-            </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Ordre de priorité : <strong>Marge par produit (product_key)</strong> → <strong>Marge par région</strong> → <strong>Marge par jeu</strong> → <strong>Marge globale</strong>. Le frontend ne peut jamais modifier le prix final.
-            </p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {/* Global Margin */}
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-              <div className="text-xs font-bold text-orange-400 uppercase">1. Marge Globale (%)</div>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Pourcentage appliqué par défaut
-                </label>
-                <input
-                  type="number"
-                  step="0.5"
-                  min="0"
-                  max="200"
-                  value={globalMargin}
-                  onChange={e => setGlobalMargin(Number(e.target.value))}
-                  className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-700 text-white font-mono text-sm"
-                />
+        <div className="space-y-6">
+          {/* Configurable USD -> HTG Exchange Rate Box */}
+          <div className="bg-slate-900/90 border border-orange-500/40 rounded-2xl p-6 space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="px-2.5 py-0.5 rounded-full bg-orange-500/20 text-orange-300 text-[10px] font-bold uppercase">
+                    Devise Fournisseur RechargeGames : USD (Immuable)
+                  </span>
+                  <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold uppercase">
+                    Devise de Vente PlayUp : HTG
+                  </span>
+                </div>
+                <h3 className="text-base font-bold text-white">
+                  Taux de Change USD → HTG &amp; Calcul Automatique des Coûts / Marges
+                </h3>
+                <p className="text-xs text-slate-400 max-w-3xl">
+                  Les prix fournisseurs RechargeGames restent strictement en <strong>USD</strong>. Le système calcule automatiquement le coût fournisseur en <strong>HTG</strong>, le bénéfice en <strong>HTG</strong> et la marge. Le client voit uniquement le prix final PlayUp en <strong>HTG</strong>.
+                </p>
               </div>
-              <div className="text-[11px] text-slate-400 bg-slate-900 p-2.5 rounded-lg font-mono">
-                Exemple : Prix fournisseur $1.00 + {globalMargin}% ={' '}
-                <span className="text-emerald-400 font-bold">
-                  ${(1 * (1 + globalMargin / 100)).toFixed(2)} USD
-                </span>
+
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 flex flex-wrap items-center gap-3">
+                <div>
+                  <label className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                    Taux USD → HTG
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono font-bold text-slate-300">1 USD =</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="1"
+                      value={usdToHtgRateInput}
+                      onChange={e => setUsdToHtgRateInput(e.target.value)}
+                      className="w-28 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-700 text-orange-400 font-mono font-bold text-sm"
+                    />
+                    <span className="text-xs font-mono font-bold text-emerald-400">HTG</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleUpdateExchangeRate()}
+                  disabled={savingExchangeRate}
+                  className="px-4 py-2.5 rounded-xl bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold cursor-pointer"
+                >
+                  {savingExchangeRate ? 'Application...' : 'Appliquer en Temps Réel'}
+                </button>
               </div>
             </div>
+          </div>
 
-            {/* Region Margins */}
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-              <div className="text-xs font-bold text-orange-400 uppercase">2. Marge par Région (%)</div>
-              {['Brazil', 'USA', 'Global'].map(reg => (
-                <div key={reg} className="flex items-center justify-between gap-2">
-                  <span className="text-xs text-slate-200 font-semibold">{getRegionBadge(reg)}</span>
+          <form
+            onSubmit={handleSaveMargins}
+            className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 space-y-6"
+          >
+            <div>
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-orange-400" />
+                <span>Système de Marges PlayUp Côté Serveur</span>
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Ordre de priorité : <strong>Prix de vente manuel en HTG</strong> → <strong>Marge par produit (product_key)</strong> → <strong>Marge par région</strong> → <strong>Marge par jeu</strong> → <strong>Marge globale</strong>.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* Global Margin */}
+              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="text-xs font-bold text-orange-400 uppercase">1. Marge Globale (%)</div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">
+                    Pourcentage appliqué par défaut
+                  </label>
                   <input
                     type="number"
                     step="0.5"
-                    value={regionMargins[reg] ?? globalMargin}
-                    onChange={e =>
-                      setRegionMargins(prev => ({
-                        ...prev,
-                        [reg]: Number(e.target.value)
-                      }))
-                    }
-                    className="w-24 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white font-mono text-xs text-right"
+                    min="0"
+                    max="200"
+                    value={globalMargin}
+                    onChange={e => setGlobalMargin(Number(e.target.value))}
+                    className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-700 text-white font-mono text-sm"
                   />
                 </div>
-              ))}
-            </div>
+                <div className="text-[11px] text-slate-400 bg-slate-900 p-2.5 rounded-lg font-mono">
+                  Exemple ($1.00 USD × {Number(usdToHtgRateInput) || 132} HTG) + {globalMargin}% ={' '}
+                  <span className="text-emerald-400 font-bold">
+                    {((Number(usdToHtgRateInput) || 132) * (1 + globalMargin / 100)).toFixed(2)} HTG
+                  </span>
+                </div>
+              </div>
 
-            {/* Game Margins */}
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-              <div className="text-xs font-bold text-orange-400 uppercase">3. Marge par Jeu (%)</div>
-              {['Free Fire', 'PUBG Mobile', 'Mobile Legends: Bang Bang', 'Call of Duty: Mobile', 'Roblox (Codes Digitaux / Vouchers)'].map(
-                gm => (
-                  <div key={gm} className="flex items-center justify-between gap-2">
-                    <span className="text-xs text-slate-200 truncate">{gm}</span>
+              {/* Region Margins */}
+              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="text-xs font-bold text-orange-400 uppercase">2. Marge par Région (%)</div>
+                {['Brazil', 'USA', 'Global'].map(reg => (
+                  <div key={reg} className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-slate-200 font-semibold">{getRegionBadge(reg)}</span>
                     <input
                       type="number"
                       step="0.5"
-                      value={gameMargins[gm] ?? globalMargin}
+                      value={regionMargins[reg] ?? globalMargin}
                       onChange={e =>
-                        setGameMargins(prev => ({
+                        setRegionMargins(prev => ({
                           ...prev,
-                          [gm]: Number(e.target.value)
+                          [reg]: Number(e.target.value)
                         }))
                       }
                       className="w-24 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white font-mono text-xs text-right"
                     />
                   </div>
-                )
+                ))}
+              </div>
+
+              {/* Game Margins */}
+              <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="text-xs font-bold text-orange-400 uppercase">3. Marge par Jeu (%)</div>
+                {['Free Fire', 'PUBG Mobile', 'Mobile Legends: Bang Bang', 'Call of Duty: Mobile', 'Roblox (Codes Digitaux / Vouchers)'].map(
+                  gm => (
+                    <div key={gm} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-slate-200 truncate">{gm}</span>
+                      <input
+                        type="number"
+                        step="0.5"
+                        value={gameMargins[gm] ?? globalMargin}
+                        onChange={e =>
+                          setGameMargins(prev => ({
+                            ...prev,
+                            [gm]: Number(e.target.value)
+                          }))
+                        }
+                        className="w-24 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white font-mono text-xs text-right"
+                      />
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+
+            {/* Per-Product Margin Override */}
+            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+              <div className="text-xs font-bold text-orange-400 uppercase">
+                4. Marge spécifique par Produit (product_key)
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <select
+                  value={customProductKey}
+                  onChange={e => setCustomProductKey(e.target.value)}
+                  className="px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white"
+                >
+                  <option value="">Sélectionner un product_key...</option>
+                  {products.map(p => (
+                    <option key={p.product_key} value={p.product_key}>
+                      {p.product_key} — {p.name} ({p.region})
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  step="0.5"
+                  value={customProductMargin}
+                  onChange={e => setCustomProductMargin(e.target.value)}
+                  placeholder="Marge %"
+                  className="w-28 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!customProductKey) return;
+                    setProductMargins(prev => ({
+                      ...prev,
+                      [customProductKey]: Number(customProductMargin)
+                    }));
+                    setCustomProductKey('');
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-white cursor-pointer"
+                >
+                  Ajouter règle produit
+                </button>
+              </div>
+
+              {Object.keys(productMargins).length > 0 && (
+                <div className="flex flex-wrap gap-2 pt-2">
+                  {Object.entries(productMargins).map(([pk, mVal]) => (
+                    <span
+                      key={pk}
+                      className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-mono text-orange-300 flex items-center gap-2"
+                    >
+                      <span>
+                        {pk}: +{mVal}%
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = { ...productMargins };
+                          delete next[pk];
+                          setProductMargins(next);
+                        }}
+                        className="text-rose-400 hover:text-rose-300"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
               )}
             </div>
-          </div>
 
-          {/* Per-Product Margin Override */}
-          <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-            <div className="text-xs font-bold text-orange-400 uppercase">
-              4. Marge spécifique par Produit (product_key)
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <select
-                value={customProductKey}
-                onChange={e => setCustomProductKey(e.target.value)}
-                className="px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white"
-              >
-                <option value="">Sélectionner un product_key...</option>
-                {products.map(p => (
-                  <option key={p.product_key} value={p.product_key}>
-                    {p.product_key} — {p.name} ({p.region})
-                  </option>
-                ))}
-              </select>
-              <input
-                type="number"
-                step="0.5"
-                value={customProductMargin}
-                onChange={e => setCustomProductMargin(e.target.value)}
-                placeholder="Marge %"
-                className="w-28 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white font-mono"
-              />
+            <div className="flex justify-end">
               <button
-                type="button"
-                onClick={() => {
-                  if (!customProductKey) return;
-                  setProductMargins(prev => ({
-                    ...prev,
-                    [customProductKey]: Number(customProductMargin)
-                  }));
-                  setCustomProductKey('');
-                }}
-                className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-white cursor-pointer"
+                type="submit"
+                disabled={savingMargins}
+                className="px-5 py-2.5 rounded-xl bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold cursor-pointer"
               >
-                Ajouter règle produit
+                {savingMargins ? 'Recalcul en cours...' : 'Enregistrer et recalculer les prix PlayUp en HTG'}
               </button>
             </div>
+          </form>
 
-            {Object.keys(productMargins).length > 0 && (
-              <div className="flex flex-wrap gap-2 pt-2">
-                {Object.entries(productMargins).map(([pk, mVal]) => (
-                  <span
-                    key={pk}
-                    className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-mono text-orange-300 flex items-center gap-2"
-                  >
-                    <span>
-                      {pk}: +{mVal}%
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const next = { ...productMargins };
-                        delete next[pk];
-                        setProductMargins(next);
-                      }}
-                      className="text-rose-400 hover:text-rose-300"
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
+          {/* Price & Exchange Rate History Table */}
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-sm font-bold text-white">
+                  Historique des Modifications (Taux USD → HTG &amp; Prix de Vente HTG)
+                </h4>
+                <p className="text-xs text-slate-400">
+                  Journal immuable de toutes les modifications du taux de change et des prix HTG appliquées en temps réel.
+                </p>
+              </div>
+              <span className="px-2.5 py-1 rounded-full bg-slate-800 text-orange-300 text-xs font-mono font-bold">
+                {priceHistory.length} entrée(s)
+              </span>
+            </div>
+
+            {priceHistory.length === 0 ? (
+              <div className="text-xs text-slate-500 py-4">
+                Aucune modification enregistrée pour le moment.
+              </div>
+            ) : (
+              <div className="overflow-x-auto max-h-72 overflow-y-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400">
+                      <th className="py-2 px-3">Horodatage</th>
+                      <th className="py-2 px-3">Type</th>
+                      <th className="py-2 px-3">Service / Produit</th>
+                      <th className="py-2 px-3">Taux USD → HTG</th>
+                      <th className="py-2 px-3">Fournisseur (USD)</th>
+                      <th className="py-2 px-3">Coût Auto (HTG)</th>
+                      <th className="py-2 px-3">Prix Vente (HTG)</th>
+                      <th className="py-2 px-3">Bénéfice &amp; Marge (HTG)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {priceHistory.map(entry => (
+                      <tr key={entry.id} className="hover:bg-slate-800/30">
+                        <td className="py-2 px-3 font-mono text-[11px] text-slate-400">
+                          {new Date(entry.timestamp).toLocaleString('fr-FR')}
+                        </td>
+                        <td className="py-2 px-3">
+                          <span className="px-2 py-0.5 rounded bg-slate-800 text-orange-300 text-[10px] font-bold uppercase">
+                            {entry.changeType === 'exchange_rate'
+                              ? 'Taux USD → HTG'
+                              : entry.changeType === 'manual_price_htg'
+                              ? 'Prix Manuel HTG'
+                              : 'Marge'}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3 text-white font-semibold">
+                          {entry.packageName || entry.reason}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-slate-300">
+                          {entry.previousExchangeRate && entry.previousExchangeRate !== entry.newExchangeRate
+                            ? `${entry.previousExchangeRate} → ${entry.newExchangeRate} HTG`
+                            : `1 USD = ${entry.newExchangeRate || usdToHtgRateInput} HTG`}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-slate-300">
+                          {typeof entry.supplierCostUsd === 'number'
+                            ? `$${entry.supplierCostUsd.toFixed(2)} USD`
+                            : '—'}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-slate-200">
+                          {typeof entry.newSupplierCostHtg === 'number'
+                            ? `${entry.newSupplierCostHtg.toFixed(2)} HTG`
+                            : '—'}
+                        </td>
+                        <td className="py-2 px-3 font-mono font-bold text-orange-400">
+                          {typeof entry.newSellingPriceHtg === 'number'
+                            ? `${entry.newSellingPriceHtg} HTG`
+                            : '—'}
+                        </td>
+                        <td className="py-2 px-3 font-mono font-bold text-emerald-400">
+                          {typeof entry.profitHtg === 'number'
+                            ? `+${entry.profitHtg.toFixed(2)} HTG (${entry.marginPercent?.toFixed(1) || 0}%)`
+                            : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
-
-          <div className="flex justify-end">
-            <button
-              type="submit"
-              disabled={savingMargins}
-              className="px-5 py-2.5 rounded-xl bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold cursor-pointer"
-            >
-              {savingMargins ? 'Recalcul en cours...' : 'Enregistrer et recalculer les prix PlayUp'}
-            </button>
-          </div>
-        </form>
+        </div>
       )}
 
       {/* TAB 4: COMMANDES, VALIDATION MANUELLE, RETRIES (MAX 3) & REMBOURSEMENTS STRICTS */}

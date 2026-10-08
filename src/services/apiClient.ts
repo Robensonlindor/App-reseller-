@@ -9,7 +9,8 @@ import {
   RechargeGamesWebhookEvent, RechargeGamesMarginConfig, RechargeGamesConfigState,
   RechargeGamesTestStepResult, AppPackageMetadata, PushNotificationLog,
   EmailDeliveryLog, PushSubscriptionRecord,
-  PaymentRequestRecord, PaymentAuditLogEntry, PaymentIdempotentOperationType
+  PaymentRequestRecord, PaymentAuditLogEntry, PaymentIdempotentOperationType,
+  PriceChangeHistoryEntry
 } from '../types';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from '../data/initialData';
 import { safeStorage } from '../lib/safeStorage';
@@ -1499,6 +1500,8 @@ export const apiClient = {
     message: string;
     margins: RechargeGamesMarginConfig;
     products: RechargeGamesProduct[];
+    services?: Service[];
+    history?: PriceChangeHistoryEntry[];
   }> {
     return fetchJson(
       '/api/admin/rechargegames/margins',
@@ -1511,6 +1514,106 @@ export const apiClient = {
         body: JSON.stringify(payload)
       },
       'Erreur sauvegarde marges RechargeGames'
+    );
+  },
+
+  async getPricingHistory(
+    token: string,
+    filters?: {
+      serviceId?: string;
+      packageId?: string;
+      productKey?: string;
+      changeType?: string;
+      limit?: number;
+    }
+  ): Promise<{
+    referenceCurrency: 'USD';
+    sellingCurrency: 'HTG';
+    usdToHtgExchangeRate: number;
+    history: PriceChangeHistoryEntry[];
+  }> {
+    const qs = new URLSearchParams();
+    if (filters?.serviceId) qs.set('serviceId', filters.serviceId);
+    if (filters?.packageId) qs.set('packageId', filters.packageId);
+    if (filters?.productKey) qs.set('productKey', filters.productKey);
+    if (filters?.changeType) qs.set('changeType', filters.changeType);
+    if (filters?.limit) qs.set('limit', String(filters.limit));
+    const url = `/api/admin/pricing/history${qs.toString() ? `?${qs.toString()}` : ''}`;
+    return fetchJson(
+      url,
+      {
+        headers: { Authorization: `Bearer ${token}` }
+      },
+      'Erreur chargement de l’historique des prix et du taux de change'
+    );
+  },
+
+  async updateUsdToHtgExchangeRate(
+    token: string,
+    payload: {
+      usdToHtgExchangeRate: number;
+      reason?: string;
+      recalculateAutoSellingPrices?: boolean;
+    }
+  ): Promise<{
+    success: boolean;
+    message: string;
+    previousExchangeRate: number;
+    newExchangeRate: number;
+    updatedServicesCount: number;
+    updatedPackagesCount: number;
+    updatedProductsCount: number;
+    historyEntry: PriceChangeHistoryEntry;
+    services: Service[];
+    products: RechargeGamesProduct[];
+    settings: AppSettings;
+    history: PriceChangeHistoryEntry[];
+  }> {
+    return fetchJson(
+      '/api/admin/pricing/exchange-rate',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de la mise à jour du taux de change USD → HTG'
+    );
+  },
+
+  async updateManualServicePriceHtg(
+    token: string,
+    payload: {
+      serviceId?: string;
+      packageId?: string;
+      productKey?: string;
+      sellingPriceHtg: number;
+      resellerPriceHtg?: number;
+      reason?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    message: string;
+    updatedPackage?: any;
+    updatedProduct?: RechargeGamesProduct;
+    historyEntry: PriceChangeHistoryEntry;
+    services: Service[];
+    products: RechargeGamesProduct[];
+    history: PriceChangeHistoryEntry[];
+  }> {
+    return fetchJson(
+      '/api/admin/pricing/service-price-htg',
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      },
+      'Erreur lors de la mise à jour manuelle du prix de vente en HTG'
     );
   },
 

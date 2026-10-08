@@ -242,25 +242,60 @@ export const INITIAL_PROVIDERS: Provider[] = [
   }
 ];
 
+const DEFAULT_USD_TO_HTG_RATE = 132;
+
+function withHtgPricing<T extends { supplierCost: number; publicPrice: number; resellerPrice: number }>(pkg: T): T & {
+  supplierCostUsd: number;
+  supplierCostHtg: number;
+  publicPriceHtg: number;
+  resellerPriceHtg: number;
+  profitHtg: number;
+  marginHtg: number;
+  marginPercent: number;
+  exchangeRateUsdHtg: number;
+  referenceCurrency: 'USD';
+  sellingCurrency: 'HTG';
+} {
+  const supplierCostUsd = Number(pkg.supplierCost || 0);
+  const supplierCostHtg = Number((supplierCostUsd * DEFAULT_USD_TO_HTG_RATE).toFixed(2));
+  const publicPriceHtg = Math.round(Number(pkg.publicPrice || 0) * DEFAULT_USD_TO_HTG_RATE);
+  const resellerPriceHtg = Math.round(Number(pkg.resellerPrice || 0) * DEFAULT_USD_TO_HTG_RATE);
+  const profitHtg = Number((publicPriceHtg - supplierCostHtg).toFixed(2));
+  const marginPercent = supplierCostHtg > 0 ? Number(((profitHtg / supplierCostHtg) * 100).toFixed(2)) : 20;
+  return {
+    ...pkg,
+    supplierCostUsd,
+    supplierCostHtg,
+    publicPriceHtg,
+    resellerPriceHtg,
+    profitHtg,
+    marginHtg: profitHtg,
+    marginPercent,
+    exchangeRateUsdHtg: DEFAULT_USD_TO_HTG_RATE,
+    referenceCurrency: 'USD',
+    sellingCurrency: 'HTG'
+  };
+}
+
 export const INITIAL_SERVICES: Service[] = [
   {
     id: 'srv_ff_diamonds',
     gameId: 'game_ff',
     externalGameId: 'freefire_global',
     name: 'Free Fire Diamonds (Global)',
-    description: 'Recharges directes de Diamants Free Fire via GoXtop avec vérification réelle du nom du joueur.',
+    description: 'Recharges directes de Diamants Free Fire via RechargeGames & GoXtop avec vérification réelle du nom du joueur.',
     category: 'diamonds',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     isActive: true,
     displayOrder: 1,
     packages: [
-      { id: 'pkg_freefire_global_110', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_110', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '110 Diamonds', amount: 110, unit: 'Diamonds', supplierCost: 0.778, margin: 0.19, publicPrice: 0.97, resellerPrice: 0.87, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 1 },
-      { id: 'pkg_freefire_global_341', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_341', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '341 Diamonds', amount: 341, unit: 'Diamonds', supplierCost: 2.374, margin: 0.59, publicPrice: 2.96, resellerPrice: 2.67, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 2 },
-      { id: 'pkg_freefire_global_572', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_572', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '572 Diamonds', amount: 572, unit: 'Diamonds', supplierCost: 3.858, margin: 0.96, publicPrice: 4.82, resellerPrice: 4.34, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 3 },
-      { id: 'pkg_freefire_global_1166', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_1166', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '1166 Diamonds', amount: 1166, unit: 'Diamonds', supplierCost: 7.727, margin: 1.93, publicPrice: 9.66, resellerPrice: 8.69, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 4 },
-      { id: 'pkg_freefire_global_2398', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_2398', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: '2398 Diamonds', amount: 2398, unit: 'Diamonds', supplierCost: 15.453, margin: 3.86, publicPrice: 19.31, resellerPrice: 17.38, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 5 },
-      { id: 'pkg_freefire_global_weekly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Weekly_Membership', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: 'Weekly Membership', amount: 1, unit: 'Pass', supplierCost: 1.545, margin: 0.39, publicPrice: 1.94, resellerPrice: 1.74, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 6 },
-      { id: 'pkg_freefire_global_monthly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Monthly_Membership', providerSlug: 'goxtop', externalGameId: 'freefire_global', name: 'Monthly Membership', amount: 1, unit: 'Pass', supplierCost: 5.565, margin: 1.39, publicPrice: 6.96, resellerPrice: 6.26, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 7 }
+      withHtgPricing({ id: 'pkg_freefire_global_110', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_110', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: '110 Diamonds', amount: 110, unit: 'Diamonds', supplierCost: 0.78, margin: 0.19, publicPrice: 0.97, resellerPrice: 0.87, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_freefire_global_341', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_341', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: '341 Diamonds', amount: 341, unit: 'Diamonds', supplierCost: 2.35, margin: 0.61, publicPrice: 2.96, resellerPrice: 2.67, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_freefire_global_572', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_572', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: '572 Diamonds', amount: 572, unit: 'Diamonds', supplierCost: 3.90, margin: 0.92, publicPrice: 4.82, resellerPrice: 4.34, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 3 }),
+      withHtgPricing({ id: 'pkg_freefire_global_1166', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_1166', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: '1166 Diamonds', amount: 1166, unit: 'Diamonds', supplierCost: 7.80, margin: 1.86, publicPrice: 9.66, resellerPrice: 8.69, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 4 }),
+      withHtgPricing({ id: 'pkg_freefire_global_2398', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_2398', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: '2398 Diamonds', amount: 2398, unit: 'Diamonds', supplierCost: 15.50, margin: 3.81, publicPrice: 19.31, resellerPrice: 17.38, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 5 }),
+      withHtgPricing({ id: 'pkg_freefire_global_weekly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Weekly_Membership', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: 'Weekly Membership', amount: 1, unit: 'Pass', supplierCost: 1.50, margin: 0.44, publicPrice: 1.94, resellerPrice: 1.74, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 6 }),
+      withHtgPricing({ id: 'pkg_freefire_global_monthly_membership', serviceId: 'srv_ff_diamonds', externalProductId: 'FREEFIRE_GLOBAL_Monthly_Membership', providerSlug: 'rechargegames', externalGameId: 'freefire_global', name: 'Monthly Membership', amount: 1, unit: 'Pass', supplierCost: 5.565, margin: 1.39, publicPrice: 6.96, resellerPrice: 6.26, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 7 })
     ],
     createdAt: '2026-01-10T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
@@ -272,14 +307,14 @@ export const INITIAL_SERVICES: Service[] = [
     name: 'PUBG Mobile Unknown Cash (UC)',
     description: 'Packs Unknown Cash officiels pour PUBG Mobile Global.',
     category: 'uc',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     isActive: true,
     displayOrder: 2,
     packages: [
-      { id: 'pkg_pubg_60', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_60', externalGameId: 'pubgm', name: '60 UC', amount: 60, unit: 'UC', supplierCost: 0.78, margin: 0.32, publicPrice: 1.10, resellerPrice: 0.88, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 1 },
-      { id: 'pkg_pubg_325', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_325', externalGameId: 'pubgm', name: '325 UC', amount: 325, unit: 'UC', supplierCost: 3.90, margin: 1.50, publicPrice: 5.40, resellerPrice: 4.40, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 2 },
-      { id: 'pkg_pubg_660', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_660', externalGameId: 'pubgm', name: '660 UC (Royal Pass)', amount: 660, unit: 'UC', supplierCost: 7.75, margin: 2.75, publicPrice: 10.50, resellerPrice: 8.70, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 3 },
-      { id: 'pkg_pubg_1800', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_1800', externalGameId: 'pubgm', name: '1800 UC', amount: 1800, unit: 'UC', supplierCost: 19.80, margin: 6.70, publicPrice: 26.50, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 4 }
+      withHtgPricing({ id: 'pkg_pubg_60', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_60', externalGameId: 'pubgm', name: '60 UC', amount: 60, unit: 'UC', supplierCost: 0.80, margin: 0.30, publicPrice: 1.10, resellerPrice: 0.88, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_pubg_325', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_325', externalGameId: 'pubgm', name: '325 UC', amount: 325, unit: 'UC', supplierCost: 3.95, margin: 1.45, publicPrice: 5.40, resellerPrice: 4.40, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_pubg_660', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_660', externalGameId: 'pubgm', name: '660 UC (Royal Pass)', amount: 660, unit: 'UC', supplierCost: 7.90, margin: 2.60, publicPrice: 10.50, resellerPrice: 8.70, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 3 }),
+      withHtgPricing({ id: 'pkg_pubg_1800', serviceId: 'srv_pubg_uc', externalProductId: 'pubg_1800', externalGameId: 'pubgm', name: '1800 UC', amount: 1800, unit: 'UC', supplierCost: 19.80, margin: 6.70, publicPrice: 26.50, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['characterId', 'serverId'], displayOrder: 4 })
     ],
     createdAt: '2026-01-12T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
@@ -291,14 +326,14 @@ export const INITIAL_SERVICES: Service[] = [
     name: 'Mobile Legends Diamants',
     description: 'Diamants Mobile Legends avec créditation via Player ID et Zone ID.',
     category: 'diamonds',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     isActive: true,
     displayOrder: 3,
     packages: [
-      { id: 'pkg_mlbb_86', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_86', externalGameId: 'mlbb', name: '86 Diamants', amount: 86, unit: 'Diamonds', supplierCost: 1.15, margin: 0.50, publicPrice: 1.65, resellerPrice: 1.35, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 1 },
-      { id: 'pkg_mlbb_257', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_257', externalGameId: 'mlbb', name: '257 Diamants', amount: 257, unit: 'Diamonds', supplierCost: 3.45, margin: 1.35, publicPrice: 4.80, resellerPrice: 3.95, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 2 },
-      { id: 'pkg_mlbb_706', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_706', externalGameId: 'mlbb', name: '706 Diamants', amount: 706, unit: 'Diamonds', supplierCost: 9.20, margin: 3.30, publicPrice: 12.50, resellerPrice: 10.40, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 3 },
-      { id: 'pkg_mlbb_pass', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_wdp', externalGameId: 'mlbb', name: 'Weekly Diamond Pass', amount: 1, unit: 'Pass', supplierCost: 1.60, margin: 0.60, publicPrice: 2.20, resellerPrice: 1.85, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 4 }
+      withHtgPricing({ id: 'pkg_mlbb_86', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_86', externalGameId: 'mlbb', name: '86 Diamants', amount: 86, unit: 'Diamonds', supplierCost: 1.10, margin: 0.55, publicPrice: 1.65, resellerPrice: 1.35, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_mlbb_257', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_257', externalGameId: 'mlbb', name: '257 Diamants', amount: 257, unit: 'Diamonds', supplierCost: 3.45, margin: 1.35, publicPrice: 4.80, resellerPrice: 3.95, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_mlbb_706', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_706', externalGameId: 'mlbb', name: '706 Diamants', amount: 706, unit: 'Diamonds', supplierCost: 9.20, margin: 3.30, publicPrice: 12.50, resellerPrice: 10.40, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 3 }),
+      withHtgPricing({ id: 'pkg_mlbb_pass', serviceId: 'srv_mlbb_diamonds', externalProductId: 'mlbb_wdp', externalGameId: 'mlbb', name: 'Weekly Diamond Pass', amount: 1, unit: 'Pass', supplierCost: 1.60, margin: 0.60, publicPrice: 2.20, resellerPrice: 1.85, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId', 'zoneId'], displayOrder: 4 })
     ],
     createdAt: '2026-01-15T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
@@ -310,13 +345,13 @@ export const INITIAL_SERVICES: Service[] = [
     name: 'Roblox Robux Digital Vouchers',
     description: 'Codes digitaux Robux officiels (Aucun Player ID requis).',
     category: 'voucher',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     isActive: true,
     displayOrder: 4,
     packages: [
-      { id: 'pkg_rbx_400', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_400', externalGameId: 'roblox', name: 'Code 400 Robux', amount: 400, unit: 'Robux PIN', supplierCost: 4.00, margin: 1.50, publicPrice: 5.50, resellerPrice: 4.60, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 1 },
-      { id: 'pkg_rbx_800', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_800', externalGameId: 'roblox', name: 'Code 800 Robux', amount: 800, unit: 'Robux PIN', supplierCost: 8.00, margin: 2.80, publicPrice: 10.80, resellerPrice: 9.10, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 2 },
-      { id: 'pkg_rbx_2000', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_2000', externalGameId: 'roblox', name: 'Code 2000 Robux', amount: 2000, unit: 'Robux PIN', supplierCost: 19.50, margin: 6.50, publicPrice: 26.00, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 3 }
+      withHtgPricing({ id: 'pkg_rbx_400', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_400', externalGameId: 'roblox', name: 'Code 400 Robux', amount: 400, unit: 'Robux PIN', supplierCost: 3.90, margin: 1.60, publicPrice: 5.50, resellerPrice: 4.60, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_rbx_800', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_800', externalGameId: 'roblox', name: 'Code 800 Robux', amount: 800, unit: 'Robux PIN', supplierCost: 8.00, margin: 2.80, publicPrice: 10.80, resellerPrice: 9.10, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_rbx_2000', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_2000', externalGameId: 'roblox', name: 'Code 2000 Robux', amount: 2000, unit: 'Robux PIN', supplierCost: 19.50, margin: 6.50, publicPrice: 26.00, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 3 })
     ],
     createdAt: '2026-02-01T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
@@ -341,14 +376,17 @@ export const INITIAL_SETTINGS: AppSettings = {
     androidApkUrl: 'https://download.playup.io/releases/playup-latest.apk',
     googlePlayUrl: 'https://play.google.com/store/apps/details?id=io.playup.mobile',
     iosAppStoreUrl: 'https://apps.apple.com/app/playup-gaming-topup/id6498129012',
-    appVersion: 'v2.4.1 (Build 2026.10)',
+    appVersion: 'v2.4.4 (Build 2026.10)',
     apkFileSize: '18.4 MB'
   },
   maintenanceMode: false,
-  announcementNotice: 'Intégration officielle GoXtop API v.1 disponible : Catalogue, Name Checker, Création idempotente et Webhooks signés.',
+  announcementNotice: 'Intégration officielle RechargeGames & GoXtop API disponible : Devise de référence USD, prix de vente PlayUp en HTG et Webhooks signés.',
   paymentGatewayConfigured: false,
   apiRateLimitPerMinute: 60,
-  defaultProviderId: 'prov_goxtop'
+  defaultProviderId: 'prov_rechargegames',
+  referenceCurrency: 'USD',
+  sellingCurrency: 'HTG',
+  usdToHtgRate: DEFAULT_USD_TO_HTG_RATE
 };
 
 export const INITIAL_TICKETS: SupportTicket[] = [];

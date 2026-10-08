@@ -656,7 +656,9 @@ export const MonCashNatCashOcrPaymentFlow: React.FC<MonCashNatCashOcrPaymentFlow
               <div className="text-[11px] text-slate-400 mt-0.5">
                 Montant exact attendu :{' '}
                 <strong className="text-emerald-400">
-                  ${Number(paymentRequest.expected_amount).toFixed(2)} USD ({paymentRequest.expected_amount_htg} HTG)
+                  {purpose === 'service_order'
+                    ? `${paymentRequest.expected_amount_htg} HTG`
+                    : `${paymentRequest.expected_amount_htg} HTG ($${Number(paymentRequest.expected_amount).toFixed(2)} USD)`}
                 </strong>
               </div>
             </div>

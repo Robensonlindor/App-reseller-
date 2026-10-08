@@ -40,19 +40,39 @@ export default function App() {
   const [isSyncingBackend, setIsSyncingBackend] = useState<boolean>(true);
   const [backendError, setBackendError] = useState<string | null>(null);
 
-  // Mobile App Modal simulator
-  const [isMobileAppOpen, setIsMobileAppOpen] = useState(false);
+  // Mobile App Modal simulator (automatically opens when launched with ?mode=mobile_app or ?source=android_app)
+  const [isMobileAppOpen, setIsMobileAppOpen] = useState(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return (
+        params.get('mode') === 'mobile_app' ||
+        params.get('source') === 'android_app' ||
+        params.get('source') === 'ios_app'
+      );
+    } catch {
+      return false;
+    }
+  });
   // Admin Overlay
   const [isAdminOpen, setIsAdminOpen] = useState(false);
-  // Automatic 2-second startup splash screen (disappears automatically without pressing any button)
+  // Automatic startup splash screen — minimum 2500ms duration to prevent UI race conditions on slow Android hardware
   const [showStartupSplash, setShowStartupSplash] = useState(true);
+  const [minSplashElapsed, setMinSplashElapsed] = useState(false);
 
   useEffect(() => {
+    const MIN_SPLASH_DURATION_MS = 2500;
     const timer = setTimeout(() => {
+      setMinSplashElapsed(true);
       setShowStartupSplash(false);
-    }, 2000);
+    }, MIN_SPLASH_DURATION_MS);
     return () => clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    if (minSplashElapsed && showStartupSplash) {
+      setShowStartupSplash(false);
+    }
+  }, [minSplashElapsed, showStartupSplash]);
 
   // Verify any existing local token against the backend on startup
   const verifyCurrentSession = useCallback(async () => {
@@ -131,6 +151,45 @@ export default function App() {
     loadBackendCatalog();
     verifyCurrentSession();
   }, [loadBackendCatalog, verifyCurrentSession]);
+
+  // Real-time subscription to USD->HTG exchange rate & HTG price updates
+  useEffect(() => {
+    const handlePricingEvent = () => {
+      loadBackendCatalog();
+    };
+    window.addEventListener('playup:pricing-updated', handlePricingEvent);
+
+    let es: EventSource | null = null;
+    if (typeof window !== 'undefined' && 'EventSource' in window) {
+      try {
+        es = new EventSource('/api/pricing/stream');
+        es.onmessage = (evt) => {
+          try {
+            const parsed = JSON.parse(evt.data);
+            if (parsed && parsed.type === 'PRICING_UPDATED') {
+              loadBackendCatalog();
+              window.dispatchEvent(new CustomEvent('playup:pricing-updated', { detail: parsed }));
+            }
+          } catch {
+            // ignore
+          }
+        };
+      } catch {
+        // ignore if SSE unavailable
+      }
+    }
+
+    return () => {
+      window.removeEventListener('playup:pricing-updated', handlePricingEvent);
+      if (es) {
+        try {
+          es.close();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [loadBackendCatalog]);
 
   const handleNavigate = (tab: string) => {
     if (tab === 'admin') {

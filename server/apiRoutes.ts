@@ -323,6 +323,14 @@ const authenticateAdmin = (req: Request, res: Response, next: NextFunction) => {
   return next();
 };
 
+const isAuthorizedAdminRequest = (req: Request): boolean => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+  if (!token) return false;
+  const user = db.verifyUserSessionToken(token);
+  return Boolean(user && user.role === 'ADMIN');
+};
+
 // ==========================================
 // 1. PUBLIC & SYSTEM ENDPOINTS (ZERO SECRETS EXPOSED)
 // ==========================================
@@ -344,6 +352,34 @@ apiRouter.get('/games', (_req, res) => {
   const games = db.getGames().filter(g => g.isActive);
   const services = db.getServices().filter(s => s.isActive);
 
+  const rate = db.getUsdToHtgExchangeRate();
+  const sanitizePublicPackageForClient = (p: any) => {
+    const finalPriceHtg =
+      typeof p.publicPriceHtg === 'number' && p.publicPriceHtg > 0
+        ? Number(p.publicPriceHtg.toFixed(2))
+        : Number((Number(p.publicPrice || 0) * rate).toFixed(2));
+    return {
+      id: p.id,
+      serviceId: p.serviceId,
+      externalProductId: p.externalProductId,
+      productKey: p.productKey,
+      region: p.region,
+      externalGameId: p.externalGameId,
+      providerSlug: p.providerSlug,
+      name: p.name,
+      amount: p.amount,
+      unit: p.unit,
+      publicPrice: p.publicPrice,
+      publicPriceHtg: finalPriceHtg,
+      sellingCurrency: 'HTG' as const,
+      currency: 'HTG',
+      isActive: p.isActive,
+      requiresPlayerId: p.requiresPlayerId,
+      requiredFields: p.requiredFields,
+      displayOrder: p.displayOrder
+    };
+  };
+
   const populated = games.map(game => {
     const gameServices = services.filter(s => s.gameId === game.id).map(srv => ({
       id: srv.id,
@@ -353,22 +389,7 @@ apiRouter.get('/games', (_req, res) => {
       category: srv.category,
       isActive: srv.isActive,
       displayOrder: srv.displayOrder,
-      packages: srv.packages.filter(p => p.isActive).map(p => ({
-        id: p.id,
-        serviceId: p.serviceId,
-        externalProductId: p.externalProductId,
-        externalGameId: p.externalGameId,
-        providerSlug: p.providerSlug,
-        name: p.name,
-        amount: p.amount,
-        unit: p.unit,
-        publicPrice: p.publicPrice,
-        currency: p.currency,
-        isActive: p.isActive,
-        requiresPlayerId: p.requiresPlayerId,
-        requiredFields: p.requiredFields,
-        displayOrder: p.displayOrder
-      }))
+      packages: srv.packages.filter(p => p.isActive).map(sanitizePublicPackageForClient)
     }));
     return {
       ...game,
@@ -387,16 +408,210 @@ apiRouter.get('/games/:idOrSlug', (req, res) => {
     return res.status(404).json({ error: 'Game not found' });
   }
 
-  const services = db.getServices().filter(s => s.gameId === game.id && s.isActive);
+  const rate = db.getUsdToHtgExchangeRate();
+  const services = db
+    .getServices()
+    .filter(s => s.gameId === game.id && s.isActive)
+    .map(srv => ({
+      ...srv,
+      packages: (srv.packages || [])
+        .filter(p => p.isActive)
+        .map(p => ({
+          id: p.id,
+          serviceId: p.serviceId,
+          externalProductId: p.externalProductId,
+          productKey: p.productKey,
+          region: p.region,
+          externalGameId: p.externalGameId,
+          providerSlug: p.providerSlug,
+          name: p.name,
+          amount: p.amount,
+          unit: p.unit,
+          publicPrice: p.publicPrice,
+          publicPriceHtg:
+            typeof p.publicPriceHtg === 'number' && p.publicPriceHtg > 0
+              ? Number(p.publicPriceHtg.toFixed(2))
+              : Number((Number(p.publicPrice || 0) * rate).toFixed(2)),
+          sellingCurrency: 'HTG' as const,
+          currency: 'HTG',
+          isActive: p.isActive,
+          requiresPlayerId: p.requiresPlayerId,
+          requiredFields: p.requiredFields,
+          displayOrder: p.displayOrder
+        }))
+    }));
   res.json({
     ...game,
     services
   });
 });
 
-apiRouter.get('/services', (_req, res) => {
+apiRouter.get('/services', (req, res) => {
+  const isAdmin = isAuthorizedAdminRequest(req);
   const services = db.getServices().filter(s => s.isActive);
-  res.json(services);
+  if (isAdmin) {
+    return res.json(services);
+  }
+  const rate = db.getUsdToHtgExchangeRate();
+  const sanitized = services.map(srv => ({
+    id: srv.id,
+    gameId: srv.gameId,
+    externalGameId: srv.externalGameId,
+    name: srv.name,
+    description: srv.description,
+    category: srv.category,
+    providerId: srv.providerId,
+    isActive: srv.isActive,
+    displayOrder: srv.displayOrder,
+    createdAt: srv.createdAt,
+    updatedAt: srv.updatedAt,
+    packages: (srv.packages || []).map(p => ({
+      id: p.id,
+      serviceId: p.serviceId,
+      externalProductId: p.externalProductId,
+      productKey: p.productKey,
+      region: p.region,
+      providerSlug: p.providerSlug,
+      externalGameId: p.externalGameId,
+      name: p.name,
+      amount: p.amount,
+      unit: p.unit,
+      publicPrice: p.publicPrice,
+      publicPriceHtg:
+        typeof p.publicPriceHtg === 'number' && p.publicPriceHtg > 0
+          ? Number(p.publicPriceHtg.toFixed(2))
+          : Number((Number(p.publicPrice || 0) * rate).toFixed(2)),
+      sellingCurrency: 'HTG' as const,
+      currency: 'HTG',
+      isActive: p.isActive,
+      requiresPlayerId: p.requiresPlayerId,
+      requiredFields: p.requiredFields,
+      displayOrder: p.displayOrder
+    }))
+  }));
+  res.json(sanitized);
+});
+
+apiRouter.get('/services/:packageId/price-history', (req, res) => {
+  const { packageId } = req.params;
+  const days = Math.max(7, Math.min(90, Number(req.query.days) || 30));
+  const rate = db.getUsdToHtgExchangeRate();
+
+  let foundPkg: any = null;
+  let foundSrv: any = null;
+  for (const srv of db.getServices()) {
+    const p = (srv.packages || []).find(
+      item =>
+        item.id === packageId ||
+        item.productKey === packageId ||
+        item.externalProductId === packageId
+    );
+    if (p) {
+      foundPkg = p;
+      foundSrv = srv;
+      break;
+    }
+  }
+
+  const currentPriceHtg = foundPkg
+    ? typeof foundPkg.publicPriceHtg === 'number' && foundPkg.publicPriceHtg > 0
+      ? Number(foundPkg.publicPriceHtg.toFixed(2))
+      : Number((Number(foundPkg.publicPrice || 1) * rate).toFixed(2))
+    : 185;
+
+  const packageChanges = db.getPriceChangeHistory({
+    packageId: foundPkg?.id || packageId,
+    limit: 50
+  });
+
+  const history: Array<{
+    date: string;
+    timestamp: string;
+    publicPrice: number;
+    resellerPrice: number;
+    currency: string;
+  }> = [];
+
+  const now = Date.now();
+  for (let i = days - 1; i >= 0; i--) {
+    const ts = new Date(now - i * 86400000);
+    const dateStr = ts.toLocaleDateString('fr-FR', { day: '2-digit', month: 'short' });
+    let dayPriceHtg = currentPriceHtg;
+    // Check if there was a recorded change after this day
+    for (const ch of packageChanges) {
+      const chTime = new Date(ch.timestamp).getTime();
+      if (chTime > ts.getTime() && typeof ch.previousSellingPriceHtg === 'number') {
+        dayPriceHtg = ch.previousSellingPriceHtg;
+      }
+    }
+    history.push({
+      date: dateStr,
+      timestamp: ts.toISOString(),
+      publicPrice: Number(dayPriceHtg.toFixed(2)),
+      resellerPrice: Number((dayPriceHtg * 0.92).toFixed(2)),
+      currency: 'HTG'
+    });
+  }
+
+  res.json({
+    packageId: foundPkg?.id || packageId,
+    packageName: foundPkg?.name || 'Pack PlayUp',
+    serviceName: foundSrv?.name || 'Service PlayUp',
+    currentPrice: currentPriceHtg,
+    lowestPrice: Math.min(...history.map(h => h.publicPrice), currentPriceHtg),
+    highestPrice: Math.max(...history.map(h => h.publicPrice), currentPriceHtg),
+    currency: 'HTG',
+    history
+  });
+});
+
+// Real-time SSE stream for live USD->HTG exchange rate and HTG price updates
+apiRouter.get('/pricing/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  NotificationEngine.registerPricingSseClient(res);
+
+  const initialPayload = JSON.stringify({
+    type: 'PRICING_STREAM_CONNECTED',
+    referenceCurrency: 'USD',
+    sellingCurrency: 'HTG',
+    usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+    timestamp: new Date().toISOString()
+  });
+  res.write(`data: ${initialPayload}\n\n`);
+
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(`: keep-alive\n\n`);
+    } catch {
+      clearInterval(keepAlive);
+    }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    NotificationEngine.unregisterPricingSseClient(res);
+  });
+});
+
+apiRouter.get('/pricing/config', (req, res) => {
+  const isAdmin = isAuthorizedAdminRequest(req);
+  const rate = db.getUsdToHtgExchangeRate();
+  if (!isAdmin) {
+    return res.json({
+      sellingCurrency: 'HTG'
+    });
+  }
+  return res.json({
+    referenceCurrency: 'USD',
+    sellingCurrency: 'HTG',
+    usdToHtgExchangeRate: rate,
+    margins: db.getRechargeGamesMargins(),
+    history: db.getPriceChangeHistory({ limit: 100 })
+  });
 });
 
 // ==========================================
@@ -2479,6 +2694,7 @@ apiRouter.post('/admin/services', authenticateAdmin, (req, res) => {
 
 apiRouter.put('/admin/services/:id', authenticateAdmin, (req, res) => {
   const { id } = req.params;
+  const adminUser = (req as any).user as AppUser | undefined;
   const services = db.getServices();
   const index = services.findIndex(s => s.id === id);
   if (index === -1) return res.status(404).json({ error: 'Service introuvable' });
@@ -2488,8 +2704,119 @@ apiRouter.put('/admin/services/:id', authenticateAdmin, (req, res) => {
     ...req.body,
     updatedAt: new Date().toISOString()
   };
-  db.setServices(services);
-  res.json(services[index]);
+  db.setServices(services, {
+    adminId: adminUser?.id || 'admin',
+    adminEmail: adminUser?.email
+  });
+
+  NotificationEngine.broadcastPricingUpdate({
+    changeType: 'service_updated',
+    usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+    historyEntry: db.getPriceChangeHistory({ limit: 1 })[0]
+  });
+
+  res.json(db.getServices()[index]);
+});
+
+// Admin USD -> HTG Exchange Rate & Manual HTG Selling Price Management
+apiRouter.get('/admin/pricing/history', authenticateAdmin, (req, res) => {
+  const { serviceId, packageId, productKey, changeType, limit } = req.query;
+  const history = db.getPriceChangeHistory({
+    serviceId: serviceId ? String(serviceId) : undefined,
+    packageId: packageId ? String(packageId) : undefined,
+    productKey: productKey ? String(productKey) : undefined,
+    changeType: changeType ? String(changeType) : undefined,
+    limit: limit ? Number(limit) : 200
+  });
+  res.json({
+    referenceCurrency: 'USD',
+    sellingCurrency: 'HTG',
+    usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+    history
+  });
+});
+
+apiRouter.put('/admin/pricing/exchange-rate', authenticateAdmin, (req, res) => {
+  try {
+    const adminUser = (req as any).user as AppUser | undefined;
+    const { usdToHtgExchangeRate, reason, recalculateAutoSellingPrices } = req.body || {};
+    const numRate = Number(usdToHtgExchangeRate);
+    if (!Number.isFinite(numRate) || numRate <= 0) {
+      return res.status(400).json({
+        error: 'Veuillez saisir un taux de change USD → HTG valide (supérieur à 0).'
+      });
+    }
+
+    const result = db.setUsdToHtgExchangeRate(numRate, {
+      adminId: adminUser?.id || 'admin',
+      adminEmail: adminUser?.email,
+      reason: reason ? String(reason) : undefined,
+      recalculateAutoSellingPrices: Boolean(recalculateAutoSellingPrices)
+    });
+
+    NotificationEngine.broadcastPricingUpdate({
+      changeType: 'exchange_rate',
+      usdToHtgExchangeRate: result.newExchangeRate,
+      historyEntry: result.historyEntry
+    });
+
+    return res.json({
+      success: true,
+      message: `Taux de change mis à jour en temps réel : 1 USD = ${result.newExchangeRate} HTG. Coûts fournisseurs, marges et bénéfices en HTG recalculés automatiquement.`,
+      ...result,
+      services: db.getServices(),
+      products: db.getRechargeGamesProducts(),
+      settings: db.getSettings(),
+      history: db.getPriceChangeHistory({ limit: 100 })
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      error: err?.message || 'Erreur lors de la mise à jour du taux de change USD → HTG.'
+    });
+  }
+});
+
+apiRouter.put('/admin/pricing/service-price-htg', authenticateAdmin, (req, res) => {
+  try {
+    const adminUser = (req as any).user as AppUser | undefined;
+    const { serviceId, packageId, productKey, sellingPriceHtg, resellerPriceHtg, reason } = req.body || {};
+    const numPrice = Number(sellingPriceHtg);
+    if (!Number.isFinite(numPrice) || numPrice <= 0) {
+      return res.status(400).json({
+        error: 'Veuillez saisir un prix de vente final en HTG valide (supérieur à 0).'
+      });
+    }
+
+    const result = db.setManualServiceSellingPriceHtg({
+      serviceId: serviceId ? String(serviceId) : undefined,
+      packageId: packageId ? String(packageId) : undefined,
+      productKey: productKey ? String(productKey) : undefined,
+      sellingPriceHtg: numPrice,
+      resellerPriceHtg: resellerPriceHtg !== undefined ? Number(resellerPriceHtg) : undefined,
+      adminId: adminUser?.id || 'admin',
+      adminEmail: adminUser?.email,
+      reason: reason ? String(reason) : undefined
+    });
+
+    NotificationEngine.broadcastPricingUpdate({
+      changeType: 'manual_price_htg',
+      usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+      historyEntry: result.historyEntry
+    });
+
+    return res.json({
+      success: true,
+      message: `Prix de vente final défini à ${numPrice} HTG et appliqué en temps réel.`,
+      ...result,
+      services: db.getServices(),
+      products: db.getRechargeGamesProducts(),
+      history: db.getPriceChangeHistory({ limit: 100 })
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      error: err?.message || 'Erreur lors de la mise à jour du prix de vente en HTG.'
+    });
+  }
 });
 
 // ==========================================
@@ -3091,11 +3418,20 @@ apiRouter.get('/admin/settings', authenticateAdmin, (_req, res) => {
 });
 
 apiRouter.put('/admin/settings', authenticateAdmin, (req, res) => {
+  const adminUser = (req as any).user as AppUser | undefined;
   const current = db.getSettings();
   const updated = { ...current, ...req.body };
-  db.setSettings(updated);
+  db.setSettings(updated, {
+    adminId: adminUser?.id || 'admin',
+    adminEmail: adminUser?.email
+  });
   db.addSystemLog('info', 'system', 'Admin updated platform settings');
-  res.json(updated);
+  NotificationEngine.broadcastPricingUpdate({
+    changeType: 'settings_updated',
+    usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+    historyEntry: db.getPriceChangeHistory({ limit: 1 })[0]
+  });
+  res.json(db.getSettings());
 });
 
 // Admin System Logs
@@ -3464,26 +3800,37 @@ apiRouter.get('/rechargegames/catalog', async (req, res) => {
   const stats = db.getRechargeGamesSyncStats();
 
   // Strip provider_price and profit_estimate for public mobile consumers
-  const publicProducts = products.map(p => ({
-    id: p.id,
-    provider: p.provider,
-    product_key: p.product_key,
-    game: p.game,
-    game_slug: p.game_slug,
-    region: p.region,
-    name: p.name,
-    topup_value: p.topup_value,
-    amount: p.amount,
-    unit: p.unit,
-    playup_price: p.playup_price,
-    currency: p.currency,
-    active: p.active,
-    requires_player_id: p.requires_player_id,
-    last_synced_at: p.last_synced_at
-  }));
+  const rate = db.getUsdToHtgExchangeRate();
+  // Return sanitized customer catalog (ONLY final PlayUp selling price in HTG; NEVER provider_price, margin_percent, or profit)
+  const publicProducts = products.map(p => {
+    const finalHtg =
+      typeof p.playup_price_htg === 'number' && p.playup_price_htg > 0
+        ? Number(p.playup_price_htg.toFixed(2))
+        : Number((Number(p.playup_price || 0) * rate).toFixed(2));
+    return {
+      id: p.id,
+      provider: p.provider,
+      product_key: p.product_key,
+      game: p.game,
+      game_slug: p.game_slug,
+      region: p.region,
+      name: p.name,
+      topup_value: p.topup_value,
+      amount: p.amount,
+      unit: p.unit,
+      playup_price: p.playup_price,
+      playup_price_htg: finalHtg,
+      selling_currency: 'HTG',
+      currency: 'HTG',
+      active: p.active,
+      requires_player_id: p.requires_player_id,
+      last_synced_at: p.last_synced_at
+    };
+  });
 
   res.json({
     mode: db.getRechargeGamesMode(),
+    sellingCurrency: 'HTG',
     regionsAvailable: stats.regionsAvailable,
     gamesAvailable: stats.gamesAvailable,
     lastSyncedAt: stats.lastSyncedAt,
@@ -3837,16 +4184,29 @@ apiRouter.post('/admin/rechargegames/sync', authenticateAdmin, async (_req, res)
 });
 
 apiRouter.put('/admin/rechargegames/margins', authenticateAdmin, (req, res) => {
-  const updated = db.setRechargeGamesMargins(req.body || {});
+  const adminUser = (req as any).user as AppUser | undefined;
+  const updated = db.setRechargeGamesMargins(req.body || {}, {
+    adminId: adminUser?.id || 'admin',
+    adminEmail: adminUser?.email
+  });
   const rg = new RechargeGamesProvider();
   // Re-sync PlayUp services with new margins
   const products = db.getRechargeGamesProducts();
   (rg as any).syncIntoPlayUpServices(products);
+
+  NotificationEngine.broadcastPricingUpdate({
+    changeType: 'margin_rule',
+    usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+    historyEntry: db.getPriceChangeHistory({ limit: 1 })[0]
+  });
+
   res.json({
     success: true,
-    message: 'Marges PlayUp enregistrées et prix clients recalculés côté serveur.',
+    message: 'Marges PlayUp et prix HTG enregistrés et recalculés en temps réel côté serveur.',
     margins: updated,
-    products
+    products: db.getRechargeGamesProducts(),
+    services: db.getServices(),
+    history: db.getPriceChangeHistory({ limit: 100 })
   });
 });
 
@@ -4889,11 +5249,24 @@ apiRouter.get('/download/info', (req, res) => {
   res.json({
     detectedPlatform,
     latestVersion: PackageDistributionEngine.LATEST_VERSION,
+    applicationId: PackageDistributionEngine.APPLICATION_ID,
     packages: {
       android: androidMeta,
       ios: iosMeta
     }
   });
+});
+
+apiRouter.get('/download/verify-apk', (_req, res) => {
+  try {
+    const report = PackageDistributionEngine.verifyAndroidApk();
+    res.json(report);
+  } catch (err: any) {
+    res.status(500).json({
+      valid: false,
+      error: err.message || 'Erreur lors de la vérification binaire de l’APK.'
+    });
+  }
 });
 
 apiRouter.head('/download/package', (req, res) => {
@@ -5174,7 +5547,7 @@ apiRouter.patch('/orders/:orderId/tracker-notifications', authenticateUser, asyn
   const orderIdx = orders.findIndex(
     o =>
       (o.id === orderId || o.orderNumber === orderId || o.partnerOrderId === orderId) &&
-      (o.userId === user.id || o.customerEmail?.toLowerCase() === user.email.toLowerCase() || user.role === 'ADMIN')
+      (o.userId === user.id || user.role === 'ADMIN')
   );
 
   if (orderIdx === -1) {
@@ -5197,10 +5570,19 @@ apiRouter.patch('/orders/:orderId/tracker-notifications', authenticateUser, asyn
 
   // Also sync user global notification preferences if enabled
   if (pushAlerts === true || emailAlerts === true) {
-    db.updateUserProfile(user.id, {
-      ...(pushAlerts === true ? { notificationsPush: true } : {}),
-      ...(emailAlerts === true ? { notificationsEmail: true } : {})
-    });
+    const allUsers = db.getUsers();
+    const uIdx = allUsers.findIndex(u => u.id === user.id);
+    if (uIdx !== -1) {
+      if (pushAlerts === true) {
+        allUsers[uIdx].pushNotificationsEnabled = true;
+        allUsers[uIdx].orderTrackerPushAlerts = true;
+      }
+      if (emailAlerts === true) {
+        allUsers[uIdx].emailNotifications = true;
+        allUsers[uIdx].orderTrackerEmailAlerts = true;
+      }
+      db.setUsers(allUsers);
+    }
   }
 
   let notificationResult = null;
@@ -5209,14 +5591,10 @@ apiRouter.patch('/orders/:orderId/tracker-notifications', authenticateUser, asyn
       orderId: targetOrder.id,
       orderNumber: targetOrder.orderNumber,
       userId: user.id,
-      userEmail: user.email,
-      userName: user.name,
       gameName: targetOrder.gameName,
-      serviceName: targetOrder.serviceName,
       packageName: targetOrder.packageName,
-      playerId: targetOrder.playerId,
       previousStatus: 'payment_verified',
-      newStatus: targetOrder.order_status || targetOrder.status,
+      newStatus: targetOrder.lifecycle_status || targetOrder.status,
       note: 'Alerte de suivi Order Tracker activée avec succès pour cette commande.'
     });
   }
@@ -5470,7 +5848,13 @@ apiRouter.post('/payments/requests', authenticateUser, paymentCreateRateLimit, a
         authoritativeUsd = Number(parsedTopup.toFixed(2));
       }
 
-      const authoritativeHtg = PaymentOcrAndAntiFraudEngine.computeHtgAmount(authoritativeUsd);
+      const authoritativeHtg =
+        purpose === 'service_order' &&
+        resolvedPackage &&
+        typeof resolvedPackage.publicPriceHtg === 'number' &&
+        resolvedPackage.publicPriceHtg > 0
+          ? Number(resolvedPackage.publicPriceHtg.toFixed(2))
+          : PaymentOcrAndAntiFraudEngine.computeHtgAmount(authoritativeUsd);
       const nowIso = new Date().toISOString();
       const reqId = `preq_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 

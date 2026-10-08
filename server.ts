@@ -70,10 +70,10 @@ async function startServer() {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 
     const origin = req.headers.origin;
-    if (origin) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, HEAD, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-KEY, stripe-signature, webhook-id, webhook-timestamp, webhook-signature');
+    res.setHeader('Access-Control-Allow-Origin', origin && origin !== 'null' ? origin : '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-KEY, stripe-signature, webhook-id, webhook-timestamp, webhook-signature');
+    if (origin && origin !== 'null') {
       res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
     if (req.method === 'OPTIONS') {

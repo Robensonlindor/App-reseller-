@@ -38,14 +38,13 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
   theme = 'light',
   compact = false
 }) => {
-  const { data, minPrice, maxPrice, avgPrice, priceDeltaPercent, resellerSavingsPercent } = useMemo(() => {
-    const basePublic = Number(pkg.publicPrice || 1);
-    const baseReseller = Number(
-      pkg.resellerPrice && pkg.resellerPrice < basePublic
-        ? pkg.resellerPrice
-        : +(basePublic * 0.92).toFixed(2)
+  const { data, minPrice, maxPrice, avgPrice, priceDeltaPercent, currentPriceHtg } = useMemo(() => {
+    const baseHtg = Number(
+      typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+        ? pkg.publicPriceHtg
+        : Number(pkg.publicPrice || 1) * 132
     );
-    const seed = hashString(`${pkg.id}_${pkg.name}_${basePublic}`);
+    const seed = hashString(`${pkg.id}_${pkg.name}_${baseHtg}`);
     const now = new Date();
     const points: PriceHistoryPoint[] = [];
 
@@ -63,37 +62,34 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
         points.push({
           dayLabel: dayStr,
           fullDate,
-          publicPrice: +basePublic.toFixed(2),
-          resellerPrice: +baseReseller.toFixed(2)
+          publicPrice: +baseHtg.toFixed(2),
+          resellerPrice: +baseHtg.toFixed(2)
         });
         continue;
       }
 
-      // Deterministic gentle market curve over the last 30 days (slight downward/stabilizing trend)
-      const wave1 = Math.sin((i + (seed % 11)) * 0.42) * 0.018;
-      const wave2 = Math.cos((i + (seed % 7)) * 0.23) * 0.012;
-      const earlyPremium = (i / 30) * 0.028; // Slightly higher 30 days ago -> shows PlayUp optimized rates
+      const wave1 = Math.sin((i + (seed % 11)) * 0.42) * 0.015;
+      const wave2 = Math.cos((i + (seed % 7)) * 0.23) * 0.01;
+      const earlyPremium = (i / 30) * 0.022;
       const factor = 1 + earlyPremium + wave1 + wave2;
 
-      const pPub = Math.max(0.05, +(basePublic * factor).toFixed(2));
-      const pRes = Math.max(0.04, +(baseReseller * (1 + earlyPremium * 0.85 + wave1 * 0.7)).toFixed(2));
+      const pPub = Math.max(1, Math.round(baseHtg * factor));
 
       points.push({
         dayLabel: dayStr,
         fullDate,
         publicPrice: pPub,
-        resellerPrice: pRes
+        resellerPrice: pPub
       });
     }
 
-    const prices = points.map(p => p.resellerPrice);
+    const prices = points.map(p => p.publicPrice);
     const minP = Math.min(...prices);
     const maxP = Math.max(...prices);
-    const avgP = +(prices.reduce((acc, v) => acc + v, 0) / prices.length).toFixed(2);
-    const firstPrice = points[0]?.resellerPrice || baseReseller;
-    const lastPrice = points[points.length - 1]?.resellerPrice || baseReseller;
+    const avgP = Math.round(prices.reduce((acc, v) => acc + v, 0) / prices.length);
+    const firstPrice = points[0]?.publicPrice || baseHtg;
+    const lastPrice = points[points.length - 1]?.publicPrice || baseHtg;
     const deltaPct = firstPrice > 0 ? +(((lastPrice - firstPrice) / firstPrice) * 100).toFixed(1) : 0;
-    const savingsPct = basePublic > 0 ? Math.max(3, Math.round(((basePublic - baseReseller) / basePublic) * 100)) : 8;
 
     return {
       data: points,
@@ -101,14 +97,13 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
       maxPrice: maxP,
       avgPrice: avgP,
       priceDeltaPercent: deltaPct,
-      resellerSavingsPercent: savingsPct
+      currentPriceHtg: +baseHtg.toFixed(2)
     };
-  }, [pkg.id, pkg.name, pkg.publicPrice, pkg.resellerPrice]);
+  }, [pkg.id, pkg.name, pkg.publicPrice, pkg.publicPriceHtg]);
 
   const isDark = theme === 'dark';
-  const currency = pkg.currency || 'USD';
+  const formatHtg = (v: number) => `${Number.isInteger(v) ? v : v.toFixed(2)} HTG`;
   const gradientId = `priceGrad_${pkg.id.replace(/[^a-zA-Z0-9]/g, '')}_${theme}`;
-  const publicGradientId = `pubGrad_${pkg.id.replace(/[^a-zA-Z0-9]/g, '')}_${theme}`;
 
   return (
     <div
@@ -131,7 +126,7 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
           <div>
             <div className="flex items-center gap-1.5">
               <span className={`font-bold ${compact ? 'text-[11px]' : 'text-xs'}`}>
-                Évolution du prix (30 derniers jours)
+                Évolution du prix PlayUp en HTG (30 derniers jours)
               </span>
               <span
                 className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${
@@ -149,7 +144,7 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
               </span>
             </div>
             <p className={`text-[10px] ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-              Indice de confiance revendeur · Tarif B2B vs Prix public ({pkg.name})
+              Prix final PlayUp ({pkg.name}) : <strong className="font-mono">{formatHtg(currentPriceHtg)}</strong>
             </p>
           </div>
         </div>
@@ -162,22 +157,18 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
           }`}
         >
           <ShieldCheck className="w-3 h-3 text-emerald-500 shrink-0" />
-          <span>Marge revendeur ~{resellerSavingsPercent}% garantie</span>
+          <span>Tarif PlayUp HTG garanti</span>
         </div>
       </div>
 
       {/* Recharts 30-day Area Chart */}
       <div className={compact ? 'h-28 w-full' : 'h-36 w-full'}>
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 6, right: 6, left: -22, bottom: 0 }}>
+          <AreaChart data={data} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
             <defs>
               <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor="#ea580c" stopOpacity={0.35} />
                 <stop offset="95%" stopColor="#ea580c" stopOpacity={0.0} />
-              </linearGradient>
-              <linearGradient id={publicGradientId} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#64748b" stopOpacity={0.2} />
-                <stop offset="95%" stopColor="#64748b" stopOpacity={0.0} />
               </linearGradient>
             </defs>
             <XAxis
@@ -189,13 +180,13 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
             />
             <YAxis
               domain={[
-                (dataMin: number) => +(dataMin * 0.95).toFixed(2),
-                (dataMax: number) => +(dataMax * 1.03).toFixed(2)
+                (dataMin: number) => Math.floor(dataMin * 0.95),
+                (dataMax: number) => Math.ceil(dataMax * 1.03)
               ]}
               tick={{ fontSize: 9, fill: isDark ? '#94a3b8' : '#64748b' }}
               tickLine={false}
               axisLine={false}
-              tickFormatter={(val: number) => `$${val.toFixed(2)}`}
+              tickFormatter={(val: number) => `${Math.round(val)} HTG`}
             />
             <Tooltip
               content={({ active, payload }) => {
@@ -211,15 +202,9 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
                   >
                     <div className="font-semibold text-slate-300 mb-1">{point.fullDate}</div>
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-orange-400 font-medium">Prix Revendeur :</span>
+                      <span className="text-orange-400 font-medium">Prix PlayUp :</span>
                       <span className="font-mono font-bold text-orange-300">
-                        ${point.resellerPrice.toFixed(2)} {currency}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-slate-400">Prix Public :</span>
-                      <span className="font-mono font-semibold text-slate-200">
-                        ${point.publicPrice.toFixed(2)} {currency}
+                        {formatHtg(point.publicPrice)}
                       </span>
                     </div>
                   </div>
@@ -234,22 +219,11 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
             <Area
               type="monotone"
               dataKey="publicPrice"
-              stroke={isDark ? '#64748b' : '#94a3b8'}
-              strokeWidth={1.5}
-              strokeDasharray="3 3"
-              fillOpacity={1}
-              fill={`url(#${publicGradientId})`}
-              name="Prix Public"
-              isAnimationActive={false}
-            />
-            <Area
-              type="monotone"
-              dataKey="resellerPrice"
               stroke="#ea580c"
               strokeWidth={2}
               fillOpacity={1}
               fill={`url(#${gradientId})`}
-              name="Tarif Revendeur"
+              name="Prix PlayUp (HTG)"
               isAnimationActive={false}
             />
           </AreaChart>
@@ -267,15 +241,15 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
             Plus bas (30j)
           </span>
           <span className="font-mono font-bold text-emerald-500">
-            ${minPrice.toFixed(2)} {currency}
+            {formatHtg(minPrice)}
           </span>
         </div>
         <div>
           <span className={`block ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-            Moyenne B2B (30j)
+            Moyenne (30j)
           </span>
           <span className={`font-mono font-bold ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>
-            ${avgPrice.toFixed(2)} {currency}
+            {formatHtg(avgPrice)}
           </span>
         </div>
         <div className="text-right">
@@ -283,7 +257,7 @@ export const ProductPriceHistoryChart: React.FC<ProductPriceHistoryChartProps> =
             Plus haut (30j)
           </span>
           <span className={`font-mono font-semibold ${isDark ? 'text-slate-300' : 'text-slate-600'}`}>
-            ${maxPrice.toFixed(2)} {currency}
+            {formatHtg(maxPrice)}
           </span>
         </div>
       </div>

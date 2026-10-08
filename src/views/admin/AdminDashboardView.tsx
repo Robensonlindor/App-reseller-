@@ -7,7 +7,8 @@ import {
 } from 'lucide-react';
 import { 
   Game, Service, ServicePackage, Provider, Reseller, Order, SupportTicket, 
-  AppSettings, SystemLog, GameField, AppUser, ApiKey, PaymentGatewayConfig, PaymentTransaction
+  AppSettings, SystemLog, GameField, AppUser, ApiKey, PaymentGatewayConfig, PaymentTransaction,
+  PriceChangeHistoryEntry
 } from '../../types';
 import { apiClient } from '../../services/apiClient';
 import { safeStorage } from '../../lib/safeStorage';
@@ -46,6 +47,11 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [logs, setLogs] = useState<SystemLog[]>([]);
+  const [priceHistory, setPriceHistory] = useState<PriceChangeHistoryEntry[]>([]);
+  const [exchangeRateInput, setExchangeRateInput] = useState<string>('132');
+  const [savingExchangeRate, setSavingExchangeRate] = useState<boolean>(false);
+  const [inlinePriceInputsHtg, setInlinePriceInputsHtg] = useState<Record<string, string>>({});
+  const [savingPkgPriceId, setSavingPkgPriceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   // Modals & Filters
@@ -113,7 +119,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       const [
         gamesData, servicesData, providersData, 
         ordersData, usersData, resellersData, apiKeysData,
-        gatewaysData, txData, ticketsData, settingsData, logsData
+        gatewaysData, txData, ticketsData, settingsData, logsData, pricingHistoryData
       ] = await Promise.all([
         apiClient.getAdminGames(token).catch(() => []),
         apiClient.getAdminServices(token).catch(() => []),
@@ -126,7 +132,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
         apiClient.getAdminPaymentTransactions(token).catch(() => []),
         apiClient.getAdminSupport(token).catch(() => []),
         apiClient.getSettings().catch(() => null),
-        apiClient.getAdminLogs(token).catch(() => [])
+        apiClient.getAdminLogs(token).catch(() => []),
+        apiClient.getPricingHistory(token, { limit: 100 }).catch(() => null)
       ]);
 
       if (statsData?.metrics) setStats(statsData.metrics);
@@ -140,7 +147,30 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       setPaymentGateways(gatewaysData);
       setPaymentTransactions(txData);
       setTickets(ticketsData);
-      if (settingsData) setSettings(settingsData);
+      if (settingsData) {
+        setSettings(settingsData);
+        if (settingsData.usdToHtgExchangeRate) {
+          setExchangeRateInput(String(settingsData.usdToHtgExchangeRate));
+        }
+      }
+      if (pricingHistoryData) {
+        setPriceHistory(pricingHistoryData.history || []);
+        if (pricingHistoryData.usdToHtgExchangeRate) {
+          setExchangeRateInput(String(pricingHistoryData.usdToHtgExchangeRate));
+        }
+      }
+      const nextInlinePrices: Record<string, string> = {};
+      const activeRate = pricingHistoryData?.usdToHtgExchangeRate || settingsData?.usdToHtgExchangeRate || 132;
+      for (const srv of servicesData || []) {
+        for (const pkg of srv.packages || []) {
+          const htgVal =
+            typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+              ? pkg.publicPriceHtg
+              : Number((Number(pkg.publicPrice || 0) * activeRate).toFixed(2));
+          nextInlinePrices[pkg.id] = String(htgVal);
+        }
+      }
+      setInlinePriceInputsHtg(nextInlinePrices);
       setLogs(logsData);
     } catch (err: any) {
       safeStorage.removeItem('playup_admin_token');
@@ -256,10 +286,86 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
     try {
       await apiClient.saveAdminService(token, editingService, isNewService);
       setEditingService(null);
-      setAdminFeedback({ type: 'success', text: 'Service et grille tarifaire enregistrés.' });
+      setAdminFeedback({
+        type: 'success',
+        text: 'Service et prix de vente en HTG enregistrés dans l’historique et appliqués en temps réel.'
+      });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
       loadAllAdminData();
     } catch (e: any) {
       setAdminFeedback({ type: 'error', text: e.message });
+    }
+  };
+
+  const handleUpdateExchangeRate = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!token) return;
+    const numRate = Number(exchangeRateInput);
+    if (!Number.isFinite(numRate) || numRate <= 0) {
+      setAdminFeedback({
+        type: 'error',
+        text: 'Veuillez saisir un taux de change USD → HTG valide (supérieur à 0).'
+      });
+      return;
+    }
+    setSavingExchangeRate(true);
+    try {
+      const res = await apiClient.updateUsdToHtgExchangeRate(token, {
+        usdToHtgExchangeRate: numRate,
+        reason: `Modification manuelle du taux de change USD → HTG depuis l'administration (1 USD = ${numRate} HTG)`
+      });
+      setServices(res.services || []);
+      if (res.settings) setSettings(res.settings);
+      if (res.history) setPriceHistory(res.history);
+      setExchangeRateInput(String(res.newExchangeRate));
+      setAdminFeedback({
+        type: 'success',
+        text: res.message
+      });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
+    } catch (err: any) {
+      setAdminFeedback({
+        type: 'error',
+        text: err.message || 'Erreur lors de la mise à jour du taux de change USD → HTG.'
+      });
+    } finally {
+      setSavingExchangeRate(false);
+    }
+  };
+
+  const handleSaveManualPriceHtg = async (serviceId: string, pkg: ServicePackage) => {
+    if (!token) return;
+    const rawVal = inlinePriceInputsHtg[pkg.id];
+    const numPriceHtg = Number(rawVal);
+    if (!Number.isFinite(numPriceHtg) || numPriceHtg <= 0) {
+      setAdminFeedback({
+        type: 'error',
+        text: 'Veuillez saisir un prix de vente final en HTG valide (supérieur à 0).'
+      });
+      return;
+    }
+    setSavingPkgPriceId(pkg.id);
+    try {
+      const res = await apiClient.updateManualServicePriceHtg(token, {
+        serviceId,
+        packageId: pkg.id,
+        productKey: pkg.productKey || pkg.externalProductId,
+        sellingPriceHtg: numPriceHtg
+      });
+      setServices(res.services || []);
+      if (res.history) setPriceHistory(res.history);
+      setAdminFeedback({
+        type: 'success',
+        text: res.message
+      });
+      window.dispatchEvent(new CustomEvent('playup:pricing-updated'));
+    } catch (err: any) {
+      setAdminFeedback({
+        type: 'error',
+        text: err.message || 'Erreur lors de la sauvegarde du prix de vente en HTG.'
+      });
+    } finally {
+      setSavingPkgPriceId(null);
     }
   };
 
@@ -877,10 +983,71 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                 </button>
               </div>
 
+              {/* USD Reference Currency -> HTG Selling Price Configurator */}
+              <div className="bg-slate-900 text-white border border-slate-800 rounded-2xl p-5 sm:p-6 space-y-4 shadow-sm">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-orange-500/20 text-orange-300 text-[10px] font-bold uppercase tracking-wider">
+                        Devise de Référence : USD
+                      </span>
+                      <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold uppercase tracking-wider">
+                        Devise de Vente PlayUp : HTG
+                      </span>
+                      <span className="px-2.5 py-0.5 rounded-full bg-sky-500/20 text-sky-300 text-[10px] font-bold uppercase tracking-wider">
+                        Temps Réel &amp; Historique Actifs
+                      </span>
+                    </div>
+                    <h3 className="font-display text-base sm:text-lg font-bold text-white">
+                      Taux de Change Officiel USD → HTG &amp; Calcul Automatique des Coûts / Marges
+                    </h3>
+                    <p className="text-xs text-slate-300 max-w-3xl">
+                      Les prix fournisseurs RechargeGames sont enregistrés en <strong>USD</strong> et ne sont <strong>jamais modifiés</strong>. Le système calcule automatiquement le coût fournisseur en <strong>HTG</strong>, le bénéfice en <strong>HTG</strong> et la marge. Le client voit uniquement le prix final PlayUp en <strong>HTG</strong>.
+                    </p>
+                  </div>
+
+                  <form
+                    onSubmit={handleUpdateExchangeRate}
+                    className="bg-slate-800/90 border border-slate-700 rounded-2xl p-3.5 flex flex-wrap items-center gap-3 shrink-0"
+                  >
+                    <div>
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                        Taux de change (1 USD → HTG)
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-mono font-bold text-slate-300">1 USD =</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="1"
+                          value={exchangeRateInput}
+                          onChange={(e) => setExchangeRateInput(e.target.value)}
+                          className="w-28 bg-slate-900 border border-slate-600 focus:border-orange-500 rounded-xl px-3 py-1.5 text-sm font-mono font-bold text-orange-400 focus:outline-none"
+                        />
+                        <span className="text-xs font-mono font-bold text-emerald-400">HTG</span>
+                      </div>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={savingExchangeRate}
+                      className="px-4 py-2.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5"
+                    >
+                      {savingExchangeRate ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                      )}
+                      <span>Appliquer en Temps Réel</span>
+                    </button>
+                  </form>
+                </div>
+              </div>
+
               <div className="space-y-6">
                 {services.map(service => {
                   const game = games.find(g => g.id === service.gameId);
                   const provider = providers.find(p => p.id === service.providerId);
+                  const activeRate = Number(exchangeRateInput) > 0 ? Number(exchangeRateInput) : (settings?.usdToHtgExchangeRate || 132);
 
                   return (
                     <div key={service.id} className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
@@ -899,7 +1066,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                         <div className="flex items-center gap-3 text-xs">
                           <span className="text-slate-500">Fournisseur assigné :</span>
                           <span className="font-semibold text-slate-800 bg-slate-100 px-2.5 py-1 rounded-lg">
-                            {provider?.name || 'GoXtop'}
+                            {provider?.name || 'RechargeGames'}
                           </span>
                           <button
                             onClick={() => {
@@ -909,7 +1076,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                             className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg font-semibold flex items-center gap-1"
                           >
                             <Edit className="w-3.5 h-3.5" />
-                            <span>Gérer Packages &amp; Prix</span>
+                            <span>Gérer Packages &amp; Prix (HTG)</span>
                           </button>
                         </div>
                       </div>
@@ -917,28 +1084,99 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                       <div className="overflow-x-auto">
                         <table className="w-full text-left text-xs">
                           <thead>
-                            <tr className="border-b border-slate-100 text-slate-400 font-semibold">
-                              <th className="py-2 px-3">Package</th>
-                              <th className="py-2 px-3">Code Produit Externe</th>
-                              <th className="py-2 px-3">Quantité</th>
-                              <th className="py-2 px-3">Prix Public</th>
-                              <th className="py-2 px-3">Prix Reseller</th>
-                              <th className="py-2 px-3">Coût Fournisseur</th>
-                              <th className="py-2 px-3">Marge B2B</th>
+                            <tr className="border-b border-slate-100 text-slate-500 font-semibold">
+                              <th className="py-2 px-3">Service / Package</th>
+                              <th className="py-2 px-3">Code Produit</th>
+                              <th className="py-2 px-3">Prix Fournisseur (USD — Immuable)</th>
+                              <th className="py-2 px-3">Coût Fournisseur Auto (HTG)</th>
+                              <th className="py-2 px-3">Prix de Vente Final PlayUp (HTG — Manuel)</th>
+                              <th className="py-2 px-3">Bénéfice Auto (HTG)</th>
+                              <th className="py-2 px-3">Marge Auto (HTG / %)</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100 font-mono">
                             {service.packages.map(pkg => {
-                              const margin = pkg.resellerPrice - pkg.supplierCost;
+                              const supplierUsd = Number(
+                                (typeof pkg.supplierCostUsd === 'number' && pkg.supplierCostUsd > 0
+                                  ? pkg.supplierCostUsd
+                                  : pkg.supplierCost || 0
+                                ).toFixed(2)
+                              );
+                              const autoSupplierCostHtg = Number((supplierUsd * activeRate).toFixed(2));
+                              const currentInputStr =
+                                inlinePriceInputsHtg[pkg.id] !== undefined
+                                  ? inlinePriceInputsHtg[pkg.id]
+                                  : String(
+                                      typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+                                        ? pkg.publicPriceHtg
+                                        : Number((Number(pkg.publicPrice || 0) * activeRate).toFixed(2))
+                                    );
+                              const effectiveSellingHtg = Number(currentInputStr) > 0 ? Number(currentInputStr) : 0;
+                              const autoProfitHtg = Number((effectiveSellingHtg - autoSupplierCostHtg).toFixed(2));
+                              const autoMarginPercent =
+                                autoSupplierCostHtg > 0
+                                  ? Number(((autoProfitHtg / autoSupplierCostHtg) * 100).toFixed(2))
+                                  : 0;
+
                               return (
-                                <tr key={pkg.id}>
-                                  <td className="py-2.5 px-3 font-sans font-semibold text-slate-900">{pkg.name}</td>
-                                  <td className="py-2.5 px-3 text-[11px] text-slate-500">{pkg.externalProductId || '—'}</td>
-                                  <td className="py-2.5 px-3">{pkg.amount} {pkg.unit}</td>
-                                  <td className="py-2.5 px-3 font-bold">${pkg.publicPrice.toFixed(2)}</td>
-                                  <td className="py-2.5 px-3 text-orange-600 font-bold">${pkg.resellerPrice.toFixed(2)}</td>
-                                  <td className="py-2.5 px-3 text-slate-500">${pkg.supplierCost.toFixed(2)}</td>
-                                  <td className="py-2.5 px-3 text-emerald-600 font-bold">+${margin.toFixed(2)}</td>
+                                <tr key={pkg.id} className="hover:bg-slate-50/80">
+                                  <td className="py-2.5 px-3 font-sans">
+                                    <div className="font-semibold text-slate-900">{pkg.name}</div>
+                                    <div className="text-[10px] text-slate-400">
+                                      {pkg.amount} {pkg.unit} · Client voit uniquement : <strong>{effectiveSellingHtg} HTG</strong>
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-[11px] text-slate-500">
+                                    {pkg.productKey || pkg.externalProductId || '—'}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100 text-slate-700 font-bold text-xs" title="Prix fournisseur RechargeGames en USD — Ne jamais modifier">
+                                      <Lock className="w-3 h-3 text-slate-400" />
+                                      ${supplierUsd.toFixed(2)} USD
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 font-bold text-slate-700">
+                                    {autoSupplierCostHtg.toFixed(2)} HTG
+                                    <span className="block text-[10px] font-sans text-slate-400 font-normal">
+                                      (${supplierUsd.toFixed(2)} × {activeRate})
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="flex items-center gap-1.5">
+                                      <input
+                                        type="number"
+                                        step="1"
+                                        min="1"
+                                        value={currentInputStr}
+                                        onChange={(e) =>
+                                          setInlinePriceInputsHtg(prev => ({
+                                            ...prev,
+                                            [pkg.id]: e.target.value
+                                          }))
+                                        }
+                                        className="w-24 border border-orange-300 focus:border-orange-600 rounded-lg px-2 py-1 text-xs font-mono font-bold text-orange-700 bg-orange-50/40"
+                                      />
+                                      <span className="text-[10px] font-bold text-slate-500">HTG</span>
+                                      <button
+                                        type="button"
+                                        disabled={savingPkgPriceId === pkg.id}
+                                        onClick={() => handleSaveManualPriceHtg(service.id, pkg)}
+                                        className="px-2.5 py-1 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 text-white font-sans font-semibold rounded-lg text-[11px] transition-colors"
+                                      >
+                                        {savingPkgPriceId === pkg.id ? '...' : 'Enregistrer'}
+                                      </button>
+                                    </div>
+                                  </td>
+                                  <td className={`py-2.5 px-3 font-bold ${autoProfitHtg >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                    {autoProfitHtg >= 0 ? '+' : ''}{autoProfitHtg.toFixed(2)} HTG
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                                      autoMarginPercent >= 0 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-rose-50 text-rose-700 border border-rose-200'
+                                    }`}>
+                                      {autoProfitHtg >= 0 ? '+' : ''}{autoProfitHtg.toFixed(2)} HTG ({autoMarginPercent >= 0 ? '+' : ''}{autoMarginPercent.toFixed(1)}%)
+                                    </span>
+                                  </td>
                                 </tr>
                               );
                             })}
@@ -948,6 +1186,102 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
                     </div>
                   );
                 })}
+              </div>
+
+              {/* Price & Exchange Rate Modification Audit History */}
+              <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                  <div>
+                    <h3 className="font-display text-base font-bold text-slate-900">
+                      Historique des Modifications (Taux de Change USD → HTG &amp; Prix de Vente HTG)
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Toutes les modifications du taux de change et des prix de vente finaux en HTG sont enregistrées dans cet historique et appliquées en temps réel.
+                    </p>
+                  </div>
+                  <span className="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 text-xs font-semibold">
+                    {priceHistory.length} entrée(s)
+                  </span>
+                </div>
+
+                {priceHistory.length === 0 ? (
+                  <p className="text-xs text-slate-400 py-3">
+                    Aucune modification enregistrée pour le moment. Modifiez le taux de change USD → HTG ou un prix de vente HTG ci-dessus pour voir l’entrée apparaître instantanément.
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-100 text-slate-400 font-semibold">
+                          <th className="py-2 px-3">Date &amp; Heure</th>
+                          <th className="py-2 px-3">Type</th>
+                          <th className="py-2 px-3">Service / Produit</th>
+                          <th className="py-2 px-3">Taux USD → HTG</th>
+                          <th className="py-2 px-3">Prix Fournisseur (USD)</th>
+                          <th className="py-2 px-3">Coût Fournisseur (HTG)</th>
+                          <th className="py-2 px-3">Prix Vente PlayUp (HTG)</th>
+                          <th className="py-2 px-3">Bénéfice &amp; Marge (HTG)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {priceHistory.map(entry => (
+                          <tr key={entry.id} className="hover:bg-slate-50">
+                            <td className="py-2.5 px-3 font-mono text-[11px] text-slate-500">
+                              {new Date(entry.timestamp).toLocaleString('fr-FR')}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                entry.changeType === 'exchange_rate'
+                                  ? 'bg-sky-100 text-sky-800'
+                                  : entry.changeType === 'manual_price_htg'
+                                  ? 'bg-orange-100 text-orange-800'
+                                  : 'bg-slate-100 text-slate-700'
+                              }`}>
+                                {entry.changeType === 'exchange_rate'
+                                  ? 'Taux USD → HTG'
+                                  : entry.changeType === 'manual_price_htg'
+                                  ? 'Prix Manuel HTG'
+                                  : 'Marge'}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 font-semibold text-slate-800">
+                              {entry.packageName
+                                ? `${entry.serviceName ? `${entry.serviceName} — ` : ''}${entry.packageName}`
+                                : entry.reason}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono">
+                              {entry.previousExchangeRate && entry.previousExchangeRate !== entry.newExchangeRate
+                                ? `${entry.previousExchangeRate} → ${entry.newExchangeRate} HTG`
+                                : `1 USD = ${entry.newExchangeRate || Number(exchangeRateInput) || settings?.usdToHtgExchangeRate || 132} HTG`}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-slate-600">
+                              {typeof entry.supplierCostUsd === 'number'
+                                ? `$${entry.supplierCostUsd.toFixed(2)} USD`
+                                : '—'}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-slate-700">
+                              {typeof entry.newSupplierCostHtg === 'number'
+                                ? `${entry.newSupplierCostHtg.toFixed(2)} HTG`
+                                : '—'}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono font-bold text-orange-600">
+                              {typeof entry.newSellingPriceHtg === 'number'
+                                ? entry.previousSellingPriceHtg && entry.previousSellingPriceHtg !== entry.newSellingPriceHtg
+                                  ? `${entry.previousSellingPriceHtg} → ${entry.newSellingPriceHtg} HTG`
+                                  : `${entry.newSellingPriceHtg} HTG`
+                                : '—'}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono font-bold text-emerald-600">
+                              {typeof entry.profitHtg === 'number'
+                                ? `+${entry.profitHtg.toFixed(2)} HTG (${entry.marginPercent?.toFixed(1) || 0}%)`
+                                : '—'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1952,84 +2286,99 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
               </div>
 
               <div className="space-y-2">
-                {editingService.packages?.map((pkg, idx) => (
-                  <div key={pkg.id || idx} className="p-3 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-2 sm:grid-cols-6 gap-2 items-center">
-                    <input
-                      type="text"
-                      value={pkg.name}
-                      onChange={(e) => {
-                        const list = [...(editingService.packages || [])];
-                        list[idx].name = e.target.value;
-                        setEditingService({ ...editingService, packages: list });
-                      }}
-                      placeholder="Nom pack"
-                      className="border border-slate-300 rounded-lg px-2 py-1.5 bg-white"
-                    />
-                    <input
-                      type="text"
-                      value={pkg.externalProductId || ''}
-                      onChange={(e) => {
-                        const list = [...(editingService.packages || [])];
-                        list[idx].externalProductId = e.target.value;
-                        setEditingService({ ...editingService, packages: list });
-                      }}
-                      placeholder="ID GoXtop"
-                      className="border border-slate-300 rounded-lg px-2 py-1.5 font-mono bg-white"
-                    />
-                    <div>
-                      <span className="text-[10px] text-slate-400 block">Public ($)</span>
+                {editingService.packages?.map((pkg, idx) => {
+                  const activeRate = Number(exchangeRateInput) > 0 ? Number(exchangeRateInput) : (settings?.usdToHtgExchangeRate || 132);
+                  const immutableUsd = Number(
+                    (typeof pkg.supplierCostUsd === 'number' && pkg.supplierCostUsd > 0
+                      ? pkg.supplierCostUsd
+                      : pkg.supplierCost || 0
+                    ).toFixed(2)
+                  );
+                  const autoCostHtg = Number((immutableUsd * activeRate).toFixed(2));
+                  const currentPriceHtg =
+                    typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+                      ? pkg.publicPriceHtg
+                      : Number((Number(pkg.publicPrice || 0) * activeRate).toFixed(2));
+                  const autoProfitHtg = Number((currentPriceHtg - autoCostHtg).toFixed(2));
+                  const autoMarginPct =
+                    autoCostHtg > 0 ? Number(((autoProfitHtg / autoCostHtg) * 100).toFixed(2)) : 0;
+
+                  return (
+                    <div key={pkg.id || idx} className="p-3 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-2 sm:grid-cols-6 gap-2 items-center">
                       <input
-                        type="number"
-                        step="0.01"
-                        value={pkg.publicPrice}
+                        type="text"
+                        value={pkg.name}
                         onChange={(e) => {
                           const list = [...(editingService.packages || [])];
-                          list[idx].publicPrice = Number(e.target.value);
+                          list[idx].name = e.target.value;
                           setEditingService({ ...editingService, packages: list });
                         }}
-                        className="w-full border border-slate-300 rounded-lg px-2 py-1 font-mono bg-white"
+                        placeholder="Nom pack"
+                        className="border border-slate-300 rounded-lg px-2 py-1.5 bg-white"
                       />
-                    </div>
-                    <div>
-                      <span className="text-[10px] text-slate-400 block">Reseller ($)</span>
                       <input
-                        type="number"
-                        step="0.01"
-                        value={pkg.resellerPrice}
+                        type="text"
+                        value={pkg.externalProductId || ''}
                         onChange={(e) => {
                           const list = [...(editingService.packages || [])];
-                          list[idx].resellerPrice = Number(e.target.value);
+                          list[idx].externalProductId = e.target.value;
                           setEditingService({ ...editingService, packages: list });
                         }}
-                        className="w-full border border-slate-300 rounded-lg px-2 py-1 font-mono bg-white"
+                        placeholder="ID Produit"
+                        className="border border-slate-300 rounded-lg px-2 py-1.5 font-mono bg-white"
                       />
+                      <div>
+                        <span className="text-[10px] text-slate-400 block">Fournisseur USD (Fixe)</span>
+                        <div className="w-full border border-slate-200 rounded-lg px-2 py-1 font-mono bg-slate-100 text-slate-600 font-bold flex items-center gap-1">
+                          <Lock className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span>${immutableUsd.toFixed(2)}</span>
+                        </div>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-400 block">Coût Auto (HTG)</span>
+                        <div className="w-full border border-slate-200 rounded-lg px-2 py-1 font-mono bg-slate-100 text-slate-700 font-bold">
+                          {autoCostHtg.toFixed(2)} HTG
+                        </div>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-orange-600 font-bold block">Prix Vente Final (HTG)</span>
+                        <input
+                          type="number"
+                          step="1"
+                          min="1"
+                          value={currentPriceHtg}
+                          onChange={(e) => {
+                            const newHtg = Number(e.target.value);
+                            const list = [...(editingService.packages || [])];
+                            list[idx].publicPriceHtg = newHtg;
+                            list[idx].publicPrice = activeRate > 0 ? Number((newHtg / activeRate).toFixed(2)) : list[idx].publicPrice;
+                            list[idx].manualPriceHtgDefined = true;
+                            setEditingService({ ...editingService, packages: list });
+                          }}
+                          className="w-full border border-orange-400 rounded-lg px-2 py-1 font-mono font-bold text-orange-700 bg-white"
+                        />
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <span className="text-[10px] text-slate-400 block">Bénéfice / Marge HTG</span>
+                          <span className={`font-mono font-bold text-[11px] ${autoProfitHtg >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                            {autoProfitHtg >= 0 ? '+' : ''}{autoProfitHtg.toFixed(1)} HTG ({autoMarginPct.toFixed(0)}%)
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const list = (editingService.packages || []).filter((_, i) => i !== idx);
+                            setEditingService({ ...editingService, packages: list });
+                          }}
+                          className="text-red-600 hover:underline text-[10px]"
+                        >
+                          Suppr.
+                        </button>
+                      </div>
                     </div>
-                    <div>
-                      <span className="text-[10px] text-slate-400 block">Coût ($)</span>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={pkg.supplierCost}
-                        onChange={(e) => {
-                          const list = [...(editingService.packages || [])];
-                          list[idx].supplierCost = Number(e.target.value);
-                          setEditingService({ ...editingService, packages: list });
-                        }}
-                        className="w-full border border-slate-300 rounded-lg px-2 py-1 font-mono bg-white"
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const list = (editingService.packages || []).filter((_, i) => i !== idx);
-                        setEditingService({ ...editingService, packages: list });
-                      }}
-                      className="text-red-600 hover:underline justify-self-end"
-                    >
-                      Supprimer
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 

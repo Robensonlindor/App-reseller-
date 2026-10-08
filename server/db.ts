@@ -18,7 +18,7 @@ import {
   PaymentRequestRecord, PaymentAuditEventType, PaymentAuditLogEntry, AntiFraudIncidentRecord,
   PaymentIdempotentOperationType, PaymentIdempotencyRecord, PaymentSecurityNonceRecord, PaymentSecurityRateLimitLog,
   PaymentProofRecord, ValidatedPaymentRecord, IdempotencyKeyRecord, WalletTransactionType, WalletTransactionRecord, AuditLogRecord, WalletLedgerReconciliation,
-  Wallet2FAChannel, Wallet2FAOperationType, Wallet2FAChallengeRecord
+  Wallet2FAChannel, Wallet2FAOperationType, Wallet2FAChallengeRecord, PriceChangeHistoryEntry
 } from '../src/types';
 import { 
   INITIAL_GAMES, INITIAL_SERVICES, INITIAL_PROVIDERS, 
@@ -216,6 +216,7 @@ export interface DatabaseSchema {
   paymentIdempotencyRecords?: Record<string, PaymentIdempotencyRecord>;
   paymentSecurityNonces?: Record<string, PaymentSecurityNonceRecord>;
   paymentRateLimitLogs?: PaymentSecurityRateLimitLog[];
+  priceChangeHistory?: PriceChangeHistoryEntry[];
 }
 
 export class PlayUpDatabase {
@@ -567,6 +568,36 @@ export class PlayUpDatabase {
       this.data.games = uniqueGames;
     }
 
+    // Ensure USD reference currency and HTG selling currency + exchange rate in settings & services
+    if (!this.data.settings) {
+      this.data.settings = INITIAL_SETTINGS;
+      changed = true;
+    }
+    if (
+      typeof this.data.settings.usdToHtgExchangeRate !== 'number' ||
+      !Number.isFinite(this.data.settings.usdToHtgExchangeRate) ||
+      this.data.settings.usdToHtgExchangeRate <= 0
+    ) {
+      this.data.settings.usdToHtgExchangeRate = 132;
+      changed = true;
+    }
+    if (this.data.settings.referenceCurrency !== 'USD') {
+      this.data.settings.referenceCurrency = 'USD';
+      changed = true;
+    }
+    if (this.data.settings.sellingCurrency !== 'HTG') {
+      this.data.settings.sellingCurrency = 'HTG';
+      changed = true;
+    }
+    if (!this.data.priceChangeHistory) {
+      this.data.priceChangeHistory = [];
+      changed = true;
+    }
+
+    if (this.recalculateAllServicesAndProductsHtgInMemory()) {
+      changed = true;
+    }
+
     if (changed) {
       this.save();
     }
@@ -670,11 +701,123 @@ export class PlayUpDatabase {
   }
 
   public getServices(): Service[] {
+    this.recalculateAllServicesAndProductsHtgInMemory();
     return this.data.services;
   }
 
-  public setServices(services: Service[]) {
-    this.data.services = services;
+  public setServices(
+    services: Service[],
+    adminMeta?: { adminId?: string; adminEmail?: string; reason?: string }
+  ) {
+    const rate = this.getUsdToHtgExchangeRate();
+    const existingPkgMap = new Map<string, { serviceName: string; pkg: any }>();
+    for (const srv of this.data.services || []) {
+      for (const pkg of srv.packages || []) {
+        existingPkgMap.set(pkg.id, { serviceName: srv.name, pkg: { ...pkg } });
+      }
+    }
+
+    const manualPricesMap: Record<string, number> = {
+      ...(this.data.rechargeGamesMargins?.manualPricesHtg || {})
+    };
+
+    const normalizedServices: Service[] = services.map(srv => ({
+      ...srv,
+      packages: (srv.packages || []).map(pkg => {
+        const prevEntry = existingPkgMap.get(pkg.id);
+        const prevPkg = prevEntry?.pkg;
+
+        // Rule: NEVER modify the supplier price in USD from RechargeGames once recorded
+        const immutableSupplierUsd =
+          prevPkg && typeof prevPkg.supplierCostUsd === 'number' && prevPkg.supplierCostUsd > 0
+            ? prevPkg.supplierCostUsd
+            : prevPkg && typeof prevPkg.supplierCost === 'number' && prevPkg.supplierCost > 0
+            ? prevPkg.supplierCost
+            : Number(pkg.supplierCostUsd ?? pkg.supplierCost ?? 0);
+
+        const supplierCostUsd = Number(Math.max(0, immutableSupplierUsd).toFixed(2));
+        const supplierCostHtg = Number((supplierCostUsd * rate).toFixed(2));
+
+        let publicPriceHtg: number;
+        if (typeof pkg.publicPriceHtg === 'number' && Number.isFinite(pkg.publicPriceHtg) && pkg.publicPriceHtg > 0) {
+          publicPriceHtg = Number(pkg.publicPriceHtg.toFixed(2));
+        } else if (prevPkg && typeof prevPkg.publicPriceHtg === 'number' && prevPkg.publicPriceHtg > 0 && pkg.publicPrice === prevPkg.publicPrice) {
+          publicPriceHtg = Number(prevPkg.publicPriceHtg.toFixed(2));
+        } else {
+          publicPriceHtg = Number(( Number(pkg.publicPrice || 0) * rate ).toFixed(2));
+        }
+
+        const publicPriceUsdEquiv = rate > 0 ? Number((publicPriceHtg / rate).toFixed(2)) : Number(pkg.publicPrice || 0);
+        const resellerPriceHtg =
+          typeof pkg.resellerPriceHtg === 'number' && pkg.resellerPriceHtg > 0
+            ? Number(pkg.resellerPriceHtg.toFixed(2))
+            : Number((Number(pkg.resellerPrice || publicPriceUsdEquiv * 0.9) * rate).toFixed(2));
+
+        const profitHtg = Number((publicPriceHtg - supplierCostHtg).toFixed(2));
+        const marginHtg =
+          supplierCostHtg > 0 ? Number(((profitHtg / supplierCostHtg) * 100).toFixed(2)) : 0;
+
+        const pKey = pkg.productKey || pkg.externalProductId;
+        const isManualChanged =
+          prevPkg &&
+          typeof prevPkg.publicPriceHtg === 'number' &&
+          Math.abs(prevPkg.publicPriceHtg - publicPriceHtg) >= 0.01;
+
+        const manualPriceHtgDefined = Boolean(
+          pkg.manualPriceHtgDefined || isManualChanged || prevPkg?.manualPriceHtgDefined
+        );
+
+        if (pKey && manualPriceHtgDefined) {
+          manualPricesMap[pKey] = publicPriceHtg;
+        }
+
+        if (isManualChanged) {
+          this.recordPriceChangeHistory({
+            changeType: 'manual_price_htg',
+            serviceId: srv.id,
+            serviceName: srv.name,
+            packageId: pkg.id,
+            packageName: pkg.name,
+            productKey: pKey,
+            supplierCostUsd,
+            previousSupplierCostHtg: prevPkg?.supplierCostHtg ?? supplierCostHtg,
+            newSupplierCostHtg: supplierCostHtg,
+            previousSellingPriceHtg: prevPkg.publicPriceHtg,
+            newSellingPriceHtg: publicPriceHtg,
+            profitHtg,
+            marginPercent: marginHtg,
+            previousExchangeRate: rate,
+            newExchangeRate: rate,
+            adminId: adminMeta?.adminId || 'admin',
+            adminEmail: adminMeta?.adminEmail,
+            reason: adminMeta?.reason || `Modification manuelle du prix de vente PlayUp en HTG (${srv.name} - ${pkg.name})`
+          });
+        }
+
+        return {
+          ...pkg,
+          supplierCost: supplierCostUsd,
+          supplierCostUsd,
+          supplierCostHtg,
+          publicPrice: publicPriceUsdEquiv,
+          publicPriceHtg,
+          resellerPrice: rate > 0 ? Number((resellerPriceHtg / rate).toFixed(2)) : pkg.resellerPrice,
+          resellerPriceHtg,
+          profitHtg,
+          marginHtg,
+          manualPriceHtgDefined,
+          referenceCurrency: 'USD',
+          sellingCurrency: 'HTG',
+          exchangeRateApplied: rate
+        };
+      })
+    }));
+
+    this.data.services = normalizedServices;
+    if (this.data.rechargeGamesMargins) {
+      this.data.rechargeGamesMargins.manualPricesHtg = manualPricesMap;
+    }
+    this.recalculateAllServicesAndProductsHtgInMemory();
     this.save();
   }
 
@@ -952,11 +1095,40 @@ export class PlayUpDatabase {
   }
 
   public getSettings(): AppSettings {
-    return this.data.settings;
+    const rate = this.getUsdToHtgExchangeRate();
+    return {
+      ...this.data.settings,
+      referenceCurrency: 'USD',
+      sellingCurrency: 'HTG',
+      usdToHtgExchangeRate: rate
+    };
   }
 
-  public setSettings(settings: AppSettings) {
-    this.data.settings = settings;
+  public setSettings(
+    settings: AppSettings,
+    adminMeta?: { adminId?: string; adminEmail?: string }
+  ) {
+    const prevRate = this.getUsdToHtgExchangeRate();
+    const incomingRate = Number(settings?.usdToHtgExchangeRate);
+    this.data.settings = {
+      ...settings,
+      referenceCurrency: 'USD',
+      sellingCurrency: 'HTG',
+      usdToHtgExchangeRate:
+        Number.isFinite(incomingRate) && incomingRate > 0 ? Number(incomingRate.toFixed(2)) : prevRate
+    };
+    if (
+      Number.isFinite(incomingRate) &&
+      incomingRate > 0 &&
+      Math.abs(incomingRate - prevRate) >= 0.001
+    ) {
+      this.setUsdToHtgExchangeRate(incomingRate, {
+        adminId: adminMeta?.adminId || 'admin',
+        adminEmail: adminMeta?.adminEmail,
+        reason: 'Mise à jour du taux de change USD → HTG depuis les Paramètres Système'
+      });
+      return;
+    }
     this.save();
   }
 
@@ -3554,28 +3726,543 @@ export class PlayUpDatabase {
   }
 
   public getRechargeGamesMargins(): RechargeGamesMarginConfig {
-    return (
-      this.data.rechargeGamesMargins || {
-        globalMarginPercent: 20,
-        gameMargins: {},
-        regionMargins: {},
-        productMargins: {},
-        updatedAt: new Date().toISOString()
-      }
-    );
+    const rate = this.getUsdToHtgExchangeRate();
+    const base = this.data.rechargeGamesMargins || {
+      globalMarginPercent: 20,
+      usdToHtgExchangeRate: rate,
+      gameMargins: {},
+      regionMargins: {},
+      productMargins: {},
+      manualPricesHtg: {},
+      updatedAt: new Date().toISOString()
+    };
+    return {
+      ...base,
+      usdToHtgExchangeRate: rate,
+      manualPricesHtg: base.manualPricesHtg || {}
+    };
+  }
+
+  public getUsdToHtgExchangeRate(): number {
+    const fromSettings = Number(this.data?.settings?.usdToHtgExchangeRate);
+    if (Number.isFinite(fromSettings) && fromSettings > 0) {
+      return Number(fromSettings.toFixed(2));
+    }
+    const fromMargins = Number(this.data?.rechargeGamesMargins?.usdToHtgExchangeRate);
+    if (Number.isFinite(fromMargins) && fromMargins > 0) {
+      return Number(fromMargins.toFixed(2));
+    }
+    return 132;
   }
 
   /**
-   * Computes final PlayUp customer price from RechargeGames provider_price using server-side margin rules
-   * Precedence: productMargins[product_key] > regionMargins[region] > gameMargins[game] > globalMarginPercent
+   * Updates the global USD -> HTG exchange rate, automatically recalculates all HTG supplier costs,
+   * updates margins/profits in HTG, and records the change in priceChangeHistory.
+   * Never modifies RechargeGames supplier USD prices.
+   */
+  public setUsdToHtgExchangeRate(
+    newRateInput: number,
+    options?: {
+      adminId?: string;
+      adminEmail?: string;
+      reason?: string;
+      recalculateAutoSellingPrices?: boolean;
+    }
+  ): {
+    previousExchangeRate: number;
+    newExchangeRate: number;
+    updatedServicesCount: number;
+    updatedPackagesCount: number;
+    updatedProductsCount: number;
+    historyEntry: PriceChangeHistoryEntry;
+  } {
+    const cleanRate = Number(Number(newRateInput).toFixed(2));
+    if (!Number.isFinite(cleanRate) || cleanRate <= 0) {
+      throw new Error('Le taux de change USD → HTG doit être un nombre supérieur à 0.');
+    }
+
+    const previousRate = this.getUsdToHtgExchangeRate();
+    if (!this.data.settings) {
+      this.data.settings = INITIAL_SETTINGS;
+    }
+    this.data.settings.usdToHtgExchangeRate = cleanRate;
+    this.data.settings.referenceCurrency = 'USD';
+    this.data.settings.sellingCurrency = 'HTG';
+
+    if (!this.data.rechargeGamesMargins) {
+      this.data.rechargeGamesMargins = {
+        globalMarginPercent: 20,
+        usdToHtgExchangeRate: cleanRate,
+        gameMargins: {},
+        regionMargins: {},
+        productMargins: {},
+        manualPricesHtg: {},
+        updatedAt: new Date().toISOString()
+      };
+    } else {
+      this.data.rechargeGamesMargins.usdToHtgExchangeRate = cleanRate;
+      this.data.rechargeGamesMargins.updatedAt = new Date().toISOString();
+    }
+
+    let updatedPackagesCount = 0;
+    const recalcAuto = options?.recalculateAutoSellingPrices === true;
+
+    for (const srv of this.data.services || []) {
+      for (const pkg of srv.packages || []) {
+        const supplierUsd = Number(
+          (typeof pkg.supplierCostUsd === 'number' && pkg.supplierCostUsd > 0
+            ? pkg.supplierCostUsd
+            : pkg.supplierCost || 0
+          ).toFixed(2)
+        );
+        const prevCostHtg = Number((supplierUsd * previousRate).toFixed(2));
+        const newCostHtg = Number((supplierUsd * cleanRate).toFixed(2));
+        const prevSellingHtg =
+          typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+            ? pkg.publicPriceHtg
+            : Number((Number(pkg.publicPrice || 0) * previousRate).toFixed(2));
+
+        let newSellingHtg = prevSellingHtg;
+        if (recalcAuto && !pkg.manualPriceHtgDefined) {
+          const pKey = pkg.productKey || pkg.externalProductId || '';
+          const calc = this.computePlayUpMarginAndPrice(supplierUsd, srv.externalGameId || srv.gameId, pkg.region || 'Global', pKey);
+          newSellingHtg = calc.playupPriceHtg;
+        }
+
+        const profitHtg = Number((newSellingHtg - newCostHtg).toFixed(2));
+        const marginHtg = newCostHtg > 0 ? Number(((profitHtg / newCostHtg) * 100).toFixed(2)) : 0;
+
+        pkg.supplierCost = supplierUsd; // Immutable USD supplier cost
+        pkg.supplierCostUsd = supplierUsd;
+        pkg.supplierCostHtg = newCostHtg;
+        pkg.publicPriceHtg = newSellingHtg;
+        pkg.publicPrice = cleanRate > 0 ? Number((newSellingHtg / cleanRate).toFixed(2)) : pkg.publicPrice;
+        pkg.profitHtg = profitHtg;
+        pkg.marginHtg = marginHtg;
+        pkg.referenceCurrency = 'USD';
+        pkg.sellingCurrency = 'HTG';
+        pkg.exchangeRateApplied = cleanRate;
+        updatedPackagesCount++;
+      }
+    }
+
+    this.recalculateAllServicesAndProductsHtgInMemory();
+
+    const historyEntry = this.recordPriceChangeHistory({
+      changeType: 'exchange_rate',
+      previousExchangeRate: previousRate,
+      newExchangeRate: cleanRate,
+      adminId: options?.adminId || 'admin',
+      adminEmail: options?.adminEmail,
+      reason:
+        options?.reason ||
+        `Mise à jour du taux de change de référence : 1 USD = ${cleanRate} HTG (précédent : ${previousRate} HTG)`
+    });
+
+    this.addSystemLog(
+      'info',
+      'system',
+      `[Pricing USD→HTG] Taux de change mis à jour : 1 USD = ${cleanRate} HTG (ancien: ${previousRate} HTG) par ${options?.adminEmail || options?.adminId || 'admin'}`
+    );
+
+    this.save();
+
+    return {
+      previousExchangeRate: previousRate,
+      newExchangeRate: cleanRate,
+      updatedServicesCount: (this.data.services || []).length,
+      updatedPackagesCount,
+      updatedProductsCount: (this.data.rechargeGamesProducts || []).length,
+      historyEntry
+    };
+  }
+
+  /**
+   * Manually sets the final selling price in HTG for a specific service package or RechargeGames product.
+   * Never modifies the supplier USD price. Automatically computes HTG supplier cost, HTG profit, and HTG margin.
+   */
+  public setManualServiceSellingPriceHtg(params: {
+    serviceId?: string;
+    packageId?: string;
+    productKey?: string;
+    sellingPriceHtg: number;
+    resellerPriceHtg?: number;
+    adminId?: string;
+    adminEmail?: string;
+    reason?: string;
+  }): {
+    updatedPackage?: any;
+    updatedProduct?: RechargeGamesProduct;
+    historyEntry: PriceChangeHistoryEntry;
+  } {
+    const cleanPriceHtg = Number(Number(params.sellingPriceHtg).toFixed(2));
+    if (!Number.isFinite(cleanPriceHtg) || cleanPriceHtg <= 0) {
+      throw new Error('Le prix de vente final en HTG doit être supérieur à 0.');
+    }
+
+    const rate = this.getUsdToHtgExchangeRate();
+    let matchedService: Service | undefined;
+    let matchedPkg: any | undefined;
+
+    for (const srv of this.data.services || []) {
+      for (const pkg of srv.packages || []) {
+        const matchesPkgId = params.packageId && pkg.id === params.packageId;
+        const matchesKey =
+          params.productKey &&
+          (pkg.productKey === params.productKey || pkg.externalProductId === params.productKey);
+        if (matchesPkgId || matchesKey) {
+          matchedService = srv;
+          matchedPkg = pkg;
+          break;
+        }
+      }
+      if (matchedPkg) break;
+    }
+
+    const pKey =
+      params.productKey ||
+      matchedPkg?.productKey ||
+      matchedPkg?.externalProductId ||
+      params.packageId ||
+      '';
+
+    if (!this.data.rechargeGamesMargins) {
+      this.data.rechargeGamesMargins = this.getRechargeGamesMargins();
+    }
+    if (!this.data.rechargeGamesMargins.manualPricesHtg) {
+      this.data.rechargeGamesMargins.manualPricesHtg = {};
+    }
+    if (pKey) {
+      this.data.rechargeGamesMargins.manualPricesHtg[pKey] = cleanPriceHtg;
+      this.data.rechargeGamesMargins.updatedAt = new Date().toISOString();
+    }
+
+    let supplierCostUsd = 0;
+    let prevSellingPriceHtg = cleanPriceHtg;
+
+    if (matchedPkg) {
+      // Never modify supplier USD cost
+      supplierCostUsd = Number(
+        (typeof matchedPkg.supplierCostUsd === 'number' && matchedPkg.supplierCostUsd > 0
+          ? matchedPkg.supplierCostUsd
+          : matchedPkg.supplierCost || 0
+        ).toFixed(2)
+      );
+      prevSellingPriceHtg =
+        typeof matchedPkg.publicPriceHtg === 'number' && matchedPkg.publicPriceHtg > 0
+          ? matchedPkg.publicPriceHtg
+          : Number((Number(matchedPkg.publicPrice || 0) * rate).toFixed(2));
+
+      const supplierCostHtg = Number((supplierCostUsd * rate).toFixed(2));
+      const profitHtg = Number((cleanPriceHtg - supplierCostHtg).toFixed(2));
+      const marginHtg =
+        supplierCostHtg > 0 ? Number(((profitHtg / supplierCostHtg) * 100).toFixed(2)) : 0;
+
+      matchedPkg.supplierCost = supplierCostUsd;
+      matchedPkg.supplierCostUsd = supplierCostUsd;
+      matchedPkg.supplierCostHtg = supplierCostHtg;
+      matchedPkg.publicPriceHtg = cleanPriceHtg;
+      matchedPkg.publicPrice = rate > 0 ? Number((cleanPriceHtg / rate).toFixed(2)) : matchedPkg.publicPrice;
+      if (typeof params.resellerPriceHtg === 'number' && params.resellerPriceHtg > 0) {
+        matchedPkg.resellerPriceHtg = Number(params.resellerPriceHtg.toFixed(2));
+        matchedPkg.resellerPrice = rate > 0 ? Number((matchedPkg.resellerPriceHtg / rate).toFixed(2)) : matchedPkg.resellerPrice;
+      }
+      matchedPkg.profitHtg = profitHtg;
+      matchedPkg.marginHtg = marginHtg;
+      matchedPkg.manualPriceHtgDefined = true;
+      matchedPkg.referenceCurrency = 'USD';
+      matchedPkg.sellingCurrency = 'HTG';
+      matchedPkg.exchangeRateApplied = rate;
+    }
+
+    let updatedProduct: RechargeGamesProduct | undefined;
+    if (this.data.rechargeGamesProducts && pKey) {
+      const prodIdx = this.data.rechargeGamesProducts.findIndex(
+        p => p.product_key === pKey || p.id === pKey
+      );
+      if (prodIdx !== -1) {
+        const prod = this.data.rechargeGamesProducts[prodIdx];
+        if (!supplierCostUsd) {
+          supplierCostUsd = Number((prod.provider_price_usd ?? prod.provider_price ?? 0).toFixed(2));
+        }
+        if (prevSellingPriceHtg === cleanPriceHtg && prod.playup_price_htg) {
+          prevSellingPriceHtg = prod.playup_price_htg;
+        }
+      }
+    }
+
+    this.recalculateAllServicesAndProductsHtgInMemory();
+
+    if (this.data.rechargeGamesProducts && pKey) {
+      updatedProduct = this.data.rechargeGamesProducts.find(
+        p => p.product_key === pKey || p.id === pKey
+      );
+    }
+
+    const finalSupplierCostHtg = Number((supplierCostUsd * rate).toFixed(2));
+    const finalProfitHtg = Number((cleanPriceHtg - finalSupplierCostHtg).toFixed(2));
+    const finalMarginPercent =
+      finalSupplierCostHtg > 0
+        ? Number(((finalProfitHtg / finalSupplierCostHtg) * 100).toFixed(2))
+        : 0;
+
+    const historyEntry = this.recordPriceChangeHistory({
+      changeType: 'manual_price_htg',
+      serviceId: matchedService?.id || params.serviceId,
+      serviceName: matchedService?.name || updatedProduct?.game,
+      packageId: matchedPkg?.id || params.packageId,
+      packageName: matchedPkg?.name || updatedProduct?.name,
+      productKey: pKey || undefined,
+      supplierCostUsd,
+      previousSupplierCostHtg: finalSupplierCostHtg,
+      newSupplierCostHtg: finalSupplierCostHtg,
+      previousSellingPriceHtg: prevSellingPriceHtg,
+      newSellingPriceHtg: cleanPriceHtg,
+      profitHtg: finalProfitHtg,
+      marginPercent: finalMarginPercent,
+      previousExchangeRate: rate,
+      newExchangeRate: rate,
+      adminId: params.adminId || 'admin',
+      adminEmail: params.adminEmail,
+      reason:
+        params.reason ||
+        `Prix de vente PlayUp défini manuellement à ${cleanPriceHtg} HTG (Coût fournisseur: $${supplierCostUsd.toFixed(2)} USD = ${finalSupplierCostHtg} HTG, Bénéfice: ${finalProfitHtg} HTG, Marge: ${finalMarginPercent}%)`
+    });
+
+    this.addSystemLog(
+      'info',
+      'system',
+      `[Pricing HTG] Prix de vente défini manuellement pour ${matchedPkg?.name || updatedProduct?.name || pKey}: ${cleanPriceHtg} HTG (Coût fournisseur: $${supplierCostUsd.toFixed(2)} USD / ${finalSupplierCostHtg} HTG, Bénéfice: ${finalProfitHtg} HTG, Marge: ${finalMarginPercent}%)`
+    );
+
+    this.save();
+
+    return {
+      updatedPackage: matchedPkg,
+      updatedProduct,
+      historyEntry
+    };
+  }
+
+  public recordPriceChangeHistory(
+    entry: Omit<PriceChangeHistoryEntry, 'id' | 'timestamp' | 'referenceCurrency' | 'sellingCurrency'>
+  ): PriceChangeHistoryEntry {
+    if (!this.data.priceChangeHistory) {
+      this.data.priceChangeHistory = [];
+    }
+    const fullEntry: PriceChangeHistoryEntry = {
+      ...entry,
+      id: `pch_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      referenceCurrency: 'USD',
+      sellingCurrency: 'HTG',
+      timestamp: new Date().toISOString()
+    };
+    this.data.priceChangeHistory.unshift(fullEntry);
+    if (this.data.priceChangeHistory.length > 500) {
+      this.data.priceChangeHistory = this.data.priceChangeHistory.slice(0, 500);
+    }
+    return fullEntry;
+  }
+
+  public getPriceChangeHistory(filters?: {
+    serviceId?: string;
+    packageId?: string;
+    productKey?: string;
+    changeType?: string;
+    limit?: number;
+  }): PriceChangeHistoryEntry[] {
+    let list = this.data.priceChangeHistory || [];
+    if (filters?.serviceId) {
+      list = list.filter(e => e.serviceId === filters.serviceId);
+    }
+    if (filters?.packageId) {
+      list = list.filter(e => e.packageId === filters.packageId);
+    }
+    if (filters?.productKey) {
+      list = list.filter(e => e.productKey === filters.productKey);
+    }
+    if (filters?.changeType && filters.changeType !== 'all') {
+      list = list.filter(e => e.changeType === filters.changeType);
+    }
+    const limit = filters?.limit && filters.limit > 0 ? filters.limit : 200;
+    return list.slice(0, limit);
+  }
+
+  /**
+   * Synchronizes all services and RechargeGames products in memory with the current USD -> HTG exchange rate.
+   * Never modifies RechargeGames supplier USD prices.
+   */
+  public recalculateAllServicesAndProductsHtgInMemory(): boolean {
+    let modified = false;
+    const rate = this.getUsdToHtgExchangeRate();
+    const manualPrices = this.data.rechargeGamesMargins?.manualPricesHtg || {};
+
+    for (const srv of this.data.services || []) {
+      for (const pkg of srv.packages || []) {
+        const immutableUsd = Number(
+          (typeof pkg.supplierCostUsd === 'number' && pkg.supplierCostUsd > 0
+            ? pkg.supplierCostUsd
+            : pkg.supplierCost || 0
+          ).toFixed(2)
+        );
+        const costHtg = Number((immutableUsd * rate).toFixed(2));
+        const pKey = pkg.productKey || pkg.externalProductId || '';
+
+        let sellingHtg: number;
+        if (pKey && typeof manualPrices[pKey] === 'number' && manualPrices[pKey] > 0) {
+          sellingHtg = Number(manualPrices[pKey].toFixed(2));
+        } else if (typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0) {
+          sellingHtg = Number(pkg.publicPriceHtg.toFixed(2));
+        } else {
+          sellingHtg = Number((Number(pkg.publicPrice || 0) * rate).toFixed(2));
+        }
+
+        const sellingUsdEquiv = rate > 0 ? Number((sellingHtg / rate).toFixed(2)) : Number(pkg.publicPrice || 0);
+        const profitHtg = Number((sellingHtg - costHtg).toFixed(2));
+        const marginHtg = costHtg > 0 ? Number(((profitHtg / costHtg) * 100).toFixed(2)) : 0;
+
+        if (
+          pkg.supplierCostUsd !== immutableUsd ||
+          pkg.supplierCostHtg !== costHtg ||
+          pkg.publicPriceHtg !== sellingHtg ||
+          pkg.profitHtg !== profitHtg ||
+          pkg.marginHtg !== marginHtg ||
+          pkg.exchangeRateApplied !== rate ||
+          pkg.referenceCurrency !== 'USD' ||
+          pkg.sellingCurrency !== 'HTG'
+        ) {
+          pkg.supplierCost = immutableUsd;
+          pkg.supplierCostUsd = immutableUsd;
+          pkg.supplierCostHtg = costHtg;
+          pkg.publicPriceHtg = sellingHtg;
+          pkg.publicPrice = sellingUsdEquiv;
+          pkg.resellerPriceHtg =
+            typeof pkg.resellerPriceHtg === 'number' && pkg.resellerPriceHtg > 0
+              ? pkg.resellerPriceHtg
+              : Number((Number(pkg.resellerPrice || sellingUsdEquiv * 0.9) * rate).toFixed(2));
+          pkg.profitHtg = profitHtg;
+          pkg.marginHtg = marginHtg;
+          pkg.referenceCurrency = 'USD';
+          pkg.sellingCurrency = 'HTG';
+          pkg.exchangeRateApplied = rate;
+          modified = true;
+        }
+      }
+    }
+
+    if (this.data.rechargeGamesProducts && this.data.rechargeGamesProducts.length > 0) {
+      this.data.rechargeGamesProducts = this.data.rechargeGamesProducts.map(prod => {
+        // NEVER modify provider_price (USD)
+        const immutableProviderUsd = Number(
+          (typeof prod.provider_price_usd === 'number' && prod.provider_price_usd > 0
+            ? prod.provider_price_usd
+            : prod.provider_price || 0
+          ).toFixed(2)
+        );
+        const calc = this.computePlayUpMarginAndPrice(
+          immutableProviderUsd,
+          prod.game,
+          prod.region,
+          prod.product_key
+        );
+        if (
+          prod.provider_price_usd !== immutableProviderUsd ||
+          prod.provider_cost_htg !== calc.providerCostHtg ||
+          prod.playup_price_htg !== calc.playupPriceHtg ||
+          prod.profit_htg !== calc.profitHtg ||
+          prod.margin_percent !== calc.marginPercent ||
+          prod.exchange_rate !== rate
+        ) {
+          modified = true;
+        }
+        return {
+          ...prod,
+          provider_price: immutableProviderUsd,
+          provider_price_usd: immutableProviderUsd,
+          provider_cost_htg: calc.providerCostHtg,
+          margin_percent: calc.marginPercent,
+          playup_price: calc.playupPrice,
+          playup_price_htg: calc.playupPriceHtg,
+          profit_estimate: calc.profit,
+          profit_htg: calc.profitHtg,
+          manual_price_htg: calc.isManualHtg ? calc.playupPriceHtg : undefined,
+          reference_currency: 'USD',
+          selling_currency: 'HTG',
+          exchange_rate: rate,
+          currency: 'HTG'
+        };
+      });
+    }
+
+    return modified;
+  }
+
+  /**
+   * Computes final PlayUp customer price in HTG (and USD equivalent) from RechargeGames provider_price (USD)
+   * Precedence: manualPricesHtg[product_key] > productMargins[product_key] > regionMargins[region] > gameMargins[game] > globalMarginPercent
    */
   public computePlayUpMarginAndPrice(
     providerPrice: number,
     game: string,
     region: string,
     productKey: string
-  ): { marginPercent: number; playupPrice: number; profit: number } {
+  ): {
+    marginPercent: number;
+    playupPrice: number;
+    profit: number;
+    providerPriceUsd: number;
+    providerCostHtg: number;
+    playupPriceHtg: number;
+    profitHtg: number;
+    exchangeRate: number;
+    isManualHtg: boolean;
+  } {
     const margins = this.getRechargeGamesMargins();
+    const exchangeRate = this.getUsdToHtgExchangeRate();
+    const safeProviderPriceUsd = Number(Math.max(0, Number(providerPrice) || 0).toFixed(2));
+    const providerCostHtg = Number((safeProviderPriceUsd * exchangeRate).toFixed(2));
+
+    // Check if admin set a manual final selling price in HTG for this product/service
+    let manualHtgPrice: number | undefined;
+    if (productKey && typeof margins.manualPricesHtg?.[productKey] === 'number' && margins.manualPricesHtg[productKey] > 0) {
+      manualHtgPrice = Number(margins.manualPricesHtg[productKey].toFixed(2));
+    } else if (productKey) {
+      for (const srv of this.data.services || []) {
+        const foundPkg = (srv.packages || []).find(
+          p =>
+            (p.productKey === productKey || p.externalProductId === productKey || p.id === productKey) &&
+            p.manualPriceHtgDefined &&
+            typeof p.publicPriceHtg === 'number' &&
+            p.publicPriceHtg > 0
+        );
+        if (foundPkg && foundPkg.publicPriceHtg) {
+          manualHtgPrice = Number(foundPkg.publicPriceHtg.toFixed(2));
+          break;
+        }
+      }
+    }
+
+    if (typeof manualHtgPrice === 'number' && manualHtgPrice > 0) {
+      const playupPriceHtg = manualHtgPrice;
+      const profitHtg = Number((playupPriceHtg - providerCostHtg).toFixed(2));
+      const marginPercent =
+        providerCostHtg > 0 ? Number(((profitHtg / providerCostHtg) * 100).toFixed(2)) : 0;
+      const playupPrice =
+        exchangeRate > 0 ? Number((playupPriceHtg / exchangeRate).toFixed(2)) : safeProviderPriceUsd;
+      const profit = Number((playupPrice - safeProviderPriceUsd).toFixed(2));
+      return {
+        marginPercent,
+        playupPrice,
+        profit,
+        providerPriceUsd: safeProviderPriceUsd,
+        providerCostHtg,
+        playupPriceHtg,
+        profitHtg,
+        exchangeRate,
+        isManualHtg: true
+      };
+    }
+
     let marginPercent = margins.globalMarginPercent ?? 20;
 
     if (game && typeof margins.gameMargins?.[game] === 'number') {
@@ -3588,38 +4275,71 @@ export class PlayUpDatabase {
       marginPercent = margins.productMargins[productKey];
     }
 
-    const safeProviderPrice = Math.max(0, Number(providerPrice) || 0);
-    const playupPrice = Number((safeProviderPrice * (1 + marginPercent / 100)).toFixed(2));
-    const profit = Number((playupPrice - safeProviderPrice).toFixed(2));
+    const playupPriceHtg = Number((providerCostHtg * (1 + marginPercent / 100)).toFixed(2));
+    const profitHtg = Number((playupPriceHtg - providerCostHtg).toFixed(2));
+    const playupPrice =
+      exchangeRate > 0
+        ? Number((playupPriceHtg / exchangeRate).toFixed(2))
+        : Number((safeProviderPriceUsd * (1 + marginPercent / 100)).toFixed(2));
+    const profit = Number((playupPrice - safeProviderPriceUsd).toFixed(2));
 
-    return { marginPercent, playupPrice, profit };
+    return {
+      marginPercent: Number(marginPercent.toFixed(2)),
+      playupPrice,
+      profit,
+      providerPriceUsd: safeProviderPriceUsd,
+      providerCostHtg,
+      playupPriceHtg,
+      profitHtg,
+      exchangeRate,
+      isManualHtg: false
+    };
   }
 
-  public setRechargeGamesMargins(config: Partial<RechargeGamesMarginConfig>): RechargeGamesMarginConfig {
+  public setRechargeGamesMargins(
+    config: Partial<RechargeGamesMarginConfig>,
+    adminMeta?: { adminId?: string; adminEmail?: string }
+  ): RechargeGamesMarginConfig {
     const current = this.getRechargeGamesMargins();
+    if (
+      typeof config.usdToHtgExchangeRate === 'number' &&
+      Number.isFinite(config.usdToHtgExchangeRate) &&
+      config.usdToHtgExchangeRate > 0 &&
+      config.usdToHtgExchangeRate !== current.usdToHtgExchangeRate
+    ) {
+      this.setUsdToHtgExchangeRate(config.usdToHtgExchangeRate, {
+        adminId: adminMeta?.adminId,
+        adminEmail: adminMeta?.adminEmail,
+        reason: `Modification du taux de change USD → HTG depuis la configuration des marges`
+      });
+    }
+
+    const rate = this.getUsdToHtgExchangeRate();
     const updated: RechargeGamesMarginConfig = {
       globalMarginPercent:
         typeof config.globalMarginPercent === 'number' ? config.globalMarginPercent : current.globalMarginPercent,
+      usdToHtgExchangeRate: rate,
       gameMargins: config.gameMargins !== undefined ? config.gameMargins : current.gameMargins,
       regionMargins: config.regionMargins !== undefined ? config.regionMargins : current.regionMargins,
       productMargins: config.productMargins !== undefined ? config.productMargins : current.productMargins,
+      manualPricesHtg: config.manualPricesHtg !== undefined ? config.manualPricesHtg : current.manualPricesHtg || {},
       updatedAt: new Date().toISOString()
     };
     this.data.rechargeGamesMargins = updated;
 
-    // Recalculate playup_price for all stored RechargeGames products immediately
-    if (this.data.rechargeGamesProducts && this.data.rechargeGamesProducts.length > 0) {
-      this.data.rechargeGamesProducts = this.data.rechargeGamesProducts.map(prod => {
-        const calc = this.computePlayUpMarginAndPrice(prod.provider_price, prod.game, prod.region, prod.product_key);
-        return {
-          ...prod,
-          margin_percent: calc.marginPercent,
-          playup_price: calc.playupPrice,
-          profit_estimate: calc.profit
-        };
+    if (config.globalMarginPercent !== undefined && config.globalMarginPercent !== current.globalMarginPercent) {
+      this.recordPriceChangeHistory({
+        changeType: 'margin_rule',
+        marginPercent: updated.globalMarginPercent,
+        previousExchangeRate: rate,
+        newExchangeRate: rate,
+        adminId: adminMeta?.adminId || 'admin',
+        adminEmail: adminMeta?.adminEmail,
+        reason: `Marge globale PlayUp mise à jour : ${current.globalMarginPercent}% → ${updated.globalMarginPercent}%`
       });
     }
 
+    this.recalculateAllServicesAndProductsHtgInMemory();
     this.save();
     return updated;
   }
@@ -3650,14 +4370,38 @@ export class PlayUpDatabase {
   }
 
   public setRechargeGamesProducts(products: RechargeGamesProduct[]) {
+    const rate = this.getUsdToHtgExchangeRate();
+    const existingByKey = new Map(
+      (this.data.rechargeGamesProducts || []).map(p => [p.product_key, p])
+    );
     this.data.rechargeGamesProducts = products.map(p => {
-      const calc = this.computePlayUpMarginAndPrice(p.provider_price, p.game, p.region, p.product_key);
+      const prev = existingByKey.get(p.product_key);
+      // Supplier price in USD from RechargeGames is stored in USD and never altered by PlayUp margin rules
+      const immutableProviderUsd = Number(
+        (typeof p.provider_price_usd === 'number' && p.provider_price_usd > 0
+          ? p.provider_price_usd
+          : typeof p.provider_price === 'number' && p.provider_price > 0
+          ? p.provider_price
+          : prev?.provider_price_usd ?? prev?.provider_price ?? 0
+        ).toFixed(2)
+      );
+      const calc = this.computePlayUpMarginAndPrice(immutableProviderUsd, p.game, p.region, p.product_key);
       return {
         ...p,
         provider: 'rechargegames',
+        provider_price: immutableProviderUsd,
+        provider_price_usd: immutableProviderUsd,
+        provider_cost_htg: calc.providerCostHtg,
         margin_percent: calc.marginPercent,
         playup_price: calc.playupPrice,
-        profit_estimate: calc.profit
+        playup_price_htg: calc.playupPriceHtg,
+        profit_estimate: calc.profit,
+        profit_htg: calc.profitHtg,
+        manual_price_htg: calc.isManualHtg ? calc.playupPriceHtg : undefined,
+        reference_currency: 'USD',
+        selling_currency: 'HTG',
+        exchange_rate: rate,
+        currency: 'HTG'
       };
     });
     this.save();
@@ -4402,7 +5146,7 @@ export class PlayUpDatabase {
         ? 'verifying'
         : 'received';
 
-    let proofId = crypto.randomUUID();
+    let proofId: string = crypto.randomUUID();
     const ocrJson = JSON.stringify(params.ocrResult || {});
     try {
       const existingProofByHash = this.sqlite
@@ -6331,16 +7075,16 @@ export class PlayUpDatabase {
       if (filters?.paymentRequestId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM wallet_transactions WHERE payment_request_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.paymentRequestId, limit) || []) as WalletTransactionRecord[];
+          .all(filters.paymentRequestId, limit) || []) as unknown as WalletTransactionRecord[];
       }
       if (filters?.userId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM wallet_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.userId, limit) || []) as WalletTransactionRecord[];
+          .all(filters.userId, limit) || []) as unknown as WalletTransactionRecord[];
       }
       return (this.sqlite
         ?.prepare(`SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT ?`)
-        .all(limit) || []) as WalletTransactionRecord[];
+        .all(limit) || []) as unknown as WalletTransactionRecord[];
     } catch {
       return [];
     }
@@ -6352,16 +7096,16 @@ export class PlayUpDatabase {
       if (filters?.paymentRequestId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM payment_proofs WHERE payment_request_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.paymentRequestId, limit) || []) as PaymentProofRecord[];
+          .all(filters.paymentRequestId, limit) || []) as unknown as PaymentProofRecord[];
       }
       if (filters?.userId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM payment_proofs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.userId, limit) || []) as PaymentProofRecord[];
+          .all(filters.userId, limit) || []) as unknown as PaymentProofRecord[];
       }
       return (this.sqlite
         ?.prepare(`SELECT * FROM payment_proofs ORDER BY created_at DESC LIMIT ?`)
-        .all(limit) || []) as PaymentProofRecord[];
+        .all(limit) || []) as unknown as PaymentProofRecord[];
     } catch {
       return [];
     }
@@ -6399,16 +7143,16 @@ export class PlayUpDatabase {
       if (filters?.paymentRequestId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM validated_payments WHERE payment_request_id = ? ORDER BY validated_at DESC LIMIT ?`)
-          .all(filters.paymentRequestId, limit) || []) as ValidatedPaymentRecord[];
+          .all(filters.paymentRequestId, limit) || []) as unknown as ValidatedPaymentRecord[];
       }
       if (filters?.userId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM validated_payments WHERE user_id = ? ORDER BY validated_at DESC LIMIT ?`)
-          .all(filters.userId, limit) || []) as ValidatedPaymentRecord[];
+          .all(filters.userId, limit) || []) as unknown as ValidatedPaymentRecord[];
       }
       return (this.sqlite
         ?.prepare(`SELECT * FROM validated_payments ORDER BY validated_at DESC LIMIT ?`)
-        .all(limit) || []) as ValidatedPaymentRecord[];
+        .all(limit) || []) as unknown as ValidatedPaymentRecord[];
     } catch {
       return [];
     }
@@ -6426,22 +7170,22 @@ export class PlayUpDatabase {
     return '';
   }
 
-  public getCanonicalIdempotencyKeys(filters?: { userId?: string; endpoint?: string; limit?: number }): CanonicalIdempotencyKeyRecord[] {
+  public getCanonicalIdempotencyKeys(filters?: { userId?: string; endpoint?: string; limit?: number }): IdempotencyKeyRecord[] {
     try {
       const limit = filters?.limit || 100;
       if (filters?.userId && filters?.endpoint) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM idempotency_keys WHERE user_id = ? AND endpoint = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.userId, filters.endpoint, limit) || []) as CanonicalIdempotencyKeyRecord[];
+          .all(filters.userId, filters.endpoint, limit) || []) as unknown as IdempotencyKeyRecord[];
       }
       if (filters?.userId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM idempotency_keys WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.userId, limit) || []) as CanonicalIdempotencyKeyRecord[];
+          .all(filters.userId, limit) || []) as unknown as IdempotencyKeyRecord[];
       }
       return (this.sqlite
         ?.prepare(`SELECT * FROM idempotency_keys ORDER BY created_at DESC LIMIT ?`)
-        .all(limit) || []) as CanonicalIdempotencyKeyRecord[];
+        .all(limit) || []) as unknown as IdempotencyKeyRecord[];
     } catch {
       return [];
     }
@@ -6453,16 +7197,16 @@ export class PlayUpDatabase {
       if (filters?.resourceId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM audit_logs WHERE resource_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.resourceId, limit) || []) as AuditLogRecord[];
+          .all(filters.resourceId, limit) || []) as unknown as AuditLogRecord[];
       }
       if (filters?.userId) {
         return (this.sqlite
           ?.prepare(`SELECT * FROM audit_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`)
-          .all(filters.userId, limit) || []) as AuditLogRecord[];
+          .all(filters.userId, limit) || []) as unknown as AuditLogRecord[];
       }
       return (this.sqlite
         ?.prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?`)
-        .all(limit) || []) as AuditLogRecord[];
+        .all(limit) || []) as unknown as AuditLogRecord[];
     } catch {
       return [];
     }
@@ -6500,6 +7244,7 @@ export class PlayUpDatabase {
   public createWallet2FAChallenge(params: {
     userId: string;
     userEmail?: string;
+    userPhone?: string;
     operationType: Wallet2FAOperationType;
     channel: Wallet2FAChannel;
     destination: string;
@@ -7148,7 +7893,7 @@ export class PlayUpDatabase {
             .all(filters.userId, limit)
         : this.sqlite
             ?.prepare(`SELECT * FROM wallet_2fa_challenges ORDER BY created_at DESC LIMIT ?`)
-            .all(limit)) as Wallet2FAChallengeRecord[];
+            .all(limit)) as unknown as Wallet2FAChallengeRecord[];
       return (rows || []).map(({ code_hash, verification_token, ...safe }) => safe);
     } catch {
       return [];

@@ -47,16 +47,30 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
   // Device frame toggle (Phone Frame vs Expanded View)
   const [deviceFrameMode, setDeviceFrameMode] = useState<boolean>(true);
 
-  // Dedicated Splash Screen state (displays only the exact PlayUp logo centered on the phone screen and disappears automatically after 2s)
+  // Dedicated Splash Screen state — minimum 2500ms duration to prevent UI race conditions on slow Android hardware
   const [showSplashScreen, setShowSplashScreen] = useState<boolean>(true);
 
   useEffect(() => {
     if (!showSplashScreen) return;
+    const MIN_SPLASH_DURATION_MS = 2500;
     const timer = setTimeout(() => {
       setShowSplashScreen(false);
-    }, 2000);
+    }, MIN_SPLASH_DURATION_MS);
     return () => clearTimeout(timer);
   }, [showSplashScreen]);
+
+  const getPackagePriceHtg = (pkg?: ServicePackage | null): number => {
+    if (!pkg) return 0;
+    if (typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0) {
+      return Number(pkg.publicPriceHtg.toFixed(2));
+    }
+    return Number((Number(pkg.publicPrice || 0) * 132).toFixed(2));
+  };
+
+  const formatHtg = (val: number): string => {
+    const num = Number(val || 0);
+    return `${Number.isInteger(num) ? num : num.toFixed(2)} HTG`;
+  };
 
   // Purchase Flow State
   const [selectedGame, setSelectedGame] = useState<Game | null>(null);
@@ -178,6 +192,33 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     }
   };
 
+  // Real-time update listener when admin updates USD->HTG exchange rate or HTG selling prices
+  useEffect(() => {
+    const handlePricingUpdated = () => {
+      loadRechargeGamesCatalog();
+    };
+    window.addEventListener('playup:pricing-updated', handlePricingUpdated);
+    return () => window.removeEventListener('playup:pricing-updated', handlePricingUpdated);
+  }, []);
+
+  // Keep selectedService and selectedPackage synchronized when services or rgCatalog update in real time
+  useEffect(() => {
+    if (selectedGame) {
+      const updatedSrv = services.find(s => s.gameId === selectedGame.id && s.isActive);
+      if (updatedSrv) {
+        setSelectedService(updatedSrv);
+        if (selectedPackage) {
+          const updatedPkg = updatedSrv.packages.find(
+            p => p.id === selectedPackage.id || (p.productKey && p.productKey === selectedPackage.productKey)
+          );
+          if (updatedPkg) {
+            setSelectedPackage(updatedPkg);
+          }
+        }
+      }
+    }
+  }, [services, rgCatalog]);
+
   const loadPaymentGateways = async () => {
     try {
       const gws = await apiClient.getPaymentGateways();
@@ -216,10 +257,12 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     try {
       if (authMode === 'login') {
         const res = await apiClient.loginUser(authEmail, authPassword);
-        syncUserState(res.user, res.token);
-        const prof = await apiClient.getUserProfile(res.token);
-        setUserPaymentTransactions(prof.paymentTransactions || []);
-        setAuthSuccess(`Bienvenue, ${res.user.name} !`);
+        if (res.user && res.token) {
+          syncUserState(res.user, res.token);
+          const prof = await apiClient.getUserProfile(res.token);
+          setUserPaymentTransactions(prof.paymentTransactions || []);
+          setAuthSuccess(`Bienvenue, ${res.user.name} !`);
+        }
       } else if (authMode === 'register') {
         const res = await apiClient.registerUser({
           name: authName,
@@ -1470,27 +1513,35 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                   gameRgProducts.length > 0
                     ? gameRgProducts
                         .filter(p => (p.region || '').toLowerCase() === (selectedRegion || '').toLowerCase())
-                        .map((p, idx) => ({
-                          id: `pkg_rg_${p.product_key}`,
-                          serviceId: selectedService?.id || `srv_${selectedGame.slug}`,
-                          externalProductId: p.product_key,
-                          productKey: p.product_key,
-                          region: p.region,
-                          providerSlug: 'rechargegames',
-                          externalGameId: p.game_slug || selectedGame.slug,
-                          name: p.name,
-                          amount: p.amount || 1,
-                          unit: p.unit || 'Diamonds',
-                          supplierCost: p.provider_price || 0,
-                          margin: 0,
-                          publicPrice: p.playup_price,
-                          resellerPrice: p.playup_price,
-                          currency: p.currency,
-                          isActive: p.active,
-                          requiresPlayerId: p.requires_player_id !== false,
-                          requiredFields: selectedGame.fields.map(f => f.name),
-                          displayOrder: idx + 1
-                        }))
+                        .map((p, idx) => {
+                          const priceHtg =
+                            typeof p.playup_price_htg === 'number' && p.playup_price_htg > 0
+                              ? Number(p.playup_price_htg.toFixed(2))
+                              : Number((Number(p.playup_price || 0) * 132).toFixed(2));
+                          return {
+                            id: `pkg_rg_${p.product_key}`,
+                            serviceId: selectedService?.id || `srv_${selectedGame.slug}`,
+                            externalProductId: p.product_key,
+                            productKey: p.product_key,
+                            region: p.region,
+                            providerSlug: 'rechargegames',
+                            externalGameId: p.game_slug || selectedGame.slug,
+                            name: p.name,
+                            amount: p.amount || 1,
+                            unit: p.unit || 'Diamonds',
+                            supplierCost: 0,
+                            margin: 0,
+                            publicPrice: p.playup_price,
+                            publicPriceHtg: priceHtg,
+                            resellerPrice: p.playup_price,
+                            sellingCurrency: 'HTG',
+                            currency: 'HTG',
+                            isActive: p.active,
+                            requiresPlayerId: p.requires_player_id !== false,
+                            requiredFields: selectedGame.fields.map(f => f.name),
+                            displayOrder: idx + 1
+                          };
+                        })
                     : selectedService?.packages || [];
 
                 return (
@@ -1577,7 +1628,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                               </div>
                               <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
                                 <span className="font-mono font-bold text-orange-600 text-xs">
-                                  ${pkg.publicPrice.toFixed(2)} {pkg.currency}
+                                  {formatHtg(getPackagePriceHtg(pkg))}
                                 </span>
                                 {!pkg.isActive ? (
                                   <span className="text-[9px] font-bold text-rose-600">Indisponible</span>
@@ -1935,9 +1986,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                       <span className="font-mono text-[10px] text-slate-300">{pendingPartnerOrderId}</span>
                     </div>
                     <div className="flex justify-between pt-2 border-t border-slate-800">
-                      <span className="font-bold">Montant à régler :</span>
+                      <span className="font-bold">Prix final PlayUp :</span>
                       <span className="font-mono text-lg font-extrabold text-orange-400">
-                        ${selectedPackage.publicPrice.toFixed(2)} USD
+                        {formatHtg(getPackagePriceHtg(selectedPackage))}
                       </span>
                     </div>
                   </div>
@@ -1953,13 +2004,13 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     {isOrdering ? (
                       <>
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Validation du paiement &amp; envoi GoXtop...</span>
+                        <span>Validation du paiement &amp; envoi...</span>
                       </>
                     ) : (
                       <>
                         <CreditCard className="w-4 h-4" />
                         <span>
-                          Payer ${selectedPackage.publicPrice.toFixed(2)} via{' '}
+                          Payer {formatHtg(getPackagePriceHtg(selectedPackage))} via{' '}
                           {selectedPaymentMethod === 'moncash'
                             ? 'MonCash'
                             : selectedPaymentMethod === 'natcash'
@@ -1975,9 +2026,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
               ) : (
                 <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-slate-400">Total à payer</span>
+                    <span className="text-xs text-slate-400">Prix final PlayUp</span>
                     <span className="font-mono text-xl font-extrabold text-orange-400">
-                      ${selectedPackage ? selectedPackage.publicPrice.toFixed(2) : '0.00'} USD
+                      {selectedPackage ? formatHtg(getPackagePriceHtg(selectedPackage)) : '0 HTG'}
                     </span>
                   </div>
 
@@ -1999,7 +2050,7 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
                     <ShieldCheck className="w-4 h-4" />
                     <span>
                       {selectedPackage
-                        ? `Acheter maintenant — $${selectedPackage.publicPrice.toFixed(2)} ${selectedPackage.currency}`
+                        ? `Acheter maintenant — ${formatHtg(getPackagePriceHtg(selectedPackage))}`
                         : 'Sélectionnez un produit'}
                     </span>
                   </button>

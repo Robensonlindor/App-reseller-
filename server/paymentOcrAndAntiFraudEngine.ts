@@ -31,7 +31,8 @@ export class PaymentOcrAndAntiFraudEngine {
   }
 
   public static computeHtgAmount(usdAmount: number): number {
-    return Math.round(Number(usdAmount || 0) * HTG_EXCHANGE_RATE);
+    const rate = db.getUsdToHtgExchangeRate() || HTG_EXCHANGE_RATE;
+    return Math.round(Number(usdAmount || 0) * rate);
   }
 
   /**

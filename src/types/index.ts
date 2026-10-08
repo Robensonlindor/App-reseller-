@@ -279,7 +279,7 @@ export interface UserNotification {
   orderNumber?: string;
   title: string;
   message: string;
-  type: 'order' | 'info' | 'error' | 'refund';
+  type: 'order' | 'info' | 'error' | 'refund' | 'wallet';
   read: boolean;
   createdAt: string;
 }
@@ -326,12 +326,25 @@ export interface ServicePackage {
   name: string;
   amount: number;
   unit: string;
-  publicPrice: number;    // PlayUp Selling Price (= Supplier cost + PlayUp margin)
-  resellerPrice: number;  // PlayUp Reseller Price
-  supplierCost: number;   // Provider Cost (Never modified in Provider)
-  margin: number;         // PlayUp Margin (publicPrice - supplierCost)
-  currency: string;       // USD
-  isActive: boolean;      // Availability
+  publicPrice: number;        // PlayUp Selling Price in USD equivalent
+  publicPriceHtg?: number;    // PlayUp Selling Price in HTG (Authoritative client price)
+  resellerPrice: number;      // PlayUp Reseller Price
+  resellerPriceHtg?: number;  // PlayUp Reseller Price in HTG
+  supplierCost: number;       // Provider Cost in USD (Never modified in Provider)
+  supplierCostUsd?: number;   // Explicit Provider Cost in USD (Immutable for RechargeGames)
+  supplierCostHtg?: number;   // Automatically computed Provider Cost in HTG (supplierCostUsd * exchangeRateUsdHtg)
+  margin: number;             // PlayUp Margin in USD
+  profitHtg?: number;         // PlayUp Benefit in HTG (publicPriceHtg - supplierCostHtg)
+  marginHtg?: number;         // PlayUp Margin in HTG (= profitHtg)
+  marginPercent?: number;     // PlayUp Margin % in HTG
+  exchangeRateUsdHtg?: number;// Applied USD -> HTG exchange rate
+  exchangeRateApplied?: number; // Applied USD -> HTG exchange rate
+  referenceCurrency?: 'USD';  // Reference currency for supplier prices ('USD')
+  sellingCurrency?: 'HTG';    // Selling currency for PlayUp prices ('HTG')
+  isManualPriceHtg?: boolean; // True if admin manually set the final selling price in HTG
+  manualPriceHtgDefined?: boolean; // True if admin manually set the final selling price in HTG
+  currency: string;           // USD / HTG
+  isActive: boolean;          // Availability
   requiresPlayerId?: boolean; // Some products (like gift cards/vouchers) don't need Player ID
   requiredFields?: string[];  // Only fields required by this specific product
   displayOrder: number;
@@ -408,9 +421,14 @@ export interface Order {
   serverId?: string;
   gameProfileData: Record<string, string>;
   publicPrice: number;
+  publicPriceHtg?: number;     // Final PlayUp selling price in HTG
   chargedAmount: number;       // PlayUp selling price paid by user
-  supplierCost: number;        // GoXtop cost
+  chargedAmountHtg?: number;   // PlayUp selling price paid by user in HTG
+  supplierCost: number;        // Supplier cost in USD
+  supplierCostHtg?: number;    // Supplier cost automatically computed in HTG
   margin: number;              // PlayUp margin
+  profitHtg?: number;          // PlayUp profit/margin in HTG
+  exchangeRateUsdHtg?: number; // Exchange rate USD -> HTG applied
   currency: string;
   status: OrderStatus;         // pending | paid | processing | completed | failed | cancelled | refunded | manual_review
   payment_status?: PaymentLifecycleStatus;
@@ -507,6 +525,10 @@ export interface AppSettings {
   paymentGatewayConfigured: boolean;
   apiRateLimitPerMinute: number;
   defaultProviderId?: string;
+  referenceCurrency?: 'USD';
+  sellingCurrency?: 'HTG';
+  usdToHtgRate?: number;
+  usdToHtgExchangeRate?: number;
 }
 
 export interface SystemLog {
@@ -686,11 +708,23 @@ export interface RechargeGamesProduct {
   topup_value: string;        // e.g. '100 Diamonds', '60 UC'
   amount?: number;            // Numeric value e.g. 100
   unit?: string;              // e.g. 'Diamonds', 'UC', 'CP', 'Robux'
-  provider_price: number;     // Supplier cost from RechargeGames
-  currency: string;           // e.g. 'USD'
-  playup_price: number;       // Final customer price computed server-side with PlayUp margin
+  provider_price: number;     // Supplier cost from RechargeGames in USD (NEVER modified)
+  provider_price_usd?: number;// Explicit Supplier cost from RechargeGames in USD
+  reference_currency?: 'USD'; // Reference currency ('USD')
+  currency: string;           // 'USD'
+  selling_currency?: 'HTG';   // PlayUp selling currency ('HTG')
+  exchange_rate?: number;     // Configured USD -> HTG exchange rate
+  exchange_rate_usd_htg?: number; // Configured USD -> HTG exchange rate
+  provider_cost_htg?: number; // Automatically calculated supplier cost in HTG (provider_price * exchange_rate_usd_htg)
+  playup_price: number;       // Final customer price in USD equivalent
+  playup_price_htg?: number;  // Final PlayUp selling price in HTG (shown to client)
+  manual_price_htg?: number;  // Manual final PlayUp selling price in HTG if set by admin
+  is_manual_price_htg?: boolean; // True if admin manually defined the selling price in HTG
+  manual_price_htg_defined?: boolean; // True if admin manually defined the selling price in HTG
   margin_percent: number;     // Applied margin %
-  profit_estimate: number;    // playup_price - provider_price
+  profit_estimate: number;    // playup_price - provider_price (USD)
+  profit_htg?: number;        // playup_price_htg - provider_cost_htg (Benefit in HTG)
+  margin_htg?: number;        // Benefit/Margin in HTG (= profit_htg)
   active: boolean;            // Availability from RechargeGames
   requires_player_id?: boolean;
   last_synced_at: string;     // ISO timestamp
@@ -713,10 +747,15 @@ export interface RechargeGamesOrderRecord {
   player_id: string;          // Player ID
   player_name?: string;       // Verified or provided player name
   server_id?: string;         // Optional zone/server ID
-  provider_price: number;     // Supplier cost
-  customer_price: number;     // Final PlayUp price charged to customer
-  profit: number;             // customer_price - provider_price
+  provider_price: number;     // Supplier cost in USD (Never modified)
+  provider_cost_htg?: number; // Automatically computed supplier cost in HTG
+  customer_price: number;     // Final PlayUp price charged to customer (USD equivalent)
+  customer_price_htg?: number;// Final PlayUp selling price charged to customer in HTG
+  profit: number;             // customer_price - provider_price (USD)
+  profit_htg?: number;        // customer_price_htg - provider_cost_htg (HTG)
+  exchange_rate_usd_htg?: number; // Exchange rate USD -> HTG applied at order time
   currency: string;           // 'USD'
+  selling_currency?: 'HTG';   // 'HTG'
   status: RechargeGamesOrderStatus; // 'pending' | 'order_pending' | 'sent_to_rechargegames' | 'delivered' | 'failed' | 'refunded' | 'manual_review'
   payment_status?: PaymentLifecycleStatus;
   lifecycle_status?: OrderLifecycleStatus;
@@ -798,14 +837,58 @@ export interface FirestoreWebhookIdempotencyRecord {
 }
 
 /**
- * PlayUp Server-Side Margin Configuration for RechargeGames
+ * PlayUp Server-Side Margin & USD -> HTG Reference Currency Configuration for RechargeGames
  */
 export interface RechargeGamesMarginConfig {
-  globalMarginPercent: number;            // Default e.g. 20 (%)
-  gameMargins: Record<string, number>;    // e.g. { 'Free Fire': 20, 'PUBG Mobile': 18 }
-  regionMargins: Record<string, number>;  // e.g. { 'Brazil': 15, 'USA': 20, 'Global': 20 }
-  productMargins: Record<string, number>; // e.g. { 'ff_br_100': 25 } (margin % per product_key)
+  referenceCurrency?: 'USD';                 // Reference currency for RechargeGames supplier prices ('USD')
+  sellingCurrency?: 'HTG';                   // PlayUp selling currency ('HTG')
+  usdToHtgRate?: number;                     // Configurable USD -> HTG exchange rate (default: 132)
+  usdToHtgExchangeRate?: number;             // Configurable USD -> HTG exchange rate (default: 132)
+  globalMarginPercent: number;               // Default e.g. 20 (%)
+  gameMargins: Record<string, number>;       // e.g. { 'Free Fire': 20, 'PUBG Mobile': 18 }
+  regionMargins: Record<string, number>;     // e.g. { 'Brazil': 15, 'USA': 20, 'Global': 20 }
+  productMargins: Record<string, number>;    // e.g. { 'ff_br_100': 25 } (margin % per product_key)
+  manualPricesHtg?: Record<string, number>;  // Manual final PlayUp selling price in HTG per product_key or packageId
+  manualProductPricesHtg?: Record<string, number>; // Alias for manual prices in HTG
   updatedAt: string;
+}
+
+/**
+ * Immutable History Log for USD -> HTG Exchange Rate & PlayUp Price (HTG) Modifications
+ */
+export interface PriceChangeHistoryEntry {
+  id: string;
+  changeType: 'exchange_rate' | 'manual_price_htg' | 'margin_update' | 'margin_rule' | 'EXCHANGE_RATE_UPDATE' | 'MANUAL_PRICE_HTG_UPDATE' | 'MARGIN_RULE_UPDATE' | 'SERVICE_PACKAGE_PRICE_UPDATE';
+  referenceCurrency: 'USD';
+  sellingCurrency: 'HTG';
+  serviceId?: string;
+  serviceName?: string;
+  packageId?: string;
+  packageName?: string;
+  productKey?: string;
+  productName?: string;
+  supplierCostUsd?: number;         // Immutable RechargeGames supplier price in USD
+  providerPriceUsd?: number;        // Alias for supplier price in USD
+  previousSupplierCostHtg?: number; // Provider cost in HTG before modification
+  newSupplierCostHtg?: number;      // Provider cost in HTG after modification (supplierCostUsd * newExchangeRate)
+  supplierCostHtgBefore?: number;
+  supplierCostHtgAfter?: number;
+  previousSellingPriceHtg?: number; // Final PlayUp selling price in HTG before modification
+  newSellingPriceHtg?: number;      // Final PlayUp selling price in HTG after modification
+  sellingPriceHtgBefore?: number;
+  sellingPriceHtgAfter?: number;
+  profitHtg?: number;               // Benefit in HTG (newSellingPriceHtg - newSupplierCostHtg)
+  profitHtgAfter?: number;
+  marginPercent?: number;           // Margin % in HTG
+  marginPercentAfter?: number;
+  previousExchangeRate?: number;
+  newExchangeRate?: number;
+  adminId?: string;
+  adminEmail?: string;
+  reason: string;
+  summary?: string;
+  timestamp: string;
+  createdAt?: string;
 }
 
 export interface RechargeGamesSyncStats {
@@ -898,8 +981,16 @@ export interface EmailDeliveryLog {
 export interface AppPackageMetadata {
   platform: 'android' | 'ios';
   fileName: string;
+  applicationId?: string;
   version: string;
   buildNumber: number;
+  minSdkVersion?: number;
+  targetSdkVersion?: number;
+  compileSdkVersion?: number;
+  supportedAbis?: string[];
+  signatureSchemes?: string[];
+  certificateSha256Fingerprint?: string;
+  verificationPassed?: boolean;
   sizeBytes: number;
   sizeFormatted: string;
   sha256: string;
@@ -942,6 +1033,7 @@ export type PaymentRequestStage =
   | 'verifying'
   | 'verified'
   | 'credited'
+  | 'refunded'
   | 'manual_review'
   | 'rejected';
 

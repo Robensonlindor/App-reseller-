@@ -39,6 +39,19 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
     ? services.filter(s => s.gameId === selectedGame.id)
     : services;
 
+  const getPackagePriceHtg = (pkg?: ServicePackage | null): number => {
+    if (!pkg) return 0;
+    if (typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0) {
+      return Number(pkg.publicPriceHtg.toFixed(2));
+    }
+    return Number((Number(pkg.publicPrice || 0) * 132).toFixed(2));
+  };
+
+  const formatHtg = (val: number): string => {
+    const num = Number(val || 0);
+    return `${Number.isInteger(num) ? num : num.toFixed(2)} HTG`;
+  };
+
   const handlePackageClick = (service: Service, pkg: ServicePackage) => {
     setSelectedPackagesByService(prev => ({ ...prev, [service.id]: pkg }));
     const parentGame = games.find(g => g.id === service.gameId);
@@ -175,9 +188,9 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
 
                         <div className="mt-4 pt-3 border-t border-slate-200/60 flex items-center justify-between">
                           <div>
-                            <span className="text-[10px] text-slate-400 block">Prix indicatif</span>
+                            <span className="text-[10px] text-slate-400 block">Prix PlayUp</span>
                             <span className="font-mono text-sm font-semibold text-slate-900">
-                              ${pkg.publicPrice.toFixed(2)}
+                              {formatHtg(getPackagePriceHtg(pkg))}
                             </span>
                           </div>
                           <button
@@ -200,16 +213,13 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                 {(() => {
                   const selectedPkg = selectedPackagesByService[service.id] || service.packages[0];
                   if (!selectedPkg) return null;
-                  const resellerRate =
-                    selectedPkg.resellerPrice && selectedPkg.resellerPrice < selectedPkg.publicPrice
-                      ? selectedPkg.resellerPrice
-                      : +(selectedPkg.publicPrice * 0.92).toFixed(2);
+                  const finalPriceHtg = getPackagePriceHtg(selectedPkg);
                   return (
                     <div className="mt-5 bg-slate-50/90 border border-slate-200 rounded-2xl p-4 sm:p-5 space-y-4">
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200/80">
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-wider text-orange-600 block">
-                            Produit sélectionné · Transparence Tarifaire Revendeur
+                            Produit sélectionné · Tarif Officiel PlayUp
                           </span>
                           <h4 className="font-display text-base sm:text-lg font-bold text-slate-900">
                             {game?.name} — {selectedPkg.name}
@@ -217,15 +227,9 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                         </div>
                         <div className="flex flex-wrap items-center gap-4">
                           <div>
-                            <span className="text-[10px] text-slate-500 block">Tarif B2B Revendeur</span>
+                            <span className="text-[10px] text-slate-500 block">Prix Final PlayUp (HTG)</span>
                             <span className="font-mono text-lg font-extrabold text-orange-600">
-                              ${resellerRate.toFixed(2)} {selectedPkg.currency || 'USD'}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-[10px] text-slate-500 block">Prix Public Conseillé</span>
-                            <span className="font-mono text-base font-bold text-slate-800">
-                              ${selectedPkg.publicPrice.toFixed(2)} {selectedPkg.currency || 'USD'}
+                              {formatHtg(finalPriceHtg)}
                             </span>
                           </div>
                           <button
@@ -314,9 +318,9 @@ export const ServicesView: React.FC<ServicesViewProps> = ({
                 <span className="font-semibold text-slate-900">{activePackageModal.pkg.name}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Prix indicatif :</span>
-                <span className="font-mono font-bold text-slate-900">
-                  ${activePackageModal.pkg.publicPrice.toFixed(2)} USD
+                <span className="text-slate-500">Prix final PlayUp :</span>
+                <span className="font-mono font-bold text-orange-600">
+                  {formatHtg(getPackagePriceHtg(activePackageModal.pkg))}
                 </span>
               </div>
               <div className="flex justify-between">

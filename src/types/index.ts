@@ -237,6 +237,7 @@ export interface ProviderApiLog {
     | 'CHECK_PLAYER'
     | 'CREATE_ORDER'
     | 'GET_ORDER_STATUS'
+    | 'GET_BALANCE'
     | 'TRACK_ORDER'
     | 'WEBHOOK_EVENT';
   httpMethod: 'GET' | 'POST' | 'PUT';
@@ -435,7 +436,7 @@ export interface Order {
   lifecycle_status?: OrderLifecycleStatus;
   refund_status?: RefundLifecycleStatus;
   user_status_message?: string;
-  dispatch_status?: 'awaiting_payment' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
+  dispatch_status?: 'awaiting_payment' | 'awaiting_provider_balance' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
   retry_count?: number;
   max_retries?: number;
   next_retry_at?: string | null;
@@ -761,7 +762,7 @@ export interface RechargeGamesOrderRecord {
   lifecycle_status?: OrderLifecycleStatus;
   refund_status?: RefundLifecycleStatus;
   user_status_message?: string;
-  dispatch_status?: 'awaiting_payment' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
+  dispatch_status?: 'awaiting_payment' | 'awaiting_provider_balance' | 'ready_to_send' | 'sent' | 'sent_to_rechargegames' | 'pending_retry' | 'manual_review' | 'delivered' | 'failed';
   quantity?: number;
   test_mode: boolean;         // true if created in TEST mode
   payment_method?: string;
@@ -916,6 +917,103 @@ export interface RechargeGamesConfigState {
   lastConnectionTestedAt?: string;
   syncStats: RechargeGamesSyncStats;
   margins: RechargeGamesMarginConfig;
+  balanceMonitor?: {
+    snapshot: RechargeGamesBalanceSnapshot;
+    config: RechargeGamesBalanceMonitorConfig;
+  };
+}
+
+export type RechargeGamesBalanceOrigin =
+  | 'scheduled_poll'
+  | 'pre_order_check'
+  | 'post_order_check'
+  | 'admin_manual_refresh'
+  | 'threshold_config_update'
+  | 'startup_sync';
+
+export type RechargeGamesBalanceAlertLevel =
+  | 'normal'
+  | 'low_balance'
+  | 'critical_balance'
+  | 'insufficient_for_order';
+
+export interface RechargeGamesLedgerItem {
+  delta_micro: number;
+  delta: number;
+  reason: string;
+  order_id: string | null;
+  created_at: string;
+}
+
+export interface RechargeGamesBalanceMonitorConfig {
+  lowBalanceThresholdUsd: number;
+  lowBalanceEnabled: boolean;
+  lowBalanceAlertArmed: boolean;
+  lowBalanceLastTriggeredAt: string | null;
+  lowBalanceLastRearmedAt: string | null;
+  criticalBalanceThresholdUsd: number;
+  criticalBalanceEnabled: boolean;
+  criticalBalanceAlertArmed: boolean;
+  criticalBalanceLastTriggeredAt: string | null;
+  criticalBalanceLastRearmedAt: string | null;
+  insufficientForOrderAlertEnabled: boolean;
+  pollingEnabled: boolean;
+  pollingIntervalSeconds: number;
+  updatedAt: string;
+  updatedByAdminId?: string;
+}
+
+export interface RechargeGamesBalanceSnapshot {
+  balance: number;
+  balance_micro: number;
+  currency: string;
+  ledger: RechargeGamesLedgerItem[];
+  currentLevel: 'normal' | 'low_balance' | 'critical_balance';
+  lastCheckedAt: string | null;
+  lastOrigin: RechargeGamesBalanceOrigin | null;
+  officialEndpoint: string;
+  balanceWebhookSupportedByOfficialApi: boolean;
+  mechanismUsed: string;
+  httpStatus?: number | null;
+  error?: string | null;
+}
+
+export interface RechargeGamesBalanceLogRecord {
+  id: string;
+  previous_balance: number | null;
+  new_balance: number;
+  previous_balance_micro: number | null;
+  new_balance_micro: number;
+  currency: string;
+  checked_at: string;
+  origin: RechargeGamesBalanceOrigin;
+  order_id: string | null;
+  buyer_ref: string | null;
+  required_amount: number | null;
+  sufficient_for_order: boolean | null;
+  alert_triggered: RechargeGamesBalanceAlertLevel | null;
+  alert_id: string | null;
+  http_status: number | null;
+  latency_ms: number;
+}
+
+export interface RechargeGamesBalanceAlertRecord {
+  id: string;
+  alert_level: 'low_balance' | 'critical_balance' | 'insufficient_for_order';
+  current_balance: number;
+  current_balance_micro: number;
+  threshold_configured: number;
+  required_order_amount: number | null;
+  currency: string;
+  order_id: string | null;
+  buyer_ref: string | null;
+  origin: RechargeGamesBalanceOrigin;
+  message: string;
+  triggered_at: string;
+  acknowledged: boolean;
+  acknowledged_at: string | null;
+  rearmed: boolean;
+  rearmed_at: string | null;
 }
 
 export interface RechargeGamesTestStepResult {

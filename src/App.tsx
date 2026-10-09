@@ -283,6 +283,8 @@ export default function App() {
             onNavigate={handleNavigate}
             onOpenMobileApp={() => setIsMobileAppOpen(true)}
             lang={lang}
+            authUser={authUser}
+            onAuthChange={(user) => setAuthUser(user)}
           />
         )}
 

@@ -390,9 +390,22 @@ export const apiClient = {
       subtotalPrice: number;
       gatewayFee: number;
       totalAmount: number;
+      unitPriceHtg?: number;
+      subtotalPriceHtg?: number;
+      exchangeRate?: number;
       currency: string;
       providerCost: number;
       margin: number;
+    };
+    walletCheck?: {
+      sufficient: boolean;
+      walletBalanceUsd: number;
+      walletBalanceHtg: number;
+      requiredAmountUsd: number;
+      requiredAmountHtg: number;
+      missingAmountUsd: number;
+      missingAmountHtg: number;
+      exchangeRate: number;
     };
   }> {
     const res = await fetch('/api/payments/validate', {
@@ -1204,6 +1217,7 @@ export const apiClient = {
     order: RechargeGamesOrderRecord;
     playupOrder?: Order;
     refundRecord?: RefundRecord;
+    user?: AppUser;
   }> {
     const body = await fetchJson<{
       success: boolean;
@@ -1211,6 +1225,7 @@ export const apiClient = {
       order: RechargeGamesOrderRecord;
       playupOrder?: Order;
       refundRecord?: RefundRecord;
+      user?: AppUser;
     }>(
       '/api/rechargegames/orders',
       {

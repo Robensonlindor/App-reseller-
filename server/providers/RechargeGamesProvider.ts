@@ -1667,9 +1667,22 @@ export class RechargeGamesProvider {
       subtotalPrice: number;
       gatewayFee: number;
       totalAmount: number;
+      unitPriceHtg?: number;
+      subtotalPriceHtg?: number;
+      exchangeRate?: number;
       currency: string;
       providerCost: number;
       margin: number;
+    };
+    walletCheck?: {
+      sufficient: boolean;
+      walletBalanceUsd: number;
+      walletBalanceHtg: number;
+      requiredAmountUsd: number;
+      requiredAmountHtg: number;
+      missingAmountUsd: number;
+      missingAmountHtg: number;
+      exchangeRate: number;
     };
   }> {
     if (!params.userId || params.userId.trim().length === 0) {
@@ -1837,10 +1850,34 @@ export class RechargeGamesProvider {
         subtotalPrice,
         gatewayFee,
         totalAmount,
+        unitPriceHtg,
+        subtotalPriceHtg,
+        exchangeRate: db.getUsdToHtgExchangeRate(),
         currency: product.currency || 'USD',
         providerCost,
         margin
-      }
+      },
+      walletCheck: (() => {
+        const rate = db.getUsdToHtgExchangeRate() || 132;
+        const u = db.getUserById(params.userId);
+        const walletBalanceUsd = Number((u?.walletBalance || 0).toFixed(2));
+        const walletBalanceHtg = Number((walletBalanceUsd * rate).toFixed(2));
+        const requiredAmountUsd = subtotalPrice;
+        const requiredAmountHtg = subtotalPriceHtg;
+        const missingAmountUsd = Math.max(0, Number((requiredAmountUsd - walletBalanceUsd).toFixed(2)));
+        const missingAmountHtg = Math.max(0, Number((requiredAmountHtg - walletBalanceHtg).toFixed(2)));
+        const sufficient = walletBalanceUsd + 0.005 >= requiredAmountUsd && walletBalanceHtg + 0.5 >= requiredAmountHtg;
+        return {
+          sufficient,
+          walletBalanceUsd,
+          walletBalanceHtg,
+          requiredAmountUsd,
+          requiredAmountHtg,
+          missingAmountUsd,
+          missingAmountHtg,
+          exchangeRate: rate
+        };
+      })()
     };
   }
 
@@ -1928,13 +1965,14 @@ export class RechargeGamesProvider {
     const product = preCheck.product;
     const quantity = preCheck.pricing.quantity;
     const customerPrice = preCheck.pricing.subtotalPrice;
+    const customerPriceHtg = (preCheck.pricing as any).subtotalPriceHtg || Number((customerPrice * db.getUsdToHtgExchangeRate()).toFixed(2));
     const providerPrice = preCheck.pricing.providerCost;
     const profit = preCheck.pricing.margin;
     const cleanPlayerId = String(params.playerId || '').trim();
     const verifiedNickname = preCheck.verifiedPlayerName || (params.playerName ? String(params.playerName).trim() : undefined);
 
-    // Step 6: Determine backend-authoritative PaymentLifecycleStatus
-    const linkedPaymentTx =
+    // Step 6: Determine backend-authoritative PaymentLifecycleStatus & Atomic Wallet Debit
+    let linkedPaymentTx =
       (params.paymentReference ? db.findPaymentTransactionByRefOrId(params.paymentReference) : undefined) ||
       (params.paymentTransactionId ? db.findPaymentTransactionByRefOrId(params.paymentTransactionId) : undefined);
 
@@ -1958,6 +1996,58 @@ export class RechargeGamesProvider {
         effectivePaymentStatus = 'payment_pending';
       }
     } else if (params.paymentConfirmed === true) {
+      // If paymentMethod === 'wallet' and no prior paymentTransactionId was debited (and not an internal test suite call),
+      // strictly verify and debit the user's real PlayUp Wallet on the backend before marking payment_succeeded!
+      if ((params.paymentMethod || 'wallet') === 'wallet' && !params.testMode) {
+        const users = db.getUsers();
+        const uIdx = users.findIndex(u => u.id === params.userId || u.uid === params.userId);
+        if (uIdx === -1) {
+          return {
+            success: false,
+            httpStatus: 404,
+            errorCode: 'USER_NOT_FOUND',
+            userMessage: 'Compte utilisateur PlayUp introuvable pour le débit du Wallet.'
+          };
+        }
+        const rate = db.getUsdToHtgExchangeRate() || 132;
+        const availableUsd = Number((users[uIdx].walletBalance || 0).toFixed(2));
+        const availableHtg = Number((availableUsd * rate).toFixed(2));
+        if (availableUsd + 0.005 < customerPrice) {
+          return {
+            success: false,
+            httpStatus: 402,
+            errorCode: 'INSUFFICIENT_WALLET_BALANCE',
+            userMessage: `Solde insuffisant. Montant disponible : ${availableHtg.toFixed(0)} HTG ($${availableUsd.toFixed(2)} USD) — Montant nécessaire : ${customerPriceHtg.toFixed(0)} HTG ($${customerPrice.toFixed(2)} USD). Veuillez recharger votre PlayUp Wallet.`
+          };
+        }
+
+        // Debit user's wallet strictly on the backend
+        users[uIdx].walletBalance = Number(Math.max(0, availableUsd - customerPrice).toFixed(2));
+        users[uIdx].ordersCount = (users[uIdx].ordersCount || 0) + 1;
+        users[uIdx].totalSpent = Number(((users[uIdx].totalSpent || 0) + customerPrice).toFixed(2));
+        db.setUsers(users);
+
+        const autoTxRef = `PAY-WALLET-${Date.now().toString().slice(-6)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+        const createdWalletTx = db.addPaymentTransaction({
+          transactionReference: autoTxRef,
+          userId: users[uIdx].id,
+          userEmail: users[uIdx].email,
+          gatewayId: 'gw_wallet',
+          paymentMethod: 'wallet',
+          amount: customerPrice,
+          currency: 'USD',
+          feeAmount: 0,
+          totalCharged: customerPrice,
+          status: 'payment_succeeded',
+          payment_status: 'payment_succeeded',
+          externalReference: `WLT_${Date.now().toString().slice(-7)}`,
+          payerIdentifier: users[uIdx].email,
+          statusMessage: `Débit PlayUp Wallet côté backend : ${customerPriceHtg.toFixed(2)} HTG ($${customerPrice.toFixed(2)} USD) pour ${product.name}`
+        });
+        linkedPaymentTx = createdWalletTx;
+        params.paymentReference = createdWalletTx.transactionReference;
+        params.paymentTransactionId = createdWalletTx.id;
+      }
       effectivePaymentStatus = 'payment_succeeded';
     } else {
       effectivePaymentStatus = 'payment_pending';

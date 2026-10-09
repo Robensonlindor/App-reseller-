@@ -1717,6 +1717,57 @@ apiRouter.post('/app/orders', authenticateUser, orderRateLimit, async (req, res)
       return res.status(rgRes.httpStatus || 201).json(rgRes.playupOrder || rgRes.order);
     }
 
+    let resolvedPaymentTxId = req.body.paymentTransactionId ? String(req.body.paymentTransactionId) : undefined;
+    let resolvedPaymentRef = req.body.paymentReference ? String(req.body.paymentReference) : undefined;
+    const effectivePaymentMethod = (req.body.paymentMethod || 'wallet') as PaymentMethodType;
+
+    // Server-side Wallet balance verification & atomic debit when paymentConfirmed=true and paymentMethod='wallet'
+    if (paymentConfirmed && effectivePaymentMethod === 'wallet' && !resolvedPaymentTxId && !resolvedPaymentRef) {
+      const users = db.getUsers();
+      const uIdx = users.findIndex(u => u.id === authenticatedUser.id || u.uid === authenticatedUser.id);
+      if (uIdx === -1) {
+        return res.status(404).json({ error: 'Compte utilisateur PlayUp introuvable.' });
+      }
+      const rate = db.getUsdToHtgExchangeRate() || 132;
+      const availableUsd = Number((users[uIdx].walletBalance || 0).toFixed(2));
+      const availableHtg = Number((availableUsd * rate).toFixed(2));
+      const requiredUsd = Number(pkg.publicPrice.toFixed(2));
+      const requiredHtg =
+        typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0
+          ? Number(pkg.publicPriceHtg.toFixed(2))
+          : Number((requiredUsd * rate).toFixed(2));
+
+      if (availableUsd + 0.005 < requiredUsd) {
+        return res.status(402).json({
+          error: 'INSUFFICIENT_WALLET_BALANCE',
+          message: `Solde insuffisant. Montant disponible : ${availableHtg.toFixed(0)} HTG ($${availableUsd.toFixed(2)} USD) — Montant nécessaire : ${requiredHtg.toFixed(0)} HTG ($${requiredUsd.toFixed(2)} USD). Veuillez recharger votre PlayUp Wallet.`
+        });
+      }
+
+      users[uIdx].walletBalance = Number(Math.max(0, availableUsd - requiredUsd).toFixed(2));
+      db.setUsers(users);
+
+      const autoTxRef = `PAY-WALLET-${Date.now().toString().slice(-6)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+      const createdWalletTx = db.addPaymentTransaction({
+        transactionReference: autoTxRef,
+        userId: users[uIdx].id,
+        userEmail: users[uIdx].email,
+        gatewayId: 'gw_wallet',
+        paymentMethod: 'wallet',
+        amount: requiredUsd,
+        currency: 'USD',
+        feeAmount: 0,
+        totalCharged: requiredUsd,
+        status: 'payment_succeeded',
+        payment_status: 'payment_succeeded',
+        externalReference: `WLT_${Date.now().toString().slice(-7)}`,
+        payerIdentifier: users[uIdx].email,
+        statusMessage: `Débit PlayUp Wallet côté backend : ${requiredHtg.toFixed(2)} HTG ($${requiredUsd.toFixed(2)} USD) pour ${pkg.name}`
+      });
+      resolvedPaymentTxId = createdWalletTx.id;
+      resolvedPaymentRef = createdWalletTx.transactionReference;
+    }
+
     const providers = db.getProviders();
     const provider = providers.find(p => p.id === service.providerId) || providers.find(p => p.id === 'prov_goxtop') || providers[0];
 
@@ -1749,9 +1800,9 @@ apiRouter.post('/app/orders', authenticateUser, orderRateLimit, async (req, res)
       margin,
       currency: pkg.currency,
       status: initialStatus,
-      paymentMethod: req.body.paymentMethod || 'card',
-      paymentTransactionId: req.body.paymentTransactionId || undefined,
-      paymentReference: req.body.paymentReference || undefined,
+      paymentMethod: effectivePaymentMethod,
+      paymentTransactionId: resolvedPaymentTxId,
+      paymentReference: resolvedPaymentRef,
       providerId: provider?.id || 'prov_goxtop',
       providerName: provider?.name || 'GoXtop',
       createdAt: nowIso,
@@ -3889,7 +3940,8 @@ apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
       message: result.userMessage,
       order: result.order,
       playupOrder: result.playupOrder,
-      refundRecord: result.refundRecord
+      refundRecord: result.refundRecord,
+      user: db.getUserById(authenticatedUser.id)
     });
   }
 
@@ -3898,7 +3950,8 @@ apiRouter.post('/rechargegames/orders', authenticateUser, async (req, res) => {
     message: result.userMessage,
     order: result.order,
     playupOrder: result.playupOrder,
-    refundRecord: result.refundRecord
+    refundRecord: result.refundRecord,
+    user: db.getUserById(authenticatedUser.id)
   });
 });
 

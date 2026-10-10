@@ -348,6 +348,7 @@ export interface ServicePackage {
   isActive: boolean;          // Availability
   requiresPlayerId?: boolean; // Some products (like gift cards/vouchers) don't need Player ID
   requiredFields?: string[];  // Only fields required by this specific product
+  imageUrl?: string;          // Custom image URL configured in Administration for this card
   displayOrder: number;
 }
 
@@ -359,6 +360,7 @@ export interface Service {
   description: string;
   category: ServiceCategory;
   providerId: string;
+  imageUrl?: string;          // Custom default image URL configured in Administration for this service
   isActive: boolean;
   displayOrder: number;
   packages: ServicePackage[];
@@ -728,6 +730,7 @@ export interface RechargeGamesProduct {
   margin_htg?: number;        // Benefit/Margin in HTG (= profit_htg)
   active: boolean;            // Availability from RechargeGames
   requires_player_id?: boolean;
+  image_url?: string;         // Custom or resolved product card image URL
   last_synced_at: string;     // ISO timestamp
   raw_metadata?: Record<string, any>;
 }
@@ -851,6 +854,7 @@ export interface RechargeGamesMarginConfig {
   productMargins: Record<string, number>;    // e.g. { 'ff_br_100': 25 } (margin % per product_key)
   manualPricesHtg?: Record<string, number>;  // Manual final PlayUp selling price in HTG per product_key or packageId
   manualProductPricesHtg?: Record<string, number>; // Alias for manual prices in HTG
+  customImageUrls?: Record<string, string>;  // Custom image URL per packageId, product_key, serviceId, or gameId
   updatedAt: string;
 }
 

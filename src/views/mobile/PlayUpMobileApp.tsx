@@ -323,7 +323,13 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
     setUserToken(token);
     safeStorage.setItem('playup_user_token', token);
     safeStorage.setItem('playup_user_profile', JSON.stringify(user));
+    if (user.role === 'ADMIN') {
+      safeStorage.setItem('playup_admin_token', token);
+    } else {
+      safeStorage.removeItem('playup_admin_token');
+    }
     onAuthChange?.(user);
+    window.dispatchEvent(new CustomEvent('playup:auth-updated'));
     setProfileName(user.name);
     setProfilePhone(user.phone || '');
     setProfileCurrency(user.preferredCurrency || 'USD');
@@ -397,7 +403,9 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
         uid: fbData.uid,
         email: fbData.email,
         name: fbData.name,
-        avatarUrl: fbData.avatarUrl
+        avatarUrl: fbData.avatarUrl,
+        idToken: fbData.idToken,
+        accessToken: fbData.accessToken
       });
       syncUserState(res.user, res.token);
       setAuthSuccess(`Connecté via Google (${res.user.email})`);
@@ -504,18 +512,25 @@ export const PlayUpMobileApp: React.FC<PlayUpMobileAppProps> = ({
       setProfilePushNotifs(prof.user.pushNotificationsEnabled !== false);
       setUserPaymentTransactions(prof.paymentTransactions || []);
       const [orders, rgList] = await Promise.all([
-        apiClient.getRecentOrders(prof.user.id, userToken),
+        apiClient.getRecentOrders(prof.user.id, userToken).catch(() => []),
         apiClient.getRechargeGamesOrders(prof.user.id).catch(() => [])
       ]);
       setUserOrders(orders);
       setRgOrders(rgList);
-    } catch {
-      safeStorage.removeItem('playup_user_token');
-      safeStorage.removeItem('playup_user_profile');
-      setAuthUser(null);
-      setUserToken('');
-      setUserOrders([]);
-      setRgOrders([]);
+      safeStorage.setItem('playup_user_profile', JSON.stringify(prof.user));
+      if (prof.user.role === 'ADMIN') {
+        safeStorage.setItem('playup_admin_token', userToken);
+      }
+    } catch (err: any) {
+      if (err?.status === 401) {
+        safeStorage.removeItem('playup_user_token');
+        safeStorage.removeItem('playup_user_profile');
+        safeStorage.removeItem('playup_admin_token');
+        setAuthUser(null);
+        setUserToken('');
+        setUserOrders([]);
+        setRgOrders([]);
+      }
     } finally {
       setOrdersLoading(false);
     }

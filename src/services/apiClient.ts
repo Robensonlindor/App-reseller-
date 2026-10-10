@@ -88,7 +88,10 @@ async function fetchJson<T>(
   }
 
   if (!res.ok) {
-    throw new Error(parsed?.error || parsed?.message || fallbackErrorMsg);
+    const err: any = new Error(parsed?.error || parsed?.message || fallbackErrorMsg);
+    err.status = res.status;
+    err.code = parsed?.code || parsed?.errorCode;
+    throw err;
   }
 
   return parsed as T;
@@ -181,8 +184,10 @@ export const apiClient = {
     email: string;
     name: string;
     avatarUrl?: string;
-  }): Promise<{ user: AppUser; token: string }> {
-    return fetchJson<{ user: AppUser; token: string }>(
+    idToken?: string;
+    accessToken?: string;
+  }): Promise<{ user: AppUser; token: string; isFirstUserAdmin?: boolean }> {
+    return fetchJson<{ user: AppUser; token: string; isFirstUserAdmin?: boolean }>(
       '/api/auth/social',
       {
         method: 'POST',

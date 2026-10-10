@@ -21,6 +21,11 @@ import { db } from '../db';
 import { NotificationEngine } from '../notificationAndDownloadEngine';
 import { WebhookHmacValidator } from '../webhookEngine';
 import {
+  resolveGameCoverImage,
+  resolvePackageImage,
+  resolveRechargeGamesProductImage
+} from '../../src/lib/serviceImages';
+import {
   acquireInFlightWebhookLock,
   releaseInFlightWebhookLock,
   checkWebhookIdempotencyInFirestore,
@@ -1171,30 +1176,46 @@ export class RechargeGamesProvider {
 
     try {
       const targetSlugs = [
-        { rgSlug: 'free-fire', playupSlug: 'free-fire', displayGame: 'Free Fire', defaultUnit: 'Diamonds' },
-        { rgSlug: 'pubg-mobile', playupSlug: 'pubg-mobile', displayGame: 'PUBG Mobile', defaultUnit: 'UC' },
-        { rgSlug: 'mobile-legends', playupSlug: 'mobile-legends', displayGame: 'Mobile Legends', defaultUnit: 'Diamonds' },
-        { rgSlug: 'roblox', playupSlug: 'roblox', displayGame: 'Roblox (Codes Digitaux / Vouchers)', defaultUnit: 'Robux' },
-        { rgSlug: 'genshin-impact', playupSlug: 'genshin-impact', displayGame: 'Genshin Impact', defaultUnit: 'Genesis Crystals' },
-        { rgSlug: 'valorant-points', playupSlug: 'valorant', displayGame: 'Valorant', defaultUnit: 'VP' },
-        { rgSlug: '8-ball-pool', playupSlug: '8-ball-pool', displayGame: '8 Ball Pool', defaultUnit: 'Coins' }
+        { rgSlug: 'free-fire', playupSlug: 'free-fire', displayGame: 'Free Fire', defaultUnit: 'Diamonds', maxPerGroup: 10 },
+        { rgSlug: 'pubg-mobile', playupSlug: 'pubg-mobile', displayGame: 'PUBG Mobile', defaultUnit: 'UC', maxPerGroup: 10 },
+        { rgSlug: 'mobile-legends', playupSlug: 'mobile-legends', displayGame: 'Mobile Legends', defaultUnit: 'Diamonds', maxPerGroup: 10 },
+        { rgSlug: 'roblox', playupSlug: 'roblox', displayGame: 'Roblox (Codes Digitaux / Vouchers)', defaultUnit: 'Robux', maxPerGroup: 8 },
+        { rgSlug: 'genshin-impact', playupSlug: 'genshin-impact', displayGame: 'Genshin Impact', defaultUnit: 'Genesis Crystals', maxPerGroup: 8 },
+        { rgSlug: 'valorant-points', playupSlug: 'valorant', displayGame: 'Valorant', defaultUnit: 'VP', maxPerGroup: 6 },
+        { rgSlug: 'blood-strike', playupSlug: 'blood-strike', displayGame: 'Blood Strike', defaultUnit: 'Gold', maxPerGroup: 8 },
+        { rgSlug: 'honkai-star-rail', playupSlug: 'honkai-star-rail', displayGame: 'Honkai: Star Rail', defaultUnit: 'Oneiric Shards', maxPerGroup: 8 },
+        { rgSlug: 'delta-force', playupSlug: 'delta-force', displayGame: 'Delta Force', defaultUnit: 'Delta Coins', maxPerGroup: 8 },
+        { rgSlug: 'eafc-mobile', playupSlug: 'eafc-mobile', displayGame: 'EA Sports FC Mobile', defaultUnit: 'FC Points', maxPerGroup: 8 },
+        { rgSlug: '8-ball-pool', playupSlug: '8-ball-pool', displayGame: '8 Ball Pool', defaultUnit: 'Coins', maxPerGroup: 8 },
+        { rgSlug: 'yalla-ludo', playupSlug: 'yalla-ludo', displayGame: 'Yalla Ludo', defaultUnit: 'Diamonds', maxPerGroup: 8 },
+        { rgSlug: 'arena-breakout', playupSlug: 'arena-breakout', displayGame: 'Arena Breakout', defaultUnit: 'Bonds', maxPerGroup: 8 },
+        { rgSlug: 'league-of-legends', playupSlug: 'league-of-legends', displayGame: 'League of Legends', defaultUnit: 'RP', maxPerGroup: 6 }
       ];
 
       const responses = await Promise.all(
         targetSlugs.map(async item => {
-          const url = `${effectiveBase}/v1/products?game=${encodeURIComponent(item.rgSlug)}`;
-          const res = await fetch(url, {
-            method: 'GET',
-            headers: this.buildHeaders()
-          });
-          const text = await res.text();
-          let parsed: any = null;
           try {
-            parsed = JSON.parse(text);
-          } catch {
-            parsed = null;
+            const url = `${effectiveBase}/v1/products?game=${encodeURIComponent(item.rgSlug)}`;
+            const res = await fetch(url, {
+              method: 'GET',
+              headers: this.buildHeaders()
+            });
+            const text = await res.text();
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              parsed = null;
+            }
+            return { item, res, text, parsed };
+          } catch (fetchErr: any) {
+            return {
+              item,
+              res: { ok: false, status: 503 } as Response,
+              text: String(fetchErr?.message || 'Fetch error'),
+              parsed: null
+            };
           }
-          return { item, res, text, parsed };
         })
       );
 
@@ -1222,6 +1243,8 @@ export class RechargeGamesProvider {
       const mappedProducts: RechargeGamesProduct[] = [];
       const syncErrors: string[] = [];
       let rawResponseSample = '';
+      const customImageUrls = db.getRechargeGamesMargins().customImageUrls || {};
+      const currentGames = db.getGames();
 
       for (const { item, res, text, parsed } of responses) {
         if (!res.ok || !parsed) {
@@ -1238,8 +1261,8 @@ export class RechargeGamesProvider {
           for (const grp of groups) {
             const regionLabel = String(grp.key || grp.slug || 'Global').trim();
             const prods: any[] = Array.isArray(grp.products) ? grp.products : [];
-            // Take up to 12 products per region so the catalog stays fast and comprehensive
-            for (const prod of prods.slice(0, 12)) {
+            const limit = item.maxPerGroup || 10;
+            for (const prod of prods.slice(0, limit)) {
               const productKey = String(prod.product_key || '').trim();
               if (!productKey) continue;
 
@@ -1254,9 +1277,20 @@ export class RechargeGamesProvider {
               const requiresPlayerId = prod.delivery !== 'code' && cat.kind !== 'giftcard';
 
               const marginCalc = db.computePlayUpMarginAndPrice(providerPrice, gameName, regionLabel, productKey);
+              const prodId = `rg_prod_${productKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+              const productImage = resolveRechargeGamesProductImage(
+                {
+                  id: prodId,
+                  product_key: productKey,
+                  game: gameName,
+                  game_slug: item.playupSlug
+                },
+                currentGames,
+                customImageUrls
+              );
 
               mappedProducts.push({
-                id: `rg_prod_${productKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+                id: prodId,
                 provider: 'rechargegames',
                 product_key: productKey,
                 game: gameName,
@@ -1279,6 +1313,7 @@ export class RechargeGamesProvider {
                 margin_percent: marginCalc.marginPercent,
                 profit_estimate: marginCalc.profit,
                 profit_htg: marginCalc.profitHtg,
+                image_url: productImage,
                 active,
                 requires_player_id: requiresPlayerId,
                 last_synced_at: nowIso,
@@ -1378,6 +1413,13 @@ export class RechargeGamesProvider {
     else if (rgGameSlug.includes('genshin')) rgGameSlug = 'genshin-impact';
     else if (rgGameSlug.includes('roblox')) rgGameSlug = 'roblox';
     else if (rgGameSlug.includes('valorant')) rgGameSlug = 'valorant-points';
+    else if (rgGameSlug.includes('blood') && rgGameSlug.includes('strike')) rgGameSlug = 'blood-strike';
+    else if (rgGameSlug.includes('honkai')) rgGameSlug = 'honkai-star-rail';
+    else if (rgGameSlug.includes('delta') && rgGameSlug.includes('force')) rgGameSlug = 'delta-force';
+    else if (rgGameSlug.includes('eafc') || (rgGameSlug.includes('fc') && rgGameSlug.includes('mobile'))) rgGameSlug = 'eafc-mobile';
+    else if (rgGameSlug.includes('yalla')) rgGameSlug = 'yalla-ludo';
+    else if (rgGameSlug.includes('arena') && rgGameSlug.includes('breakout')) rgGameSlug = 'arena-breakout';
+    else if (rgGameSlug.includes('league') && rgGameSlug.includes('legend')) rgGameSlug = 'league-of-legends';
     else if (rgGameSlug.includes('8') && rgGameSlug.includes('ball')) rgGameSlug = '8-ball-pool';
 
     const cleanRegion = params.region ? String(params.region).trim() : '';
@@ -1542,6 +1584,68 @@ export class RechargeGamesProvider {
   private syncIntoPlayUpServices(rgProducts: RechargeGamesProduct[]) {
     const games = db.getGames();
     const services = db.getServices();
+    const customImageUrls = db.getRechargeGamesMargins().customImageUrls || {};
+    let gamesChanged = false;
+
+    // Ensure every game present in rgProducts has a corresponding Game entry in PlayUp
+    const uniqueRgGameSlugs = Array.from(new Set(rgProducts.map(p => p.game_slug).filter(Boolean))) as string[];
+    for (const gSlug of uniqueRgGameSlugs) {
+      const sampleProd = rgProducts.find(p => p.game_slug === gSlug);
+      if (!sampleProd) continue;
+      let existingGame = games.find(
+        g =>
+          g.slug === gSlug ||
+          g.name.toLowerCase() === sampleProd.game.toLowerCase() ||
+          (gSlug === 'roblox' && g.slug === 'roblox')
+      );
+      if (!existingGame) {
+        const gameId = `game_${gSlug.replace(/[^a-z0-9]/g, '_')}`;
+        existingGame = {
+          id: gameId,
+          slug: gSlug,
+          name: sampleProd.game,
+          externalGameId: gSlug,
+          providerId: 'prov_rechargegames',
+          supportsNameCheck: sampleProd.requires_player_id !== false,
+          referenceUrl: 'https://www.rechargegame.com/',
+          category: sampleProd.requires_player_id === false ? 'Code Digital / Voucher' : 'Mobile & PC Top-Up',
+          description: `Recharge officielle ${sampleProd.game} (${sampleProd.unit || 'Diamonds'}) via RechargeGames API.`,
+          logo: resolveGameCoverImage({ slug: gSlug, name: sampleProd.game }, customImageUrls),
+          isActive: true,
+          displayOrder: games.length + 1,
+          fields:
+            sampleProd.requires_player_id === false
+              ? [
+                  {
+                    id: `f_${gSlug}_email`,
+                    name: 'playerId',
+                    label: 'Email ou Compte Destinataire (Optionnel)',
+                    placeholder: 'Ex: client@email.com',
+                    type: 'text',
+                    required: false
+                  }
+                ]
+              : [
+                  {
+                    id: `f_${gSlug}_id`,
+                    name: 'playerId',
+                    label: 'Player ID / UID',
+                    placeholder: 'Entrez votre Player ID',
+                    type: 'text',
+                    required: true
+                  }
+                ],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        games.push(existingGame);
+        gamesChanged = true;
+      }
+    }
+
+    if (gamesChanged) {
+      db.setGames(games);
+    }
 
     for (const game of games) {
       const matchingProds = rgProducts.filter(
@@ -1554,13 +1658,73 @@ export class RechargeGamesProvider {
       if (matchingProds.length === 0) continue;
 
       let srv = services.find(s => s.gameId === game.id);
-      if (!srv) continue;
+      if (!srv) {
+        const defaultUnit = matchingProds[0]?.unit || 'Diamonds';
+        srv = {
+          id: `srv_rg_${game.slug.replace(/[^a-z0-9]/g, '_')}`,
+          gameId: game.id,
+          externalGameId: game.externalGameId || game.slug,
+          name: `${game.name} ${defaultUnit}`,
+          description: `Packs officiels ${game.name} (${defaultUnit}) synchronisés via RechargeGames API`,
+          category: matchingProds[0]?.requires_player_id === false ? 'voucher' : 'diamonds',
+          providerId: 'prov_rechargegames',
+          imageUrl: resolveGameCoverImage(game, customImageUrls),
+          isActive: true,
+          displayOrder: services.length + 1,
+          packages: [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+        services.push(srv);
+      }
+
+      const existingPkgMap = new Map<string, any>();
+      for (const ep of srv.packages || []) {
+        if (ep.productKey) existingPkgMap.set(ep.productKey, ep);
+        if (ep.externalProductId) existingPkgMap.set(ep.externalProductId, ep);
+        if (ep.id) existingPkgMap.set(ep.id, ep);
+      }
 
       const rate = db.getUsdToHtgExchangeRate();
       const rgPackages = matchingProds.map((p, idx) => {
+        const pkgId = `pkg_rg_${p.product_key}`;
+        const existingPkg =
+          existingPkgMap.get(p.product_key) ||
+          existingPkgMap.get(pkgId);
+
         const calc = db.computePlayUpMarginAndPrice(p.provider_price, p.game, p.region, p.product_key);
+
+        // Preserve manual HTG selling price if previously set on the package by the admin
+        const hasExistingManualPrice =
+          existingPkg &&
+          existingPkg.manualPriceHtgDefined &&
+          typeof existingPkg.publicPriceHtg === 'number' &&
+          existingPkg.publicPriceHtg > 0 &&
+          !calc.isManualHtg;
+
+        const finalSellingPriceHtg = hasExistingManualPrice
+          ? Number(existingPkg.publicPriceHtg.toFixed(2))
+          : calc.playupPriceHtg;
+
+        const finalProfitHtg = Number((finalSellingPriceHtg - calc.providerCostHtg).toFixed(2));
+        const finalMarginHtg =
+          calc.providerCostHtg > 0
+            ? Number(((finalProfitHtg / calc.providerCostHtg) * 100).toFixed(2))
+            : calc.marginPercent;
+        const finalSellingPriceUsd =
+          rate > 0 ? Number((finalSellingPriceHtg / rate).toFixed(2)) : calc.playupPrice;
+        const finalProfitUsd = Number((finalSellingPriceUsd - p.provider_price).toFixed(2));
+
+        // Preserve custom image URL if set on the package, product, or in customImageUrls
+        const resolvedImg =
+          customImageUrls[p.product_key] ||
+          customImageUrls[pkgId] ||
+          existingPkg?.imageUrl ||
+          p.image_url ||
+          resolvePackageImage(existingPkg, srv, game, customImageUrls);
+
         return {
-          id: `pkg_rg_${p.product_key}`,
+          id: pkgId,
           serviceId: srv!.id,
           externalProductId: p.product_key,
           productKey: p.product_key,
@@ -1573,14 +1737,15 @@ export class RechargeGamesProvider {
           supplierCost: p.provider_price,
           supplierCostUsd: p.provider_price,
           supplierCostHtg: calc.providerCostHtg,
-          margin: calc.profit,
-          marginHtg: calc.marginPercent,
-          profitHtg: calc.profitHtg,
-          publicPrice: calc.playupPrice,
-          publicPriceHtg: calc.playupPriceHtg,
-          resellerPrice: Number((p.provider_price + calc.profit * 0.5).toFixed(2)),
-          resellerPriceHtg: Number((calc.providerCostHtg + calc.profitHtg * 0.5).toFixed(2)),
-          manualPriceHtgDefined: calc.isManualHtg,
+          margin: finalProfitUsd,
+          marginHtg: finalMarginHtg,
+          profitHtg: finalProfitHtg,
+          publicPrice: finalSellingPriceUsd,
+          publicPriceHtg: finalSellingPriceHtg,
+          resellerPrice: Number((p.provider_price + Math.max(0, finalProfitUsd) * 0.5).toFixed(2)),
+          resellerPriceHtg: Number((calc.providerCostHtg + Math.max(0, finalProfitHtg) * 0.5).toFixed(2)),
+          manualPriceHtgDefined: Boolean(calc.isManualHtg || hasExistingManualPrice),
+          imageUrl: resolvedImg,
           referenceCurrency: 'USD' as const,
           sellingCurrency: 'HTG' as const,
           exchangeRateApplied: rate,
@@ -1593,6 +1758,9 @@ export class RechargeGamesProvider {
       });
 
       srv.packages = rgPackages;
+      if (!srv.imageUrl) {
+        srv.imageUrl = resolveGameCoverImage(game, customImageUrls);
+      }
       srv.updatedAt = new Date().toISOString();
     }
 

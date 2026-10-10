@@ -25,6 +25,12 @@ import {
   INITIAL_RESELLERS, INITIAL_API_KEYS, INITIAL_ORDERS, 
   INITIAL_SETTINGS, INITIAL_TICKETS, INITIAL_LOGS, INITIAL_PROVIDER_ORDERS 
 } from '../src/data/initialData';
+import {
+  resolveGameCoverImage,
+  resolvePackageImage,
+  resolveRechargeGamesProductImage,
+  isBrokenDefaultFreeFireImageForOtherGame
+} from '../src/lib/serviceImages';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -553,24 +559,69 @@ export class PlayUpDatabase {
       }
     }
 
-    // Deduplicate games by id so duplicate keys (e.g. game_mlbb) never occur
+    // Deduplicate games by id and ensure all INITIAL_GAMES exist with accurate product images
     if (Array.isArray(this.data.games)) {
       const seenGameIds = new Set<string>();
       const uniqueGames: Game[] = [];
       for (const g of this.data.games) {
         if (!seenGameIds.has(g.id)) {
           seenGameIds.add(g.id);
+          if (!g.logo || isBrokenDefaultFreeFireImageForOtherGame(g.logo, g.slug || g.name)) {
+            g.logo = resolveGameCoverImage(g);
+            changed = true;
+          }
           uniqueGames.push(g);
         } else {
+          changed = true;
+        }
+      }
+      for (const initG of INITIAL_GAMES) {
+        if (!seenGameIds.has(initG.id) && !uniqueGames.some(ug => ug.slug === initG.slug)) {
+          uniqueGames.push({ ...initG });
+          seenGameIds.add(initG.id);
           changed = true;
         }
       }
       this.data.games = uniqueGames;
     }
 
+    // Ensure all INITIAL_SERVICES exist so every game with a price has its service cards ready
+    if (Array.isArray(this.data.services)) {
+      const existingServiceIds = new Set(this.data.services.map(s => s.id));
+      for (const initSrv of INITIAL_SERVICES) {
+        if (!existingServiceIds.has(initSrv.id) && !this.data.services.some(s => s.gameId === initSrv.gameId)) {
+          this.data.services.push(JSON.parse(JSON.stringify(initSrv)));
+          existingServiceIds.add(initSrv.id);
+          changed = true;
+        }
+      }
+      const gamesMap = new Map(this.data.games.map(g => [g.id, g]));
+      for (const srv of this.data.services) {
+        const gm = gamesMap.get(srv.gameId);
+        if (!srv.imageUrl || isBrokenDefaultFreeFireImageForOtherGame(srv.imageUrl, gm?.slug || gm?.name || srv.name)) {
+          srv.imageUrl = resolveGameCoverImage(gm || { slug: srv.externalGameId, name: srv.name });
+          changed = true;
+        }
+        for (const pkg of srv.packages || []) {
+          if (!pkg.imageUrl || isBrokenDefaultFreeFireImageForOtherGame(pkg.imageUrl, gm?.slug || gm?.name || srv.name)) {
+            pkg.imageUrl = resolvePackageImage(pkg, srv, gm);
+            changed = true;
+          }
+        }
+      }
+    }
+
     // Ensure USD reference currency and HTG selling currency + exchange rate in settings & services
     if (!this.data.settings) {
       this.data.settings = INITIAL_SETTINGS;
+      changed = true;
+    }
+    if (
+      this.data.settings.announcementNotice &&
+      (this.data.settings.announcementNotice.includes('Information Système') ||
+        this.data.settings.announcementNotice.includes('Intégration officielle RechargeGames & GoXtop'))
+    ) {
+      this.data.settings.announcementNotice = '';
       changed = true;
     }
     if (
@@ -2188,10 +2239,49 @@ export class PlayUpDatabase {
     } else {
       this.syncFromSqliteToMemory();
     }
+
+    // Remove any automated verification test account so it never blocks the real owner ADMIN role
+    const testUserRow = this.sqlite
+      .prepare(`SELECT id FROM users WHERE lower(email) = 'test.auth.check@playup.ht'`)
+      .get() as any;
+    if (testUserRow) {
+      this.sqlite.prepare(`DELETE FROM users WHERE id = ?`).run(String(testUserRow.id));
+      if (this.data.users) {
+        this.data.users = this.data.users.filter(
+          u => String(u.email || '').trim().toLowerCase() !== 'test.auth.check@playup.ht'
+        );
+      }
+      if (this.data.userCredentials && this.data.userCredentials[String(testUserRow.id)]) {
+        delete this.data.userCredentials[String(testUserRow.id)];
+      }
+    }
+
+    // Ensure the owner account (leaderlindor@gmail.com or PLAYUP_ADMIN_EMAIL) always holds the ADMIN role
+    const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
+    const ownerRow = this.sqlite
+      .prepare(`SELECT id, role FROM users WHERE lower(email) = lower(?)`)
+      .get(ownerAdminEmail) as any;
+    if (ownerRow) {
+      const nowIso = new Date().toISOString();
+      this.sqlite
+        .prepare(`UPDATE users SET role = 'USER' WHERE role = 'ADMIN' AND lower(email) != lower(?)`)
+        .run(ownerAdminEmail);
+      this.sqlite
+        .prepare(`UPDATE users SET role = 'ADMIN', status = 'active' WHERE id = ?`)
+        .run(String(ownerRow.id));
+      this.sqlite
+        .prepare(
+          `UPDATE system_bootstrap SET admin_initialized = 1, first_admin_user_id = ?, initialized_at = COALESCE(initialized_at, ?), updated_at = ? WHERE id = 1`
+        )
+        .run(String(ownerRow.id), nowIso, nowIso);
+      this.syncFromSqliteToMemory();
+      this.save();
+    }
   }
 
   private syncMemoryUsersToSqlite() {
     if (!this.sqlite) return;
+    const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
     const upsertStmt = this.sqlite.prepare(`
       INSERT INTO users (
         id, uid, name, email, phone, avatar_url, role, auth_provider, email_verified,
@@ -2200,11 +2290,14 @@ export class PlayUpDatabase {
         password_hash, password_salt, reset_token, reset_token_expires_at, totp_secret, totp_pending_secret
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        uid = excluded.uid,
+        uid = COALESCE(excluded.uid, users.uid),
         name = excluded.name,
         email = excluded.email,
         phone = excluded.phone,
         avatar_url = excluded.avatar_url,
+        role = excluded.role,
+        auth_provider = excluded.auth_provider,
+        email_verified = excluded.email_verified,
         status = excluded.status,
         preferred_currency = excluded.preferred_currency,
         two_factor_enabled = excluded.two_factor_enabled,
@@ -2224,14 +2317,22 @@ export class PlayUpDatabase {
 
     for (const u of this.data.users || []) {
       const cred = this.data.userCredentials?.[u.id];
+      const normalizedEmail = String(u.email || '').trim().toLowerCase();
+      const effectiveRole =
+        normalizedEmail === ownerAdminEmail ? 'ADMIN' : u.role === 'ADMIN' ? 'ADMIN' : 'USER';
+      if (effectiveRole === 'ADMIN') {
+        this.sqlite
+          .prepare(`UPDATE users SET role = 'USER' WHERE role = 'ADMIN' AND id != ?`)
+          .run(u.id);
+      }
       upsertStmt.run(
         u.id,
         u.uid || null,
         u.name,
-        u.email,
+        normalizedEmail,
         u.phone || null,
         u.avatarUrl || null,
-        u.role === 'ADMIN' ? 'ADMIN' : 'USER',
+        effectiveRole,
         u.authProvider || 'email',
         u.emailVerified ? 1 : 0,
         u.status || 'active',
@@ -2253,7 +2354,9 @@ export class PlayUpDatabase {
       );
     }
 
-    const adminUser = (this.data.users || []).find(u => u.role === 'ADMIN');
+    const adminUser = (this.data.users || []).find(
+      u => u.role === 'ADMIN' || String(u.email || '').trim().toLowerCase() === ownerAdminEmail
+    );
     if (adminUser) {
       this.sqlite
         .prepare(
@@ -2627,8 +2730,15 @@ export class PlayUpDatabase {
         throw new Error('Échec critique pendant la création de l’utilisateur (avant insertion).');
       }
 
-      // Role decision strictly from locked system_bootstrap.admin_initialized (NEVER from COUNT(users) = 0)
-      let isFirstUser = Number(bootstrapRow.admin_initialized) === 0;
+      // Role decision strictly from locked system_bootstrap.admin_initialized or owner email
+      const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
+      const isOwnerEmail = cleanEmail === ownerAdminEmail;
+      if (isOwnerEmail) {
+        this.sqlite
+          .prepare(`UPDATE users SET role = 'USER' WHERE role = 'ADMIN' AND lower(email) != lower(?)`)
+          .run(ownerAdminEmail);
+      }
+      let isFirstUser = Number(bootstrapRow.admin_initialized) === 0 || isOwnerEmail;
       let assignedRole: 'ADMIN' | 'USER' = isFirstUser ? 'ADMIN' : 'USER';
 
       const userId = 'usr_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
@@ -3936,6 +4046,15 @@ export class PlayUpDatabase {
       this.data.rechargeGamesMargins.manualPricesHtg[pKey] = cleanPriceHtg;
       this.data.rechargeGamesMargins.updatedAt = new Date().toISOString();
     }
+    if (matchedPkg?.id) {
+      this.data.rechargeGamesMargins.manualPricesHtg[matchedPkg.id] = cleanPriceHtg;
+    }
+    if (matchedPkg?.productKey) {
+      this.data.rechargeGamesMargins.manualPricesHtg[matchedPkg.productKey] = cleanPriceHtg;
+    }
+    if (matchedPkg?.externalProductId) {
+      this.data.rechargeGamesMargins.manualPricesHtg[matchedPkg.externalProductId] = cleanPriceHtg;
+    }
 
     let supplierCostUsd = 0;
     let prevSellingPriceHtg = cleanPriceHtg;
@@ -4044,6 +4163,123 @@ export class PlayUpDatabase {
     };
   }
 
+  /**
+   * Updates the custom image URL for a card (package, product, service, or game) in the database
+   * and applies it immediately across all services and RechargeGames products.
+   */
+  public setServiceOrPackageImageUrl(params: {
+    gameId?: string;
+    serviceId?: string;
+    packageId?: string;
+    productKey?: string;
+    imageUrl: string;
+    adminId?: string;
+    adminEmail?: string;
+  }): {
+    imageUrl: string;
+    updatedGame?: Game;
+    updatedService?: Service;
+    updatedPackage?: any;
+    updatedProduct?: RechargeGamesProduct;
+  } {
+    const cleanImageUrl = String(params.imageUrl || '').trim();
+    if (!cleanImageUrl) {
+      throw new Error('Veuillez fournir une URL d’image valide.');
+    }
+
+    if (!this.data.rechargeGamesMargins) {
+      this.data.rechargeGamesMargins = this.getRechargeGamesMargins();
+    }
+    if (!this.data.rechargeGamesMargins.customImageUrls) {
+      this.data.rechargeGamesMargins.customImageUrls = {};
+    }
+
+    let updatedGame: Game | undefined;
+    let updatedService: Service | undefined;
+    let updatedPackage: any | undefined;
+    let updatedProduct: RechargeGamesProduct | undefined;
+
+    if (params.gameId) {
+      const gm = (this.data.games || []).find(g => g.id === params.gameId || g.slug === params.gameId);
+      if (gm) {
+        gm.logo = cleanImageUrl;
+        gm.updatedAt = new Date().toISOString();
+        updatedGame = gm;
+        this.data.rechargeGamesMargins.customImageUrls[gm.id] = cleanImageUrl;
+        if (gm.slug) this.data.rechargeGamesMargins.customImageUrls[gm.slug] = cleanImageUrl;
+      }
+    }
+
+    for (const srv of this.data.services || []) {
+      if (params.serviceId && srv.id === params.serviceId && !params.packageId && !params.productKey) {
+        srv.imageUrl = cleanImageUrl;
+        srv.updatedAt = new Date().toISOString();
+        updatedService = srv;
+        this.data.rechargeGamesMargins.customImageUrls[srv.id] = cleanImageUrl;
+        for (const pkg of srv.packages || []) {
+          pkg.imageUrl = cleanImageUrl;
+        }
+      }
+      for (const pkg of srv.packages || []) {
+        const matchesPkgId = params.packageId && pkg.id === params.packageId;
+        const matchesKey =
+          params.productKey &&
+          (pkg.productKey === params.productKey || pkg.externalProductId === params.productKey);
+        if (matchesPkgId || matchesKey) {
+          pkg.imageUrl = cleanImageUrl;
+          updatedPackage = pkg;
+          updatedService = srv;
+          if (pkg.id) this.data.rechargeGamesMargins.customImageUrls[pkg.id] = cleanImageUrl;
+          if (pkg.productKey) this.data.rechargeGamesMargins.customImageUrls[pkg.productKey] = cleanImageUrl;
+          if (pkg.externalProductId) this.data.rechargeGamesMargins.customImageUrls[pkg.externalProductId] = cleanImageUrl;
+        }
+      }
+    }
+
+    const pKey =
+      params.productKey ||
+      updatedPackage?.productKey ||
+      updatedPackage?.externalProductId ||
+      params.packageId ||
+      '';
+
+    if (pKey) {
+      this.data.rechargeGamesMargins.customImageUrls[pKey] = cleanImageUrl;
+      this.data.rechargeGamesMargins.updatedAt = new Date().toISOString();
+    }
+
+    if (this.data.rechargeGamesProducts) {
+      for (const prod of this.data.rechargeGamesProducts) {
+        if (
+          (pKey && (prod.product_key === pKey || prod.id === pKey)) ||
+          (params.gameId &&
+            !params.packageId &&
+            !params.productKey &&
+            (prod.game_slug === updatedGame?.slug || prod.game.toLowerCase() === updatedGame?.name.toLowerCase()))
+        ) {
+          prod.image_url = cleanImageUrl;
+          updatedProduct = prod;
+        }
+      }
+    }
+
+    this.addSystemLog(
+      'info',
+      'system',
+      `[Image Admin] Image mise à jour (${cleanImageUrl}) pour ${updatedPackage?.name || updatedProduct?.name || updatedService?.name || updatedGame?.name || pKey} par ${params.adminEmail || params.adminId || 'admin'}`
+    );
+
+    this.save();
+
+    return {
+      imageUrl: cleanImageUrl,
+      updatedGame,
+      updatedService,
+      updatedPackage,
+      updatedProduct
+    };
+  }
+
   public recordPriceChangeHistory(
     entry: Omit<PriceChangeHistoryEntry, 'id' | 'timestamp' | 'referenceCurrency' | 'sellingCurrency'>
   ): PriceChangeHistoryEntry {
@@ -4097,7 +4333,11 @@ export class PlayUpDatabase {
     const rate = this.getUsdToHtgExchangeRate();
     const manualPrices = this.data.rechargeGamesMargins?.manualPricesHtg || {};
 
+    const customImages = this.data.rechargeGamesMargins?.customImageUrls || {};
+    const gamesMap = new Map((this.data.games || []).map(g => [g.id, g]));
+
     for (const srv of this.data.services || []) {
+      const gm = gamesMap.get(srv.gameId);
       for (const pkg of srv.packages || []) {
         const immutableUsd = Number(
           (typeof pkg.supplierCostUsd === 'number' && pkg.supplierCostUsd > 0
@@ -4111,11 +4351,20 @@ export class PlayUpDatabase {
         let sellingHtg: number;
         if (pKey && typeof manualPrices[pKey] === 'number' && manualPrices[pKey] > 0) {
           sellingHtg = Number(manualPrices[pKey].toFixed(2));
+        } else if (pkg.id && typeof manualPrices[pkg.id] === 'number' && manualPrices[pkg.id] > 0) {
+          sellingHtg = Number(manualPrices[pkg.id].toFixed(2));
         } else if (typeof pkg.publicPriceHtg === 'number' && pkg.publicPriceHtg > 0) {
           sellingHtg = Number(pkg.publicPriceHtg.toFixed(2));
         } else {
           sellingHtg = Number((Number(pkg.publicPrice || 0) * rate).toFixed(2));
         }
+
+        const customImg =
+          (pKey && customImages[pKey]) ||
+          (pkg.id && customImages[pkg.id]) ||
+          (srv.id && customImages[srv.id]) ||
+          pkg.imageUrl ||
+          resolvePackageImage(pkg, srv, gm);
 
         const sellingUsdEquiv = rate > 0 ? Number((sellingHtg / rate).toFixed(2)) : Number(pkg.publicPrice || 0);
         const profitHtg = Number((sellingHtg - costHtg).toFixed(2));
@@ -4129,7 +4378,8 @@ export class PlayUpDatabase {
           pkg.marginHtg !== marginHtg ||
           pkg.exchangeRateApplied !== rate ||
           pkg.referenceCurrency !== 'USD' ||
-          pkg.sellingCurrency !== 'HTG'
+          pkg.sellingCurrency !== 'HTG' ||
+          pkg.imageUrl !== customImg
         ) {
           pkg.supplierCost = immutableUsd;
           pkg.supplierCostUsd = immutableUsd;
@@ -4145,6 +4395,7 @@ export class PlayUpDatabase {
           pkg.referenceCurrency = 'USD';
           pkg.sellingCurrency = 'HTG';
           pkg.exchangeRateApplied = rate;
+          pkg.imageUrl = customImg;
           modified = true;
         }
       }
@@ -4165,13 +4416,15 @@ export class PlayUpDatabase {
           prod.region,
           prod.product_key
         );
+        const resolvedImg = resolveRechargeGamesProductImage(prod, this.data.games, customImages);
         if (
           prod.provider_price_usd !== immutableProviderUsd ||
           prod.provider_cost_htg !== calc.providerCostHtg ||
           prod.playup_price_htg !== calc.playupPriceHtg ||
           prod.profit_htg !== calc.profitHtg ||
           prod.margin_percent !== calc.marginPercent ||
-          prod.exchange_rate !== rate
+          prod.exchange_rate !== rate ||
+          prod.image_url !== resolvedImg
         ) {
           modified = true;
         }
@@ -4186,6 +4439,7 @@ export class PlayUpDatabase {
           profit_estimate: calc.profit,
           profit_htg: calc.profitHtg,
           manual_price_htg: calc.isManualHtg ? calc.playupPriceHtg : undefined,
+          image_url: resolvedImg,
           reference_currency: 'USD',
           selling_currency: 'HTG',
           exchange_rate: rate,
@@ -4323,6 +4577,7 @@ export class PlayUpDatabase {
       regionMargins: config.regionMargins !== undefined ? config.regionMargins : current.regionMargins,
       productMargins: config.productMargins !== undefined ? config.productMargins : current.productMargins,
       manualPricesHtg: config.manualPricesHtg !== undefined ? config.manualPricesHtg : current.manualPricesHtg || {},
+      customImageUrls: config.customImageUrls !== undefined ? config.customImageUrls : current.customImageUrls || {},
       updatedAt: new Date().toISOString()
     };
     this.data.rechargeGamesMargins = updated;
@@ -4371,6 +4626,7 @@ export class PlayUpDatabase {
 
   public setRechargeGamesProducts(products: RechargeGamesProduct[]) {
     const rate = this.getUsdToHtgExchangeRate();
+    const customImages = this.data.rechargeGamesMargins?.customImageUrls || {};
     const existingByKey = new Map(
       (this.data.rechargeGamesProducts || []).map(p => [p.product_key, p])
     );
@@ -4386,6 +4642,12 @@ export class PlayUpDatabase {
         ).toFixed(2)
       );
       const calc = this.computePlayUpMarginAndPrice(immutableProviderUsd, p.game, p.region, p.product_key);
+      const resolvedImage =
+        customImages[p.product_key] ||
+        customImages[p.id] ||
+        prev?.image_url ||
+        p.image_url ||
+        resolveRechargeGamesProductImage(p, this.data.games, customImages);
       return {
         ...p,
         provider: 'rechargegames',
@@ -4398,6 +4660,7 @@ export class PlayUpDatabase {
         profit_estimate: calc.profit,
         profit_htg: calc.profitHtg,
         manual_price_htg: calc.isManualHtg ? calc.playupPriceHtg : undefined,
+        image_url: resolvedImage,
         reference_currency: 'USD',
         selling_currency: 'HTG',
         exchange_rate: rate,

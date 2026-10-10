@@ -12,6 +12,7 @@ import {
 } from '../../types';
 import { apiClient } from '../../services/apiClient';
 import { safeStorage } from '../../lib/safeStorage';
+import { signInWithGooglePopup, signOutFirebase } from '../../lib/firebase';
 import { GoXtopAdminPanel } from './GoXtopAdminPanel';
 import { RechargeGamesAdminPanel } from './RechargeGamesAdminPanel';
 
@@ -27,6 +28,8 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginInfo, setLoginInfo] = useState<string | null>(null);
+  const [loginLoading, setLoginLoading] = useState<boolean>(false);
 
   // Admin Navigation Tabs
   const [currentTab, setCurrentTab] = useState<
@@ -86,16 +89,71 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError(null);
+    setLoginInfo(null);
+    setLoginLoading(true);
     try {
-      const res = await apiClient.adminLogin(email, password);
+      const res = await apiClient.adminLogin(email.trim(), password);
       setToken(res.token);
       safeStorage.setItem('playup_admin_token', res.token);
       safeStorage.setItem('playup_user_token', res.token);
       if (res.admin) {
         safeStorage.setItem('playup_user_profile', JSON.stringify(res.admin));
       }
+      window.dispatchEvent(new CustomEvent('playup:auth-updated'));
     } catch (err: any) {
       setLoginError(err.message || 'Identifiants invalides');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleAdminGoogleLogin = async () => {
+    setLoginError(null);
+    setLoginInfo(null);
+    setLoginLoading(true);
+    try {
+      const fbUser = await signInWithGooglePopup();
+      const res = await apiClient.socialLoginUser({
+        provider: 'google',
+        uid: fbUser.uid,
+        email: fbUser.email,
+        name: fbUser.name,
+        avatarUrl: fbUser.avatarUrl,
+        idToken: fbUser.idToken,
+        accessToken: fbUser.accessToken
+      });
+      if (res.user.role !== 'ADMIN') {
+        setLoginError(`Accès refusé : le compte ${res.user.email} ne possède pas le rôle ADMIN.`);
+        return;
+      }
+      setToken(res.token);
+      safeStorage.setItem('playup_admin_token', res.token);
+      safeStorage.setItem('playup_user_token', res.token);
+      safeStorage.setItem('playup_user_profile', JSON.stringify(res.user));
+      window.dispatchEvent(new CustomEvent('playup:auth-updated'));
+    } catch (err: any) {
+      setLoginError(err.message || 'Impossible de se connecter avec Google.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleGenerateAdminSecurityCode = async () => {
+    if (!email.trim()) {
+      setLoginError('Veuillez d’abord saisir votre adresse e-mail administrateur ci-dessous.');
+      return;
+    }
+    setLoginError(null);
+    setLoginInfo(null);
+    setLoginLoading(true);
+    try {
+      const res = await apiClient.forgotUserPassword(email.trim());
+      setPassword(res.resetCode);
+      setLoginInfo(`Code de sécurité temporaire généré pour ${res.email} : ${res.resetCode} (pré-rempli ci-dessous, cliquez sur Connexion sécurisée).`);
+    } catch (err: any) {
+      setLoginError(err.message || 'Impossible de générer le code de sécurité.');
+    } finally {
+      setLoginLoading(false);
     }
   };
 
@@ -103,10 +161,12 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
     if (token) {
       apiClient.logoutUser(token).catch(() => {});
     }
+    signOutFirebase().catch(() => {});
     safeStorage.removeItem('playup_admin_token');
     safeStorage.removeItem('playup_user_token');
     safeStorage.removeItem('playup_user_profile');
     setToken(null);
+    window.dispatchEvent(new CustomEvent('playup:auth-updated'));
     onClose();
   };
 
@@ -173,9 +233,16 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
       setInlinePriceInputsHtg(nextInlinePrices);
       setLogs(logsData);
     } catch (err: any) {
-      safeStorage.removeItem('playup_admin_token');
-      setToken(null);
-      setLoginError(err?.message || 'Session administrateur invalide ou rôle ADMIN requis.');
+      if (err?.status === 401 || err?.status === 403) {
+        safeStorage.removeItem('playup_admin_token');
+        setToken(null);
+        setLoginError(err?.message || 'Session administrateur invalide ou rôle ADMIN requis.');
+      } else {
+        setAdminFeedback({
+          type: 'error',
+          text: err?.message || 'Erreur réseau temporaire lors du rafraîchissement des données.'
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -554,34 +621,62 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({ onClose 
             </div>
           )}
 
+          {loginInfo && (
+            <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-xs">
+              {loginInfo}
+            </div>
+          )}
+
           <form onSubmit={handleLogin} className="space-y-4 text-xs">
             <div>
               <label className="font-semibold text-slate-700 block mb-1">Email Administrateur</label>
               <input
                 type="email"
                 required
+                placeholder="leaderlindor@gmail.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
               />
             </div>
             <div>
-              <label className="font-semibold text-slate-700 block mb-1">Mot de passe</label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="font-semibold text-slate-700">Mot de passe ou Code de sécurité</label>
+                <button
+                  type="button"
+                  onClick={handleGenerateAdminSecurityCode}
+                  disabled={loginLoading}
+                  className="text-[11px] font-semibold text-orange-600 hover:underline"
+                >
+                  Obtenir un code de sécurité
+                </button>
+              </div>
               <input
                 type="password"
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                placeholder="Mot de passe ou code à 6 chiffres"
                 className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-xs focus:outline-none focus:border-orange-500"
               />
             </div>
 
-            <div className="pt-2">
+            <div className="pt-1 space-y-2.5">
               <button
                 type="submit"
-                className="w-full py-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded-xl text-xs shadow-md transition-colors"
+                disabled={loginLoading}
+                className="w-full py-3 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-semibold rounded-xl text-xs shadow-md transition-colors"
               >
-                Connexion sécurisée
+                {loginLoading ? 'Vérification...' : 'Connexion sécurisée'}
+              </button>
+
+              <button
+                type="button"
+                disabled={loginLoading}
+                onClick={handleAdminGoogleLogin}
+                className="w-full py-2.5 px-4 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-800 font-semibold rounded-xl text-xs flex items-center justify-center gap-2 transition-colors"
+              >
+                <span>Continuer avec Google</span>
               </button>
             </div>
 

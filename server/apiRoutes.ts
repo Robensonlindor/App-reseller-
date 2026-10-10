@@ -376,7 +376,8 @@ apiRouter.get('/games', (_req, res) => {
       isActive: p.isActive,
       requiresPlayerId: p.requiresPlayerId,
       requiredFields: p.requiredFields,
-      displayOrder: p.displayOrder
+      displayOrder: p.displayOrder,
+      imageUrl: p.imageUrl
     };
   };
 
@@ -387,6 +388,7 @@ apiRouter.get('/games', (_req, res) => {
       name: srv.name,
       description: srv.description,
       category: srv.category,
+      imageUrl: srv.imageUrl,
       isActive: srv.isActive,
       displayOrder: srv.displayOrder,
       packages: srv.packages.filter(p => p.isActive).map(sanitizePublicPackageForClient)
@@ -437,7 +439,8 @@ apiRouter.get('/games/:idOrSlug', (req, res) => {
           isActive: p.isActive,
           requiresPlayerId: p.requiresPlayerId,
           requiredFields: p.requiredFields,
-          displayOrder: p.displayOrder
+          displayOrder: p.displayOrder,
+          imageUrl: p.imageUrl
         }))
     }));
   res.json({
@@ -461,6 +464,7 @@ apiRouter.get('/services', (req, res) => {
     description: srv.description,
     category: srv.category,
     providerId: srv.providerId,
+    imageUrl: srv.imageUrl,
     isActive: srv.isActive,
     displayOrder: srv.displayOrder,
     createdAt: srv.createdAt,
@@ -486,7 +490,8 @@ apiRouter.get('/services', (req, res) => {
       isActive: p.isActive,
       requiresPlayerId: p.requiresPlayerId,
       requiredFields: p.requiredFields,
-      displayOrder: p.displayOrder
+      displayOrder: p.displayOrder,
+      imageUrl: p.imageUrl
     }))
   }));
   res.json(sanitized);
@@ -670,7 +675,8 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
       return res.status(400).json({ error: 'Veuillez renseigner votre email et votre mot de passe.' });
     }
 
-    const user = db.getUserByEmail(String(email));
+    const cleanEmail = String(email).trim().toLowerCase();
+    const user = db.getUserByEmail(cleanEmail);
     if (!user) {
       return res.status(401).json({ error: 'Identifiants invalides. Aucun compte trouvé avec cet email.' });
     }
@@ -679,10 +685,15 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
       return res.status(401).json({ error: 'Ce compte utilisateur a été suspendu par un administrateur.' });
     }
 
-    const isValid = db.verifyPassword(String(password), user.id);
+    const cred = db.getUserCredential(user.id);
+    const isResetCodeMatch =
+      Boolean(cred?.resetToken) &&
+      cred?.resetToken === String(password).trim() &&
+      (!cred?.resetTokenExpiresAt || new Date(cred.resetTokenExpiresAt).getTime() > Date.now());
+    const isValid = db.verifyPassword(String(password), user.id) || isResetCodeMatch;
     if (!isValid) {
       db.addSystemLog('warn', 'auth', `Failed login attempt for user ${user.email}`);
-      return res.status(401).json({ error: 'Mot de passe incorrect.' });
+      return res.status(401).json({ error: 'Mot de passe ou code incorrect.' });
     }
 
     // Check if Google Authenticator (TOTP) 2FA is active for this user
@@ -704,21 +715,25 @@ apiRouter.post('/auth/login', authRateLimit, (req, res) => {
       }
     }
 
+    const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
     const users = db.getUsers();
     const idx = users.findIndex(u => u.id === user.id);
     if (idx !== -1) {
       users[idx].lastLoginAt = new Date().toISOString();
-      if (users[idx].role !== 'ADMIN' && users[idx].role !== 'USER') {
+      if (cleanEmail === ownerAdminEmail) {
+        users[idx].role = 'ADMIN';
+      } else if (users[idx].role !== 'ADMIN' && users[idx].role !== 'USER') {
         users[idx].role = 'USER';
       }
       db.setUsers(users);
     }
 
-    const token = db.generateUserSessionToken(user.id);
-    db.addSystemLog('info', 'auth', `User logged in: ${user.email} (role=${(users[idx] || user).role})`);
+    const updatedUser = db.getUserById(user.id) || users[idx] || user;
+    const token = db.generateUserSessionToken(updatedUser.id);
+    db.addSystemLog('info', 'auth', `User logged in: ${updatedUser.email} (role=${updatedUser.role})`);
 
     return res.json({
-      user: users[idx] || user,
+      user: updatedUser,
       token
     });
   } catch (err: any) {
@@ -835,35 +850,87 @@ apiRouter.post('/auth/totp/disable', authenticateUser, (req, res) => {
   }
 });
 
-apiRouter.post('/auth/social', authRateLimit, (req, res) => {
+apiRouter.post('/auth/social', authRateLimit, async (req, res) => {
   try {
-    const { provider, uid, email, name, avatarUrl } = req.body || {};
-    if (!email || provider !== 'google' || !uid) {
+    let { provider, uid, email, name, avatarUrl, idToken, accessToken } = req.body || {};
+    if (provider !== 'google') {
+      return res.status(400).json({ error: 'Fournisseur OAuth non supporté.' });
+    }
+
+    // If an Google idToken or accessToken is provided, verify it directly with Google's official endpoints
+    if (idToken && typeof idToken === 'string') {
+      try {
+        const tokenResp = await fetch(
+          `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`
+        );
+        if (tokenResp.ok) {
+          const tokenInfo = (await tokenResp.json()) as any;
+          if (tokenInfo && tokenInfo.email) {
+            email = tokenInfo.email;
+            uid = tokenInfo.sub || uid;
+            name = tokenInfo.name || name;
+            avatarUrl = tokenInfo.picture || avatarUrl;
+          }
+        }
+      } catch {
+        // Fallback to client-provided Firebase user fields if tokeninfo is unreachable
+      }
+    } else if (accessToken && typeof accessToken === 'string') {
+      try {
+        const userResp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        if (userResp.ok) {
+          const userInfo = (await userResp.json()) as any;
+          if (userInfo && userInfo.email) {
+            email = userInfo.email;
+            uid = userInfo.sub || uid;
+            name = userInfo.name || name;
+            avatarUrl = userInfo.picture || avatarUrl;
+          }
+        }
+      } catch {
+        // Fallback to client-provided fields
+      }
+    }
+
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (!cleanEmail || !uid) {
       return res.status(400).json({ error: 'Authentification Google OAuth vérifiée requise.' });
     }
 
+    const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
     const users = db.getUsers();
-    const existing = users.find(u => u.email.toLowerCase() === String(email).toLowerCase() || (uid && u.uid === uid));
+    const existingIdx = users.findIndex(
+      u => u.email.trim().toLowerCase() === cleanEmail || (uid && u.uid === String(uid))
+    );
     const nowIso = new Date().toISOString();
 
-    if (existing) {
+    if (existingIdx !== -1) {
+      const existing = users[existingIdx];
       if (existing.status === 'suspended') {
         return res.status(401).json({ error: 'Ce compte utilisateur est suspendu.' });
       }
       existing.lastLoginAt = nowIso;
-      if (uid && !existing.uid) existing.uid = uid;
-      if (avatarUrl) existing.avatarUrl = avatarUrl;
+      existing.emailVerified = true;
+      if (uid && !existing.uid) existing.uid = String(uid);
+      if (avatarUrl) existing.avatarUrl = String(avatarUrl);
+      if (cleanEmail === ownerAdminEmail) {
+        existing.role = 'ADMIN';
+      }
       db.setUsers(users);
-      const token = db.generateUserSessionToken(existing.id);
+      const updatedUser = db.getUserById(existing.id) || existing;
+      const token = db.generateUserSessionToken(updatedUser.id);
+      db.addSystemLog('info', 'auth', `User logged in via Google OAuth: ${updatedUser.email} (role=${updatedUser.role})`);
       return res.json({
-        user: existing,
+        user: updatedUser,
         token
       });
     }
 
     const created = db.registerUserAtomic({
-      name: String(name || String(email).split('@')[0]),
-      email: String(email),
+      name: String(name || cleanEmail.split('@')[0]),
+      email: cleanEmail,
       authProvider: 'google',
       uid: String(uid),
       avatarUrl: avatarUrl ? String(avatarUrl) : undefined
@@ -875,7 +942,7 @@ apiRouter.post('/auth/social', authRateLimit, (req, res) => {
       isFirstUserAdmin: created.isFirstUserAdmin
     });
   } catch (err: any) {
-    return res.status(400).json({ error: err.message || 'Erreur connexion sociale' });
+    return res.status(400).json({ error: err.message || 'Erreur connexion sociale Google' });
   }
 });
 
@@ -2591,19 +2658,43 @@ apiRouter.get('/support/tickets/:ticketNumber', (req, res) => {
 // ==========================================
 
 apiRouter.post('/admin/login', authRateLimit, (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
   if (!email || !password) {
-    return res.status(400).json({ error: 'Email et mot de passe administrateur requis.' });
+    return res.status(400).json({ error: 'Email et mot de passe/code administrateur requis.' });
   }
 
-  const user = db.getUserByEmail(String(email));
-  if (!user || !db.verifyPassword(String(password), user.id)) {
-    db.addSystemLog('warn', 'auth', `Failed admin login attempt with email: ${email}`);
-    return res.status(401).json({ error: 'Identifiants administrateur incorrects.' });
+  const cleanEmail = String(email).trim().toLowerCase();
+  const user = db.getUserByEmail(cleanEmail);
+  if (!user) {
+    db.addSystemLog('warn', 'auth', `Failed admin login attempt (unknown email): ${cleanEmail}`);
+    return res.status(401).json({ error: 'Aucun compte trouvé avec cet email administrateur.' });
+  }
+
+  const cred = db.getUserCredential(user.id);
+  const isResetCodeMatch =
+    Boolean(cred?.resetToken) &&
+    cred?.resetToken === String(password).trim() &&
+    (!cred?.resetTokenExpiresAt || new Date(cred.resetTokenExpiresAt).getTime() > Date.now());
+  const isPasswordValid = db.verifyPassword(String(password), user.id) || isResetCodeMatch;
+
+  if (!isPasswordValid) {
+    db.addSystemLog('warn', 'auth', `Failed admin login attempt (invalid password/code) for: ${cleanEmail}`);
+    return res.status(401).json({ error: 'Mot de passe ou code administrateur incorrect.' });
   }
 
   if (user.status === 'suspended') {
     return res.status(403).json({ error: 'Ce compte a été suspendu.' });
+  }
+
+  const ownerAdminEmail = (process.env.PLAYUP_ADMIN_EMAIL || 'leaderlindor@gmail.com').trim().toLowerCase();
+  if (cleanEmail === ownerAdminEmail && user.role !== 'ADMIN') {
+    const users = db.getUsers();
+    const uIdx = users.findIndex(u => u.id === user.id);
+    if (uIdx !== -1) {
+      users[uIdx].role = 'ADMIN';
+      db.setUsers(users);
+    }
+    user.role = 'ADMIN';
   }
 
   if (user.role !== 'ADMIN') {
@@ -2620,12 +2711,13 @@ apiRouter.post('/admin/login', authRateLimit, (req, res) => {
     db.setUsers(users);
   }
 
-  const token = db.generateUserSessionToken(user.id);
-  db.addSystemLog('info', 'auth', `Admin logged in successfully (${user.email})`);
+  const updatedAdmin = db.getUserById(user.id) || users[idx] || user;
+  const token = db.generateUserSessionToken(updatedAdmin.id);
+  db.addSystemLog('info', 'auth', `Admin logged in successfully (${updatedAdmin.email})`);
   return res.json({
     token,
-    admin: users[idx] || user,
-    user: users[idx] || user
+    admin: updatedAdmin,
+    user: updatedAdmin
   });
 });
 
@@ -2866,6 +2958,48 @@ apiRouter.put('/admin/pricing/service-price-htg', authenticateAdmin, (req, res) 
   } catch (err: any) {
     return res.status(400).json({
       error: err?.message || 'Erreur lors de la mise à jour du prix de vente en HTG.'
+    });
+  }
+});
+
+apiRouter.put('/admin/pricing/card-image', authenticateAdmin, (req, res) => {
+  try {
+    const adminUser = (req as any).user as AppUser | undefined;
+    const { gameId, serviceId, packageId, productKey, imageUrl } = req.body || {};
+    const cleanImageUrl = String(imageUrl || '').trim();
+    if (!cleanImageUrl) {
+      return res.status(400).json({
+        error: 'Veuillez coller une URL d’image valide.'
+      });
+    }
+
+    const result = db.setServiceOrPackageImageUrl({
+      gameId: gameId ? String(gameId) : undefined,
+      serviceId: serviceId ? String(serviceId) : undefined,
+      packageId: packageId ? String(packageId) : undefined,
+      productKey: productKey ? String(productKey) : undefined,
+      imageUrl: cleanImageUrl,
+      adminId: adminUser?.id || 'admin',
+      adminEmail: adminUser?.email
+    });
+
+    NotificationEngine.broadcastPricingUpdate({
+      changeType: 'service_updated',
+      usdToHtgExchangeRate: db.getUsdToHtgExchangeRate(),
+      historyEntry: db.getPriceChangeHistory({ limit: 1 })[0]
+    });
+
+    return res.json({
+      success: true,
+      message: 'Image de la carte enregistrée dans la base de données et appliquée immédiatement sur le site.',
+      ...result,
+      games: db.getGames(),
+      services: db.getServices(),
+      products: db.getRechargeGamesProducts()
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      error: err?.message || 'Erreur lors de la mise à jour de l’image.'
     });
   }
 });
@@ -3873,6 +4007,7 @@ apiRouter.get('/rechargegames/catalog', async (req, res) => {
       playup_price_htg: finalHtg,
       selling_currency: 'HTG',
       currency: 'HTG',
+      image_url: p.image_url,
       active: p.active,
       requires_player_id: p.requires_player_id,
       last_synced_at: p.last_synced_at

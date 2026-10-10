@@ -117,7 +117,13 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
     setUserToken(token);
     safeStorage.setItem('playup_user_token', token);
     safeStorage.setItem('playup_user_profile', JSON.stringify(user));
+    if (user.role === 'ADMIN') {
+      safeStorage.setItem('playup_admin_token', token);
+    } else {
+      safeStorage.removeItem('playup_admin_token');
+    }
     onAuthChange?.(user);
+    window.dispatchEvent(new CustomEvent('playup:auth-updated'));
     setProfileName(user.name);
     setProfilePhone(user.phone || '');
     setProfileCurrency(user.preferredCurrency || 'USD');
@@ -135,6 +141,11 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
       const data = await apiClient.getUserProfile(tokenToUse);
       setAuthUser(data.user);
       safeStorage.setItem('playup_user_profile', JSON.stringify(data.user));
+      if (data.user.role === 'ADMIN') {
+        safeStorage.setItem('playup_admin_token', tokenToUse);
+      } else {
+        safeStorage.removeItem('playup_admin_token');
+      }
       onAuthChange?.(data.user);
       setOrders(data.orders || []);
       setTransactions(data.paymentTransactions || []);
@@ -146,13 +157,16 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
       setProfileTwoFactor(Boolean(data.user.twoFactorEnabled));
       setProfileEmailNotifs(data.user.emailNotifications !== false);
       setProfilePushNotifs(data.user.pushNotificationsEnabled !== false);
-    } catch {
-      // Invalid or expired session: immediately purge local state
-      safeStorage.removeItem('playup_user_token');
-      safeStorage.removeItem('playup_user_profile');
-      setAuthUser(null);
-      setUserToken('');
-      onAuthChange?.(null);
+    } catch (err: any) {
+      // Only purge local state if the server explicitly rejected the token with 401 Unauthorized
+      if (err?.status === 401) {
+        safeStorage.removeItem('playup_user_token');
+        safeStorage.removeItem('playup_user_profile');
+        safeStorage.removeItem('playup_admin_token');
+        setAuthUser(null);
+        setUserToken('');
+        onAuthChange?.(null);
+      }
     }
   };
 
@@ -225,7 +239,9 @@ export const UserAccountView: React.FC<UserAccountViewProps> = ({
         uid: fbUser.uid,
         email: fbUser.email,
         name: fbUser.name,
-        avatarUrl: fbUser.avatarUrl
+        avatarUrl: fbUser.avatarUrl,
+        idToken: fbUser.idToken,
+        accessToken: fbUser.accessToken
       });
       syncSession(res.user, res.token);
       await refreshProfileData(res.token);

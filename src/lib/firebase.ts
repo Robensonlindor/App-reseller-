@@ -1,291 +1,264 @@
-import { initializeApp, FirebaseApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
-  initializeAuth,
-  inMemoryPersistence,
-  browserLocalPersistence,
   GoogleAuthProvider,
   signInWithPopup,
-  signOut,
-  Auth
+  signInWithRedirect,
+  getRedirectResult,
+  browserPopupRedirectResolver,
+  signOut as fbSignOut,
+  onAuthStateChanged,
+  User as FirebaseUser
 } from 'firebase/auth';
-import {
-  getFirestore,
-  doc,
-  getDocFromServer,
-  setDoc,
-  getDoc,
-  serverTimestamp,
-  Firestore
-} from 'firebase/firestore';
+import { getFirestore, doc, setDoc } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-let appInstance: FirebaseApp | null = null;
-let dbInstance: Firestore | null = null;
-let authInstance: Auth | null = null;
-let googleProviderInstance: GoogleAuthProvider | null = null;
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+export const firebaseAuth = getAuth(app);
+export const firebaseFirestore = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
 
-function ensureFirebaseInitialized() {
-  if (!appInstance) {
-    try {
-      appInstance = initializeApp(firebaseConfig);
-    } catch (e) {
-      console.warn('[PlayUp Firebase] App initialization fallback:', e);
+export interface GoogleSignInResult {
+  uid: string;
+  email: string;
+  name: string;
+  avatarUrl?: string;
+  idToken?: string;
+  accessToken?: string;
+}
+
+declare global {
+  interface Window {
+    google?: any;
+  }
+}
+
+function loadGoogleIdentityServicesScript(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') {
+      reject(new Error('Environnement navigateur requis.'));
+      return;
     }
+    if (window.google?.accounts?.oauth2) {
+      resolve();
+      return;
+    }
+    const existingScript = document.getElementById('google-gsi-client-script') as HTMLScriptElement | null;
+    if (existingScript) {
+      existingScript.addEventListener('load', () => resolve());
+      existingScript.addEventListener('error', () => reject(new Error('Impossible de charger Google Identity Services.')));
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = 'google-gsi-client-script';
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Impossible de charger le script Google OAuth.'));
+    document.head.appendChild(script);
+  });
+}
+
+async function signInWithGoogleIdentityServicesFallback(): Promise<GoogleSignInResult> {
+  const clientId = (firebaseConfig as any).oAuthClientId;
+  if (!clientId) {
+    throw new Error('Aucun oAuthClientId configuré dans firebase-applet-config.json.');
+  }
+  await loadGoogleIdentityServicesScript();
+  if (!window.google?.accounts?.oauth2) {
+    throw new Error('Google Identity Services indisponible dans ce navigateur.');
   }
 
-  if (appInstance && !dbInstance) {
+  return new Promise<GoogleSignInResult>((resolve, reject) => {
     try {
-      dbInstance = getFirestore(appInstance, firebaseConfig.firestoreDatabaseId);
-    } catch (e) {
-      console.warn('[PlayUp Firebase] Firestore initialization fallback:', e);
-    }
-  }
-
-  if (appInstance && !authInstance) {
-    try {
-      // Try standard browser persistence first, fall back to inMemoryPersistence if iframe blocks localStorage/IndexedDB
-      authInstance = initializeAuth(appInstance, {
-        persistence: [browserLocalPersistence, inMemoryPersistence]
+      const tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: 'openid email profile',
+        prompt: 'select_account',
+        callback: async (tokenResponse: any) => {
+          if (tokenResponse?.error) {
+            reject(new Error(tokenResponse.error_description || tokenResponse.error || 'Connexion Google annulée.'));
+            return;
+          }
+          const accessToken = tokenResponse?.access_token;
+          if (!accessToken) {
+            reject(new Error('Jeton d’accès Google manquant.'));
+            return;
+          }
+          try {
+            const resp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+              headers: { Authorization: `Bearer ${accessToken}` }
+            });
+            if (!resp.ok) {
+              throw new Error('Impossible de récupérer le profil Google vérifié.');
+            }
+            const profile = await resp.json();
+            if (!profile?.email) {
+              throw new Error('Aucune adresse email renvoyée par Google.');
+            }
+            resolve({
+              uid: String(profile.sub || profile.email),
+              email: String(profile.email).trim().toLowerCase(),
+              name: String(profile.name || profile.given_name || profile.email.split('@')[0]),
+              avatarUrl: profile.picture || undefined,
+              accessToken
+            });
+          } catch (fetchErr: any) {
+            reject(fetchErr);
+          }
+        },
+        error_callback: (err: any) => {
+          if (err?.type === 'popup_closed') {
+            reject(new Error('La fenêtre de connexion Google a été fermée avant la validation.'));
+          } else if (err?.type === 'popup_failed_to_open') {
+            reject(new Error('Le navigateur a bloqué la fenêtre popup Google. Autorisez les popups pour ce site.'));
+          } else {
+            reject(new Error(err?.message || 'Erreur lors de l’ouverture de Google OAuth.'));
+          }
+        }
       });
-    } catch {
+
+      tokenClient.requestAccessToken();
+    } catch (e: any) {
+      reject(e);
+    }
+  });
+}
+
+export async function consumeGoogleRedirectResult(): Promise<GoogleSignInResult | null> {
+  try {
+    const result = await getRedirectResult(firebaseAuth);
+    if (!result || !result.user || !result.user.email) {
+      return null;
+    }
+    const user = result.user;
+    const idToken = await user.getIdToken();
+    return {
+      uid: user.uid,
+      email: user.email!.trim().toLowerCase(),
+      name: user.displayName || user.email!.split('@')[0],
+      avatarUrl: user.photoURL || undefined,
+      idToken
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function signInWithGooglePopup(): Promise<GoogleSignInResult> {
+  if (!isFirebaseConfigured()) {
+    throw new Error('Firebase Auth non configuré.');
+  }
+
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
+  try {
+    const result = await signInWithPopup(firebaseAuth, provider, browserPopupRedirectResolver);
+    const user = result.user;
+    if (!user.email) {
+      throw new Error('Aucune adresse email associée à ce compte Google.');
+    }
+    const idToken = await user.getIdToken();
+
+    return {
+      uid: user.uid,
+      email: user.email.trim().toLowerCase(),
+      name: user.displayName || user.email.split('@')[0],
+      avatarUrl: user.photoURL || undefined,
+      idToken
+    };
+  } catch (err: any) {
+    const code = String(err?.code || '');
+    const currentDomain = typeof window !== 'undefined' ? window.location.hostname : '';
+
+    // User explicitly closed the popup
+    if (code === 'auth/popup-closed-by-user') {
+      throw new Error('Connexion Google annulée : la fenêtre a été fermée.');
+    }
+
+    // If Firebase Auth domain isn't yet authorized or popup resolver failed, try Google Identity Services OAuth2 client
+    if (
+      code === 'auth/unauthorized-domain' ||
+      code === 'auth/operation-not-supported-in-this-environment' ||
+      code === 'auth/popup-blocked' ||
+      code === 'auth/CancelledPopupRequest' ||
+      code === 'auth/cancelled-popup-request' ||
+      code === 'auth/internal-error'
+    ) {
       try {
-        authInstance = getAuth(appInstance);
-      } catch (e) {
-        console.warn('[PlayUp Firebase] Auth initialization fallback:', e);
+        return await signInWithGoogleIdentityServicesFallback();
+      } catch (gisErr: any) {
+        if (code === 'auth/unauthorized-domain') {
+          throw new Error(
+            `Domaine non autorisé dans Firebase Auth (${currentDomain}). Ajoutez "${currentDomain}" dans Firebase Console > Authentication > Settings > Authorized domains (projet ${firebaseConfig.projectId}).`
+          );
+        }
+        if (code === 'auth/popup-blocked') {
+          await signInWithRedirect(firebaseAuth, provider);
+          throw new Error('Redirection vers Google OAuth en cours...');
+        }
+        throw new Error(gisErr?.message || err?.message || 'Erreur lors de la connexion Google.');
       }
     }
+
+    throw new Error(err?.message || 'Impossible de se connecter avec Google.');
   }
-
-  if (!googleProviderInstance) {
-    try {
-      googleProviderInstance = new GoogleAuthProvider();
-    } catch {
-      // Ignore
-    }
-  }
-
-  return {
-    app: appInstance,
-    db: dbInstance,
-    auth: authInstance,
-    googleProvider: googleProviderInstance
-  };
 }
 
-// Initialize safely without ever throwing at module load time
-const initialized = ensureFirebaseInitialized();
-export const db = initialized.db;
-export const auth = initialized.auth;
-export const googleProvider = initialized.googleProvider;
-
-export enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-export interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
-  };
-}
-
-export function handleFirestoreError(
-  error: unknown,
-  operationType: OperationType,
-  path: string | null
-) {
-  const { auth: currentAuth } = ensureFirebaseInitialized();
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: currentAuth?.currentUser?.uid,
-      email: currentAuth?.currentUser?.email,
-      emailVerified: currentAuth?.currentUser?.emailVerified,
-      isAnonymous: currentAuth?.currentUser?.isAnonymous,
-      tenantId: currentAuth?.currentUser?.tenantId,
-      providerInfo:
-        currentAuth?.currentUser?.providerData?.map(provider => ({
-          providerId: provider.providerId,
-          email: provider.email,
-        })) || [],
-    },
-    operationType,
-    path,
-  };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
-}
-
-export async function testFirestoreConnection() {
-  const { db: currentDb } = ensureFirebaseInitialized();
-  if (!currentDb) return;
+export async function signOutFirebase(): Promise<void> {
   try {
-    await getDocFromServer(doc(currentDb, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
+    await fbSignOut(firebaseAuth);
+  } catch {
+    // Ignore if not signed into firebase
   }
 }
 
-export async function syncFirebaseUserToFirestore(
-  uid: string,
-  displayName: string,
-  email: string,
-  phone?: string,
-  preferredCurrency: 'USD' | 'HTG' | 'EUR' = 'USD'
-) {
-  const { db: currentDb } = ensureFirebaseInitialized();
-  if (!currentDb) return;
-
-  const sanitizedDisplayName = (displayName || 'PlayUp Gamer').slice(0, 80);
-  const sanitizedEmail = (email || '').slice(0, 160);
-  const publicPath = `users/${uid}`;
-  const privatePath = `users/${uid}/private/info`;
-
-  try {
-    const existingSnap = await getDoc(doc(currentDb, 'users', uid));
-    if (!existingSnap.exists()) {
-      await setDoc(doc(currentDb, 'users', uid), {
-        uid,
-        displayName: sanitizedDisplayName,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, publicPath);
-  }
-
-  try {
-    const existingPrivSnap = await getDoc(doc(currentDb, 'users', uid, 'private', 'info'));
-    if (!existingPrivSnap.exists()) {
-      await setDoc(doc(currentDb, 'users', uid, 'private', 'info'), {
-        uid,
-        email: sanitizedEmail,
-        ...(phone ? { phone: phone.slice(0, 32) } : {}),
-        preferredCurrency,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, privatePath);
-  }
+export function subscribeToFirebaseAuth(callback: (user: FirebaseUser | null) => void) {
+  return onAuthStateChanged(firebaseAuth, callback);
 }
 
-export async function signInWithGooglePopup() {
-  const { auth: currentAuth, googleProvider: provider } = ensureFirebaseInitialized();
-  if (!currentAuth || !provider) {
-    throw new Error('Service Google Auth non disponible dans cet environnement.');
-  }
-  const credential = await signInWithPopup(currentAuth, provider);
-  const fbUser = credential.user;
-  const idToken = await fbUser.getIdToken();
-
-  if (fbUser.emailVerified) {
-    await syncFirebaseUserToFirestore(
-      fbUser.uid,
-      fbUser.displayName || fbUser.email?.split('@')[0] || 'PlayUp User',
-      fbUser.email || ''
-    ).catch(err => console.warn('[PlayUp Firebase] Firestore profile sync warning:', err));
-  }
-
-  return {
-    uid: fbUser.uid,
-    email: fbUser.email || '',
-    name: fbUser.displayName || fbUser.email?.split('@')[0] || 'PlayUp User',
-    avatarUrl: fbUser.photoURL || undefined,
-    emailVerified: fbUser.emailVerified,
-    idToken,
-  };
-}
-
-export async function signOutFirebase() {
-  const { auth: currentAuth } = ensureFirebaseInitialized();
-  if (currentAuth) {
-    await signOut(currentAuth);
-  }
+export function isFirebaseConfigured(): boolean {
+  return Boolean(
+    firebaseConfig &&
+      firebaseConfig.apiKey &&
+      firebaseConfig.apiKey !== 'YOUR_API_KEY' &&
+      !firebaseConfig.apiKey.includes('placeholder') &&
+      firebaseConfig.projectId
+  );
 }
 
 export async function syncWebhookEventIdempotencyToFirestore(record: {
   eventId: string;
-  eventType: 'webhook.test' | 'order.delivered' | 'order.refunded' | 'order.failed';
+  eventType?: string;
+  status?: string;
+  processedAt?: string;
+  payloadHash?: string;
   providerOrderId?: string;
   playupOrderId?: string;
   buyerRef?: string;
-  signatureHash: string;
-}) {
-  const { db: currentDb, auth: currentAuth } = ensureFirebaseInitialized();
-  if (!currentDb || !currentAuth?.currentUser || !currentAuth.currentUser.emailVerified) {
-    return;
-  }
-
-  const sanitizedEventId = String(record.eventId || '')
-    .trim()
-    .replace(/[^a-zA-Z0-9_\-]/g, '_')
-    .slice(0, 128);
-  if (!sanitizedEventId) return;
-
-  const docPath = `webhook_events/${sanitizedEventId}`;
-
-  let existsAlready = false;
+}): Promise<boolean> {
+  if (!record?.eventId || !isFirebaseConfigured()) return false;
   try {
-    const snap = await getDoc(doc(currentDb, 'webhook_events', sanitizedEventId));
-    existsAlready = snap.exists();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, docPath);
-  }
-
-  if (existsAlready) return;
-
-  const payload: Record<string, any> = {
-    eventId: sanitizedEventId,
-    provider: 'rechargegames',
-    eventType: record.eventType,
-    status: 'processed',
-    signatureHash: String(record.signatureHash || 'verified_hmac_sha256')
-      .replace(/[^a-zA-Z0-9_\-]/g, '_')
-      .slice(0, 128),
-    processedAt: serverTimestamp()
-  };
-
-  if (record.providerOrderId) {
-    payload.providerOrderId = String(record.providerOrderId)
-      .replace(/[^a-zA-Z0-9_\-]/g, '_')
-      .slice(0, 64);
-  }
-  if (record.playupOrderId) {
-    payload.playupOrderId = String(record.playupOrderId)
-      .replace(/[^a-zA-Z0-9_\-]/g, '_')
-      .slice(0, 64);
-  }
-  if (record.buyerRef) {
-    payload.buyerRef = String(record.buyerRef)
-      .replace(/[^a-zA-Z0-9_\-]/g, '_')
-      .slice(0, 64);
-  }
-
-  try {
-    await setDoc(doc(currentDb, 'webhook_events', sanitizedEventId), payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, docPath);
+    const safeId = String(record.eventId).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+    const ref = doc(firebaseFirestore, 'webhook_events', safeId);
+    await setDoc(
+      ref,
+      {
+        eventId: String(record.eventId),
+        eventType: String(record.eventType || 'order.updated'),
+        status: String(record.status || 'processed'),
+        processedAt: String(record.processedAt || new Date().toISOString()),
+        payloadHash: String(record.payloadHash || ''),
+        ...(record.providerOrderId ? { providerOrderId: String(record.providerOrderId) } : {}),
+        ...(record.playupOrderId ? { playupOrderId: String(record.playupOrderId) } : {}),
+        ...(record.buyerRef ? { buyerRef: String(record.buyerRef) } : {})
+      },
+      { merge: true }
+    );
+    return true;
+  } catch {
+    return false;
   }
 }
 

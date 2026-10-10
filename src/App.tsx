@@ -22,6 +22,7 @@ import { apiClient } from './services/apiClient';
 import { Language } from './i18n';
 import { INITIAL_GAMES, INITIAL_SERVICES, INITIAL_SETTINGS } from './data/initialData';
 import { safeStorage } from './lib/safeStorage';
+import { consumeGoogleRedirectResult } from './lib/firebase';
 
 const VALID_TABS = new Set(['home', 'services', 'reseller', 'api-docs', 'download', 'support', 'account']);
 
@@ -74,38 +75,63 @@ export default function App() {
     }
   }, [minSplashElapsed, showStartupSplash]);
 
-  // Verify any existing local token against the backend on startup
+  // Verify any existing local token against the backend on startup & keep session alive
   const verifyCurrentSession = useCallback(async () => {
-    const token = safeStorage.getItem('playup_user_token');
+    let token = safeStorage.getItem('playup_user_token') || safeStorage.getItem('playup_admin_token');
+
+    // Check if returning from a Google OAuth redirect flow
     if (!token) {
-      safeStorage.removeItem('playup_user_profile');
-      safeStorage.removeItem('playup_admin_token');
+      const redirectResult = await consumeGoogleRedirectResult();
+      if (redirectResult && redirectResult.email) {
+        try {
+          const socialRes = await apiClient.socialLoginUser({
+            provider: 'google',
+            uid: redirectResult.uid,
+            email: redirectResult.email,
+            name: redirectResult.name,
+            avatarUrl: redirectResult.avatarUrl,
+            idToken: redirectResult.idToken,
+            accessToken: redirectResult.accessToken
+          });
+          if (socialRes?.user && socialRes?.token) {
+            safeStorage.setItem('playup_user_token', socialRes.token);
+            safeStorage.setItem('playup_user_profile', JSON.stringify(socialRes.user));
+            if (socialRes.user.role === 'ADMIN') {
+              safeStorage.setItem('playup_admin_token', socialRes.token);
+            }
+            setAuthUser(socialRes.user);
+            return;
+          }
+        } catch {
+          // ignore redirect error
+        }
+      }
       setAuthUser(null);
-      setIsAdminOpen(false);
       return;
     }
+
     try {
       const res = await apiClient.getUserProfile(token);
       if (res && res.user) {
         setAuthUser(res.user);
+        safeStorage.setItem('playup_user_token', token);
         safeStorage.setItem('playup_user_profile', JSON.stringify(res.user));
-        if (res.user.role !== 'ADMIN') {
+        if (res.user.role === 'ADMIN') {
+          safeStorage.setItem('playup_admin_token', token);
+        } else {
           safeStorage.removeItem('playup_admin_token');
           setIsAdminOpen(false);
         }
-      } else {
+      }
+    } catch (err: any) {
+      // Only clear session if backend explicitly rejected the token with 401 Unauthorized
+      if (err?.status === 401) {
         safeStorage.removeItem('playup_user_token');
         safeStorage.removeItem('playup_user_profile');
         safeStorage.removeItem('playup_admin_token');
         setAuthUser(null);
         setIsAdminOpen(false);
       }
-    } catch {
-      safeStorage.removeItem('playup_user_token');
-      safeStorage.removeItem('playup_user_profile');
-      safeStorage.removeItem('playup_admin_token');
-      setAuthUser(null);
-      setIsAdminOpen(false);
     }
   }, []);
 
@@ -150,6 +176,19 @@ export default function App() {
   useEffect(() => {
     loadBackendCatalog();
     verifyCurrentSession();
+
+    const handleAuthSync = () => {
+      verifyCurrentSession();
+    };
+    window.addEventListener('playup:auth-updated', handleAuthSync);
+    const sessionHeartbeat = setInterval(() => {
+      verifyCurrentSession();
+    }, 90000);
+
+    return () => {
+      window.removeEventListener('playup:auth-updated', handleAuthSync);
+      clearInterval(sessionHeartbeat);
+    };
   }, [loadBackendCatalog, verifyCurrentSession]);
 
   // Real-time subscription to USD->HTG exchange rate & HTG price updates
@@ -223,14 +262,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Banner Notice if in maintenance or announcement */}
-      {settings?.announcementNotice && (
-        <div className="bg-slate-950 text-white text-[11px] py-1.5 px-4 text-center border-b border-slate-800">
-          <span className="font-semibold text-orange-400">Information Système :</span>{' '}
-          {settings.announcementNotice}
-        </div>
-      )}
-
       {/* Non-blocking Backend Warning / Retry Banner if backend is unreachable */}
       {backendError && (
         <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-xs text-amber-900 flex items-center justify-between gap-2">
@@ -260,7 +291,7 @@ export default function App() {
       />
 
       {/* Main Dynamic View Content */}
-      <main className="flex-1 w-full">
+      <main className="flex-1 w-full max-w-full overflow-x-hidden">
         {currentTab === 'home' && (
           <HomeView
             games={games}

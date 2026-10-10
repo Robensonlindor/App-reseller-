@@ -103,13 +103,13 @@ export const INITIAL_GAMES: Game[] = [
     slug: 'cod-mobile',
     name: 'Call of Duty: Mobile',
     externalGameId: 'codm_sgmy',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     supportsNameCheck: true,
     requiresPlayerId: true,
     category: 'FPS Mobile',
-    description: 'Packs CP Call of Duty Mobile via GoXtop avec vérification du Player ID.',
-    logo: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
-    banner: '/src/assets/images/game_cover_pubg_1790988886654.jpg',
+    description: 'Packs CP Call of Duty Mobile officiels avec vérification du Player ID.',
+    logo: '/src/assets/images/game_cover_codm_1791597775192.jpg',
+    banner: '/src/assets/images/game_cover_codm_1791597775192.jpg',
     isActive: true,
     displayOrder: 4,
     fields: [
@@ -131,17 +131,101 @@ export const INITIAL_GAMES: Game[] = [
     slug: 'roblox',
     name: 'Roblox (Codes Digitaux / Vouchers)',
     externalGameId: 'roblox',
-    providerId: 'prov_goxtop',
+    providerId: 'prov_rechargegames',
     supportsNameCheck: false,
     requiresPlayerId: false,
     category: 'Voucher / Gift Card',
     description: 'Codes Robux digitaux officiels livrés instantanément (aucun Player ID requis pour les codes PIN).',
-    logo: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
-    banner: '/src/assets/images/game_cover_freefire_1790988876938.jpg',
+    logo: '/src/assets/images/game_cover_roblox_1791597763017.jpg',
+    banner: '/src/assets/images/game_cover_roblox_1791597763017.jpg',
     isActive: true,
     displayOrder: 5,
-    fields: [], // Aucun champ inutile pour les vouchers qui ne nécessitent pas de Player ID
+    fields: [],
     createdAt: '2026-02-01T10:00:00Z',
+    updatedAt: '2026-03-20T12:00:00Z'
+  },
+  {
+    id: 'game_genshin',
+    slug: 'genshin-impact',
+    name: 'Genshin Impact',
+    externalGameId: 'genshin-impact',
+    providerId: 'prov_rechargegames',
+    supportsNameCheck: true,
+    requiresPlayerId: true,
+    category: 'Action RPG',
+    description: 'Recharges officielles de Genesis Crystals et Bénédiction de la Lune (Global, America, Europe, Asia).',
+    logo: '/src/assets/images/game_cover_genshin_1791597787503.jpg',
+    banner: '/src/assets/images/game_cover_genshin_1791597787503.jpg',
+    isActive: true,
+    displayOrder: 6,
+    fields: [
+      {
+        id: 'f_genshin_player_id',
+        name: 'playerId',
+        label: 'Genshin Impact UID',
+        placeholder: 'ex: 601234567',
+        type: 'text',
+        required: true,
+        helperText: 'Votre UID à 9 chiffres affiché en bas à droite de l’écran en jeu.'
+      }
+    ],
+    createdAt: '2026-02-10T10:00:00Z',
+    updatedAt: '2026-03-20T12:00:00Z'
+  },
+  {
+    id: 'game_valorant',
+    slug: 'valorant',
+    name: 'Valorant',
+    externalGameId: 'valorant-points',
+    providerId: 'prov_rechargegames',
+    supportsNameCheck: true,
+    requiresPlayerId: true,
+    category: 'Tactical Shooter',
+    description: 'Recharges officielles de Valorant Points (VP) via Riot ID.',
+    logo: '/src/assets/images/game_cover_valorant_1791597799488.jpg',
+    banner: '/src/assets/images/game_cover_valorant_1791597799488.jpg',
+    isActive: true,
+    displayOrder: 7,
+    fields: [
+      {
+        id: 'f_valorant_player_id',
+        name: 'playerId',
+        label: 'Riot ID (ex: Joueur#TAG)',
+        placeholder: 'ex: PlayUp#HTG',
+        type: 'text',
+        required: true,
+        helperText: 'Saisissez votre Riot ID complet incluant votre Tag.'
+      }
+    ],
+    createdAt: '2026-02-15T10:00:00Z',
+    updatedAt: '2026-03-20T12:00:00Z'
+  },
+  {
+    id: 'game_bloodstrike',
+    slug: 'blood-strike',
+    name: 'Blood Strike',
+    externalGameId: 'blood-strike',
+    providerId: 'prov_rechargegames',
+    supportsNameCheck: true,
+    requiresPlayerId: true,
+    category: 'Battle Royale',
+    description: 'Recharges instantanées de Gold Blood Strike sur serveur Global & MENA via RechargeGames.',
+    logo: '/src/assets/images/game_cover_bloodstrike_1791597808989.jpg',
+    banner: '/src/assets/images/game_cover_bloodstrike_1791597808989.jpg',
+    isActive: true,
+    displayOrder: 8,
+    fields: [
+      {
+        id: 'f_bloodstrike_player_id',
+        name: 'playerId',
+        label: 'Blood Strike User ID',
+        placeholder: 'ex: 5412908312',
+        type: 'text',
+        required: true,
+        helperText: 'Votre identifiant numérique Blood Strike.'
+      }
+    ],
+    createdAt: '2026-02-20T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
   }
 ];
@@ -349,11 +433,29 @@ export const INITIAL_SERVICES: Service[] = [
     isActive: true,
     displayOrder: 4,
     packages: [
-      withHtgPricing({ id: 'pkg_rbx_400', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_400', externalGameId: 'roblox', name: 'Code 400 Robux', amount: 400, unit: 'Robux PIN', supplierCost: 3.90, margin: 1.60, publicPrice: 5.50, resellerPrice: 4.60, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 1 }),
-      withHtgPricing({ id: 'pkg_rbx_800', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_800', externalGameId: 'roblox', name: 'Code 800 Robux', amount: 800, unit: 'Robux PIN', supplierCost: 8.00, margin: 2.80, publicPrice: 10.80, resellerPrice: 9.10, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 2 }),
-      withHtgPricing({ id: 'pkg_rbx_2000', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_2000', externalGameId: 'roblox', name: 'Code 2000 Robux', amount: 2000, unit: 'Robux PIN', supplierCost: 19.50, margin: 6.50, publicPrice: 26.00, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 3 })
+      withHtgPricing({ id: 'pkg_rbx_400', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_400', externalGameId: 'roblox', name: 'Code 400 Robux', amount: 400, unit: 'Robux', supplierCost: 3.90, margin: 1.60, publicPrice: 5.50, resellerPrice: 4.60, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_rbx_800', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_800', externalGameId: 'roblox', name: 'Code 800 Robux', amount: 800, unit: 'Robux', supplierCost: 8.00, margin: 2.80, publicPrice: 10.80, resellerPrice: 9.10, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_rbx_2000', serviceId: 'srv_roblox_robux', externalProductId: 'rbx_pin_2000', externalGameId: 'roblox', name: 'Code 2000 Robux', amount: 2000, unit: 'Robux', supplierCost: 19.50, margin: 6.50, publicPrice: 26.00, resellerPrice: 22.00, currency: 'USD', isActive: true, requiresPlayerId: false, requiredFields: [], displayOrder: 3 })
     ],
     createdAt: '2026-02-01T10:00:00Z',
+    updatedAt: '2026-03-20T12:00:00Z'
+  },
+  {
+    id: 'srv_codm_cp',
+    gameId: 'game_codm',
+    externalGameId: 'cod-mobile',
+    name: 'Call of Duty: Mobile CP',
+    description: 'Packs Call of Duty Mobile CP officiels.',
+    category: 'points',
+    providerId: 'prov_rechargegames',
+    isActive: true,
+    displayOrder: 5,
+    packages: [
+      withHtgPricing({ id: 'pkg_codm_80', serviceId: 'srv_codm_cp', externalProductId: 'codm_us_80', productKey: 'codm_us_80', region: 'USA', providerSlug: 'rechargegames', externalGameId: 'cod-mobile', name: '80 CP', amount: 80, unit: 'CP', supplierCost: 0.95, margin: 0.25, publicPrice: 1.20, resellerPrice: 1.08, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 1 }),
+      withHtgPricing({ id: 'pkg_codm_420', serviceId: 'srv_codm_cp', externalProductId: 'codm_us_420', productKey: 'codm_us_420', region: 'USA', providerSlug: 'rechargegames', externalGameId: 'cod-mobile', name: '420 CP', amount: 420, unit: 'CP', supplierCost: 4.10, margin: 0.90, publicPrice: 5.00, resellerPrice: 4.55, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 2 }),
+      withHtgPricing({ id: 'pkg_codm_880', serviceId: 'srv_codm_cp', externalProductId: 'codm_us_880', productKey: 'codm_us_880', region: 'USA', providerSlug: 'rechargegames', externalGameId: 'cod-mobile', name: '880 CP', amount: 880, unit: 'CP', supplierCost: 8.20, margin: 1.80, publicPrice: 10.00, resellerPrice: 9.10, currency: 'USD', isActive: true, requiresPlayerId: true, requiredFields: ['playerId'], displayOrder: 3 })
+    ],
+    createdAt: '2026-02-05T10:00:00Z',
     updatedAt: '2026-03-20T12:00:00Z'
   }
 ];
@@ -380,7 +482,7 @@ export const INITIAL_SETTINGS: AppSettings = {
     apkFileSize: '18.4 MB'
   },
   maintenanceMode: false,
-  announcementNotice: 'Intégration officielle RechargeGames & GoXtop API disponible : Devise de référence USD, prix de vente PlayUp en HTG et Webhooks signés.',
+  announcementNotice: '',
   paymentGatewayConfigured: false,
   apiRateLimitPerMinute: 60,
   defaultProviderId: 'prov_rechargegames',
